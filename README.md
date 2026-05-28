@@ -1,112 +1,191 @@
-# Project Improvement Analysis Report
+<div align="center">
 
-## Project Overview
-This project is an AI agent extension for VSCode that automatically generates applications from user prompts. The extension is fully autonomous, requiring only a user-provided prompt to generate a complete application.
+# 🤖 Local Multi-Agent Coder
 
-## Git Repository Context
-During toolchain discovery, the extension now reads the current workspace Git repository in read-only mode and writes a snapshot to `.agent-workspace/agents/00_git_snapshot.json`.
+**Generate entire software projects from a single prompt — powered by local LLMs via Ollama, right inside VS Code.**
 
-The snapshot includes repository root, branch, short HEAD, branch tracking status, changed/untracked files, recent commits, and staged/unstaged diff stats. Architect, task planning, code worker, reviewer, fixer, and final report agents receive this Git context so they can understand the current project state before proposing or applying changes.
+[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85-blue?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Ollama](https://img.shields.io/badge/Ollama-local%20LLM-black?logo=ollama)](https://ollama.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Technology Stack
-- **Language**: TypeScript
-- **Framework**: VSCode Extension API
-- **Build Tool**: npm
-- **Testing**: Jest (unit tests), Mocha/Chai (integration tests)
-- **Linter**: ESLint
-- **Formatter**: Prettier
-- **Package Manager**: npm
+</div>
 
-## Current Project Structure
+---
+
+## ✨ What is this?
+
+**Local Multi-Agent Coder** is a VS Code extension that orchestrates a **pipeline of specialized AI agents** to autonomously plan, design, write, review, and test code — all running **100% locally** on your machine through [Ollama](https://ollama.com/). No API keys. No cloud. No data leaves your computer.
+
+Give it a prompt like _"Build a REST API with authentication and a PostgreSQL database"_ — and watch the agents go to work.
+
+---
+
+## 🚀 How it works
+
+The extension runs a sequential multi-agent workflow, where each agent has a distinct role:
+
 ```
-project-root/
-├── src/
-│   ├── extension.ts          # Main extension entry point
-│   ├── commands/             # Command implementations
-│   ├── models/               # Data models and interfaces
-│   ├── services/             # Core services (AI integration, file generation)
-│   ├── utils/                # Utility functions
-│   └── templates/            # Application templates
-├── test/
-│   ├── unit/                 # Unit tests
-│   └── integration/          # Integration tests
-├── .vscode/
-│   ├── launch.json           # Debug configuration
-│   └── tasks.json            # Build tasks
-├── package.json              # Project configuration
-├── tsconfig.json             # TypeScript configuration
-├── README.md                 # Project documentation
-└── CHANGELOG.md              # Release notes
+User Prompt
+    │
+    ▼
+🧠 Brief Builder   — Understands the project scope
+    │
+    ▼
+💡 Brainstorm      — Generates ideas and approaches
+    │
+    ▼
+🔍 Critic          — Challenges assumptions, finds gaps
+    │
+    ▼
+💡 Second Brainstorm — Refines ideas after critique
+    │
+    ▼
+🏛️  Architect       — Designs the technical architecture
+    │
+    ▼
+📋 Task Manager    — Breaks architecture into actionable tasks
+    │
+    ▼
+⚙️  Code Worker     — Implements each task (file by file)
+    │
+    ▼
+🔎 Reviewer        — Reviews code quality & security
+    │
+    ▼
+🔧 Fixer           — Applies fixes based on review feedback
+    │
+    ▼
+🧪 Tester          — Runs tests, triggers self-healing loop
+    │
+    ▼
+✅ Done!
 ```
 
-## Key Areas for Refactoring
+---
 
-### 1. Code Organization and Modularity
-- **Current State**: The project structure is modular, but some services may have grown too large.
-- **Recommendation**: Split large services into smaller, focused modules. For example, separate AI integration logic from file generation logic.
+## 🌟 Key Features
 
-### 2. Error Handling
-- **Current State**: Error handling is likely basic, with errors displayed in VSCode's output channel.
-- **Recommendation**: Implement a centralized error handling mechanism. Use custom error classes for different types of errors (e.g., `PromptProcessingError`, `TemplateMatchingError`). Ensure errors are logged with context for debugging.
+| Feature | Description |
+|---|---|
+| 🔒 **100% Local** | All LLMs run via Ollama — your code never leaves your machine |
+| 🤝 **Multi-Agent Pipeline** | 9 specialized agents collaborate on every project |
+| 🔄 **Self-Healing** | Automatically retries with fallback models when a call fails |
+| 🌿 **Git-Aware** | Reads your repo snapshot and shares it with every agent |
+| 🛡️ **Safe Mode** | Optional user approval before any file is written |
+| 📝 **Full Audit Trail** | Every agent decision, patch, and assumption is logged |
+| ⚡ **Model Fallback** | Primary → fallback → alternate models, automatically |
 
-### 3. Testing
-- **Current State**: Testing framework is in place, but coverage may be incomplete.
-- **Recommendation**: 
-  - Increase unit test coverage, especially for core services and utility functions.
-  - Add integration tests for end-to-end workflows.
-  - Use mocking for external dependencies (e.g., AI models) to ensure tests are fast and reliable.
+---
 
-### 4. Documentation
-- **Current State**: Basic documentation exists, but may not cover all aspects of the project.
-- **Recommendation**:
-  - Add detailed comments to complex functions and algorithms.
-  - Document the API design and data models more thoroughly.
-  - Create a user guide for the VSCode extension.
+## 📦 Requirements
 
-### 5. Performance Optimization
-- **Current State**: No performance benchmarks or optimizations are mentioned.
-- **Recommendation**:
-  - Profile the application to identify bottlenecks.
-  - Optimize template matching and code generation algorithms.
-  - Implement caching for frequently used templates or generated code snippets.
+- [VS Code](https://code.visualstudio.com/) `^1.85`
+- [Ollama](https://ollama.com/) installed and running locally
+- At least one LLM pulled, e.g.:
+  ```bash
+  ollama pull qwen2.5-coder:14b-instruct
+  ollama pull devstral-small-2
+  ```
 
-### 6. Dependency Management
-- **Current State**: Dependencies are managed via npm, but no specific strategy is mentioned.
-- **Recommendation**:
-  - Regularly audit dependencies for vulnerabilities.
-  - Use `npm outdated` to keep dependencies up-to-date.
-  - Consider using a tool like `renovate` for automated dependency updates.
+---
 
-### 7. Template Management
-- **Current State**: Templates are stored locally and updated manually.
-- **Recommendation**:
-  - Implement a versioning system for templates.
-  - Add a mechanism to validate templates before use.
-  - Consider allowing users to contribute or extend templates.
+## 🛠️ Installation & Setup
 
-### 8. User Experience
-- **Current State**: The extension is autonomous, but user feedback mechanisms may be limited.
-- **Recommendation**:
-  - Add progress indicators for long-running tasks.
-  - Provide clear feedback when generation is complete or fails.
-  - Allow users to customize the generation process (e.g., select templates, adjust settings).
+1. **Clone the repo and install dependencies**
+   ```bash
+   git clone https://github.com/trantuthieng/debate_agent.git
+   cd debate_agent
+   npm install
+   ```
 
-## Recommendations for Improvement
+2. **Compile the extension**
+   ```bash
+   npm run compile
+   ```
 
-### Short-Term Improvements
-1. **Enhance Error Handling**: Implement centralized error handling with custom error classes.
-2. **Improve Testing**: Increase test coverage, especially for core services.
-3. **Update Documentation**: Add detailed comments and user guides.
+3. **Launch in VS Code**
+   - Press `F5` to open the Extension Development Host
+   - Click the 🤖 icon in the Activity Bar to open the Agent Coder panel
 
-### Medium-Term Improvements
-1. **Refactor Large Services**: Split large services into smaller, focused modules.
-2. **Optimize Performance**: Profile and optimize critical paths in the code.
-3. **Improve Template Management**: Add versioning and validation for templates.
+4. **Configure your models** by editing `.agent-workspace/model_config.json`
 
-### Long-Term Improvements
-1. **Add User Customization**: Allow users to customize the generation process.
-2. **Implement Caching**: Cache frequently used templates or generated code snippets.
-3. **Automate Dependency Updates**: Use tools like `renovate` for automated dependency management.
+---
 
-## Conclusion
-This project has a solid foundation with a modular structure and clear separation of concerns. The key areas for improvement are error handling, testing, documentation, performance, and user experience. By addressing these areas, the project can become more robust, maintainable, and user-friendly.
+## 🎮 Usage
+
+1. Open the **Agent Coder** panel from the Activity Bar
+2. Type your project description in the prompt field
+3. Click **Start** and watch the agents work in real-time
+4. Review the generated files in your workspace
+
+### Available Commands
+
+| Command | Description |
+|---|---|
+| `Local Multi-Agent Coder: Open Panel` | Open the main UI |
+| `Local Multi-Agent Coder: Start New Project` | Start a fresh generation |
+| `Local Multi-Agent Coder: Resume Workflow` | Continue an interrupted run |
+| `Local Multi-Agent Coder: Stop Workflow` | Abort the current run |
+| `Local Multi-Agent Coder: Show Agent Notes` | View agent reasoning & decisions |
+| `Local Multi-Agent Coder: Open Settings File` | Edit model configuration |
+
+---
+
+## 🗂️ Project Structure
+
+```
+src/
+├── 📄 extension.ts              # Extension entry point
+├── 🎮 commands/                 # VS Code command handlers
+├── 🏛️  orchestrator/             # AgentOrchestrator — the brain
+├── 🤖 ollama/                   # Ollama API client
+├── 📦 models/                   # TypeScript interfaces & types
+├── ⚙️  services/                 # App generation, code, templates
+├── 🧩 templates/                # Reusable code templates
+├── 🖥️  terminal/                 # Terminal runner for npm/test commands
+├── 🗃️  workspace/                # File manager & agent workspace
+├── 🌐 webview/                  # Sidebar panel UI
+└── 🔧 utils/                    # Helpers (strings, dates, logging…)
+
+test/
+├── 🧪 unit/                     # Unit tests
+└── 🔗 integration/              # Integration tests
+```
+
+---
+
+## ⚙️ Configuration
+
+Edit `.agent-workspace/model_config.json` to customize models per agent, set fallbacks, enable safe mode, and tune self-healing behaviour.
+
+```jsonc
+{
+  "models": {
+    "codeWorker": { "model": "devstral-small-2", "fallback": "qwen2.5-coder:14b-instruct" },
+    "architect":  { "model": "deepseek-coder-v2:16b" }
+  },
+  "safeMode": false,
+  "selfHealing": { "enabled": true, "modelCallRetries": 2 }
+}
+```
+
+---
+
+## 🧪 Running Tests
+
+```bash
+npm test
+```
+
+---
+
+## 🤝 Contributing
+
+Pull requests are welcome! Please open an issue first to discuss what you'd like to change.
+
+---
+
+## 📄 License
+
+MIT © [trantuthieng](https://github.com/trantuthieng)
