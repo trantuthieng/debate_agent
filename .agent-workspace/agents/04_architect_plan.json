@@ -1,0 +1,48 @@
+{
+  "summary": "VSCode extension for generating applications from user prompts",
+  "technology": [
+    "TypeScript",
+    "VSCode Extension API",
+    "npm",
+    "Jest",
+    "ESLint",
+    "Prettier"
+  ],
+  "projectStructure": [
+    "src/extension.ts",
+    "src/commands/generateAppCommand.ts",
+    "src/models/prompt.model.ts",
+    "src/models/generatedApp.model.ts",
+    "src/models/file.model.ts",
+    "src/models/types.ts",
+    "src/services/appGeneratorService.ts",
+    "src/services/templateMatcherService.ts",
+    "src/services/codeGenerationService.ts",
+    "src/services/dependencyResolverService.ts",
+    "src/utils/stringUtils.ts",
+    "src/utils/dateUtils.ts",
+    "src/utils/arrayUtils.ts",
+    "src/templates/common/header.ts",
+    "src/templates/components/button.ts",
+    "src/templates/layouts/main.ts",
+    "src/templates/index.ts",
+    "test/unit/appGeneratorService.test.ts",
+    "test/integration/appGeneratorService.test.ts"
+  ],
+  "keyDecisions": [
+    "Use TypeScript with VSCode Extension API",
+    "Modular project structure with clear separation of concerns",
+    "Prompt, GeneratedApp, File, and Types data models",
+    "Command, Service, Template, Code Generation, and Dependency Resolution APIs",
+    "Template Matching, Code Generation, and Dependency Resolution algorithms"
+  ],
+  "constraints": [
+    "No major architectural overhaul",
+    "No entirely new features not related to existing scope",
+    "No migration to a different tech stack",
+    "Maintain backward compatibility and existing functionality"
+  ],
+  "needUserInput": false,
+  "questions": [],
+  "readyToCode": true
+}

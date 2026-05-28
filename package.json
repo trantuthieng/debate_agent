@@ -1,0 +1,93 @@
+{
+  "name": "local-multi-agent-coder",
+  "displayName": "Local Multi-Agent Coder",
+  "description": "Create software projects using multiple local LLM agents through Ollama. Sequential multi-agent workflow with file-based agent communication.",
+  "version": "0.1.0",
+  "publisher": "local-dev",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "ollama",
+    "llm",
+    "ai",
+    "agents",
+    "code generation"
+  ],
+  "activationEvents": [
+    "onView:localMultiAgentCoder.sidebar"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "localMultiAgentCoder.openPanel",
+        "title": "Local Multi-Agent Coder: Open Panel",
+        "category": "Local Multi-Agent Coder"
+      },
+      {
+        "command": "localMultiAgentCoder.startNewProject",
+        "title": "Local Multi-Agent Coder: Start New Project",
+        "category": "Local Multi-Agent Coder"
+      },
+      {
+        "command": "localMultiAgentCoder.resumeWorkflow",
+        "title": "Local Multi-Agent Coder: Resume Workflow",
+        "category": "Local Multi-Agent Coder"
+      },
+      {
+        "command": "localMultiAgentCoder.stopWorkflow",
+        "title": "Local Multi-Agent Coder: Stop Workflow",
+        "category": "Local Multi-Agent Coder"
+      },
+      {
+        "command": "localMultiAgentCoder.showAgentNotes",
+        "title": "Local Multi-Agent Coder: Show Agent Notes",
+        "category": "Local Multi-Agent Coder"
+      },
+      {
+        "command": "localMultiAgentCoder.openSettingsFile",
+        "title": "Local Multi-Agent Coder: Open Settings File",
+        "category": "Local Multi-Agent Coder"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localMultiAgentCoder",
+          "title": "Local Multi-Agent Coder",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "localMultiAgentCoder": [
+        {
+          "type": "webview",
+          "id": "localMultiAgentCoder.sidebar",
+          "name": "Agent Coder"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "test": "node --test test/*.test.js",
+    "lint": "eslint src"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^8.59.4",
+    "@typescript-eslint/parser": "^8.59.4",
+    "eslint": "^10.4.0",
+    "typescript": "^5.3.3"
+  }
+}

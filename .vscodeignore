@@ -1,0 +1,13 @@
+.vscode/**
+.vscode-test/**
+.agent-workspace/**
+test/**
+src/**
+.gitignore
+tsconfig.json
+eslint.config.js
+**/*.map
+**/*.ts
+!out/**
+node_modules/**
+out/test/**

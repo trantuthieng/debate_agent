@@ -1,0 +1,11 @@
+{
+  "generatedAt": "2026-05-28T14:08:46.185Z",
+  "workspaceRoot": "/Volumes/Data/.CloudStorage/Data/OneDrive-Personal/Project/Debate_agent",
+  "isRepository": false,
+  "changedFiles": [],
+  "changedFileCount": 0,
+  "untrackedFileCount": 0,
+  "recentCommits": [],
+  "warnings": [],
+  "error": "fatal: not a git repository (or any parent up to mount point /Volumes)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set)."
+}

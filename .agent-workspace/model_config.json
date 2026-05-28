@@ -1,0 +1,71 @@
+{
+  "ollamaBaseUrl": "http://localhost:11434",
+  "requestTimeoutMs": 600000,
+  "safeMode": false,
+  "autonomousMode": true,
+  "askPolicy": "never",
+  "debateRounds": 3,
+  "maxFixRetries": 5,
+  "autoInstallDependencies": true,
+  "artifactDir": "dist",
+  "createFinalArchive": true,
+  "requireVerificationScripts": true,
+  "selfHealing": {
+    "enabled": true,
+    "modelCallRetries": 2,
+    "retryDelayMs": 5000,
+    "alternateModelLimit": 3,
+    "compactContextChars": 12000
+  },
+  "defaultOptions": {
+    "temperature": 0.1,
+    "num_ctx": 8192,
+    "top_p": 0.9
+  },
+  "agents": {
+    "briefBuilder": {
+      "model": "devstral-small-2",
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
+    },
+    "brainstorm": {
+      "model": "qwen3-coder:30b",
+      "fallbackModel": "devstral-small-2"
+    },
+    "critic": {
+      "model": "deepseek-coder-v2:16b",
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
+    },
+    "secondBrainstorm": {
+      "model": "qwen2.5-coder:14b-instruct",
+      "fallbackModel": "qwen2.5-coder:7b-instruct"
+    },
+    "architect": {
+      "model": "devstral-small-2",
+      "fallbackModel": "qwen3-coder:30b"
+    },
+    "taskManager": {
+      "model": "devstral-small-2",
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
+    },
+    "codeWorker": {
+      "model": "devstral-small-2",
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
+    },
+    "reviewer": {
+      "model": "deepseek-coder-v2:16b",
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
+    },
+    "tester": {
+      "model": "qwen2.5-coder:7b-instruct",
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
+    },
+    "fixer": {
+      "model": "devstral-small-2",
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
+    },
+    "finalIntegrator": {
+      "model": "devstral-small-2",
+      "fallbackModel": "qwen3-coder:30b"
+    }
+  }
+}

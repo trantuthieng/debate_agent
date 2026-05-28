@@ -1,0 +1,79 @@
+{
+  "generatedAt": "2026-05-28T14:08:46.193Z",
+  "packageManager": "npm",
+  "checks": [
+    {
+      "name": "node",
+      "command": "node --version",
+      "available": true,
+      "version": "v25.8.2"
+    },
+    {
+      "name": "npm",
+      "command": "npm --version",
+      "available": true,
+      "version": "11.11.1"
+    },
+    {
+      "name": "pnpm",
+      "command": "pnpm --version",
+      "available": false,
+      "error": "/bin/sh: pnpm: command not found"
+    },
+    {
+      "name": "yarn",
+      "command": "yarn --version",
+      "available": false,
+      "error": "/bin/sh: yarn: command not found"
+    },
+    {
+      "name": "git",
+      "command": "git --version",
+      "available": true,
+      "version": "git version 2.50.1 (Apple Git-155)"
+    },
+    {
+      "name": "java",
+      "command": "java -version",
+      "available": false,
+      "error": "The operation couldn’t be completed. Unable to locate a Java Runtime.\nPlease visit http://www.java.com for information on installing Java."
+    },
+    {
+      "name": "xcodebuild",
+      "command": "xcodebuild -version",
+      "available": false,
+      "error": "xcode-select: error: tool 'xcodebuild' requires Xcode, but active developer directory '/Library/Developer/CommandLineTools' is a command line tools instance"
+    },
+    {
+      "name": "android-sdk",
+      "command": "adb version",
+      "available": false,
+      "error": "/bin/sh: adb: command not found"
+    },
+    {
+      "name": "flutter",
+      "command": "flutter --version",
+      "available": false,
+      "error": "/bin/sh: flutter: command not found"
+    },
+    {
+      "name": "gradle",
+      "command": "gradle --version",
+      "available": false,
+      "error": "/bin/sh: gradle: command not found"
+    }
+  ],
+  "missing": [
+    "pnpm",
+    "yarn",
+    "java",
+    "xcodebuild",
+    "android-sdk",
+    "flutter",
+    "gradle"
+  ],
+  "notes": [
+    "Missing optional toolchains do not stop the workflow unless the generated project requires them during verification.",
+    "For signed iOS IPA delivery, Apple signing assets must already exist locally; the agent can still generate and verify the project structure without them."
+  ]
+}
