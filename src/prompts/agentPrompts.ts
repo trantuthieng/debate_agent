@@ -183,6 +183,10 @@ You have received the final architecture plan. Your job:
 3. Respect task dependencies (do not code a feature before its dependencies).
 4. Be specific about which files each task is allowed to modify.
 5. Define clear acceptance criteria for each task.
+6. Include project setup files required for a runnable product, such as package.json, README, source files, and real test files when the prompt asks for a Node/npm project.
+7. Do not put contradictions in a task: if a file is required by acceptance criteria, it must be in allowedFiles and must not appear in forbiddenActions.
+8. Plan a small development sprint, not a giant one-shot build. Prefer 2-5 vertical tasks that can each be coded, reviewed, and checked before the next task.
+9. Each sprint should move the product toward a runnable whole: setup, one core slice, tests, then polish/docs. Do not create many disconnected fragments.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -255,7 +259,11 @@ ADDITIONAL CODE RULES:
 - Include proper error handling.
 - Use async/await, not callbacks.
 - Do not hardcode secrets or credentials.
-- Do not use deprecated APIs.`;
+- Do not use deprecated APIs.
+- If the original prompt forbids external dependencies or asks for a dependency-free product, use only standard library APIs and do not import third-party packages.
+- If package.json is an allowed file for a Node.js project, include complete start/test/demo scripts as requested.
+- If tests are requested with node:test, use node:test plus node:assert only; do not use Jest globals such as describe, it, expect, beforeEach, afterEach, jest, or fail.
+- For CLI products, export pure functions for tests and only call the CLI runner when the file is executed directly.`;
 
 const CODE_WORKER_OUTPUT = `Produce valid JSON matching the schema above. The file content must be complete and correct.`;
 
@@ -273,7 +281,9 @@ Your job:
 2. Review for security vulnerabilities (injection, path traversal, credential leaks, etc.).
 3. Review for maintainability (code clarity, error handling).
 4. Check if all acceptance criteria are met.
-5. Do NOT directly edit files. Your job is ONLY review and feedback.
+5. Check the original prompt constraints, including dependency restrictions, test framework requirements, persistence paths, package scripts, and README/run instructions.
+6. For Node.js projects, reject missing package.json, missing test script, third-party imports that violate the prompt, and Jest-style tests when package.json uses node --test.
+7. Do NOT directly edit files. Your job is ONLY review and feedback.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -341,6 +351,8 @@ Your job:
 3. Do not refactor or change things that are working correctly.
 4. Do not change the overall architecture.
 5. If the error is ambiguous, choose the most likely fix and continue without user input.
+6. Preserve the user's constraints. If the prompt forbids dependencies, remove third-party imports instead of adding packages.
+7. If tests run with node:test, convert Jest-style tests to node:test and node:assert rather than adding Jest.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json

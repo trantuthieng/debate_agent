@@ -545,3 +545,452 @@ test('test fixer receives a bounded allowedFiles list from changed files', async
     'test/index.test.js',
   ]);
 });
+
+test('worker output normalization prevents missing files from crashing coding', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-missing-files',
+    title: 'Run checks',
+    description: 'No file changes are required.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['package.json'],
+    forbiddenActions: [],
+    acceptanceCriteria: [],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const output = {
+    reasoning: undefined,
+    needUserInput: true,
+    questions: 'What should I do?',
+  };
+
+  orchestrator._normalizeAutonomousWorkerOutput('codeWorker', task, output);
+
+  assert.deepEqual(output.files, []);
+  assert.deepEqual(output.questions, []);
+  assert.equal(output.needUserInput, false);
+  assert.match(output.reasoning, /incomplete response/);
+});
+
+test('static quality gate blocks dependency-free Node projects with external imports and Jest tests', async () => {
+  const root = makeTempWorkspace();
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'test'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+    scripts: { test: 'node --test test/*.test.js' },
+  }));
+  fs.writeFileSync(path.join(root, 'src/cli.js'), "const { program } = require('commander');\n");
+  fs.writeFileSync(path.join(root, 'test/cli.test.js'), "describe('cli', () => { it('works', () => expect(true).toBe(true)); });\n");
+
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Build a dependency-free Node.js CLI with no external runtime dependencies and node:test tests.');
+
+  const result = orchestrator._runStaticQualityGate();
+
+  assert.equal(result.failed, true);
+  assert.match(result.output, /commander/);
+  assert.match(result.output, /Jest-style globals/);
+});
+
+test('task normalization removes contradictory forbidden actions for required files', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'task-setup',
+    title: 'Setup project',
+    description: 'Create package metadata.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['package.json', 'README.md'],
+    forbiddenActions: ['do not modify package.json'],
+    acceptanceCriteria: ['package.json contains start and test scripts'],
+    status: 'pending',
+    createdAt: '',
+  };
+
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString());
+
+  assert.deepEqual(normalized.forbiddenActions, []);
+  assert.deepEqual(normalized.allowedFiles, ['package.json', 'README.md']);
+});
+
+test('sprint task scoping prevents repeated planning cycles from colliding', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const now = new Date().toISOString();
+  const plan = {
+    tasks: [
+      {
+        id: 'task-001',
+        title: 'Setup',
+        description: 'Create setup files.',
+        assignedAgent: 'codeWorker',
+        dependsOn: [],
+        allowedFiles: ['package.json'],
+        forbiddenActions: [],
+        acceptanceCriteria: ['package exists'],
+        status: 'completed',
+        createdAt: now,
+        completedAt: now,
+        error: 'old error',
+      },
+      {
+        id: 'task-002',
+        title: 'Feature',
+        description: 'Create feature files.',
+        assignedAgent: 'codeWorker',
+        dependsOn: ['task-001'],
+        allowedFiles: ['src/index.js'],
+        forbiddenActions: [],
+        acceptanceCriteria: ['feature exists'],
+        status: 'pending',
+        createdAt: now,
+      },
+    ],
+    totalTasks: 2,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+  orchestrator.workspace.writeFile(orchestrator.workspace.taskPlanPath, JSON.stringify(plan, null, 2));
+
+  orchestrator._scopeTaskPlanForSprint(2);
+
+  const scoped = JSON.parse(fs.readFileSync(orchestrator.workspace.taskPlanPath, 'utf8'));
+  assert.deepEqual(scoped.tasks.map(task => task.id), ['sprint-02-task-001', 'sprint-02-task-002']);
+  assert.deepEqual(scoped.tasks[1].dependsOn, ['sprint-02-task-001']);
+  assert.equal(scoped.tasks[0].status, 'pending');
+  assert.equal(scoped.tasks[0].completedAt, undefined);
+  assert.equal(scoped.tasks[0].error, undefined);
+});
+
+test('improvement consensus stops only when all brainstorm agents agree no work remains', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const stopConsensus = [
+    { agentRole: 'brainstorm', readyToStop: true, confidence: 'high', remainingWork: [], nextSprintGoal: '', rationale: 'done' },
+    { agentRole: 'critic', readyToStop: true, confidence: 'high', remainingWork: [], nextSprintGoal: '', rationale: 'done' },
+    { agentRole: 'secondBrainstorm', readyToStop: true, confidence: 'high', remainingWork: [], nextSprintGoal: '', rationale: 'done' },
+  ];
+  const continueConsensus = [
+    ...stopConsensus.slice(0, 2),
+    { agentRole: 'secondBrainstorm', readyToStop: false, confidence: 'medium', remainingWork: ['Improve onboarding'], nextSprintGoal: 'Add onboarding polish', rationale: 'useful' },
+  ];
+
+  assert.equal(orchestrator._consensusReadyToStop(stopConsensus), true);
+  assert.equal(orchestrator._consensusReadyToStop(continueConsensus), false);
+});
+
+test('fallback improvement consensus requires more than one clean sprint before stopping', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeFile(
+    orchestrator.workspace.testerPath,
+    '# Test Results\n\n{"passed":true,"testsRun":8,"errors":[],"warnings":[],"needsFix":false}'
+  );
+  orchestrator.workspace.writeProjectState(makeState({ failedTasks: [] }));
+
+  const first = orchestrator._fallbackImprovementConsensus('brainstorm', 1, new Error('model offline'));
+  const second = orchestrator._fallbackImprovementConsensus('brainstorm', 2, new Error('model offline'));
+
+  assert.equal(first.readyToStop, false);
+  assert.deepEqual(first.remainingWork, ['Stabilize remaining verification or completeness gaps found during the previous sprint.']);
+  assert.equal(second.readyToStop, true);
+  assert.deepEqual(second.remainingWork, []);
+});
+
+test('deterministic browser game recovery creates a verifiable playable scaffold', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt(
+    'Build a complete mini browser game called Meteor Dodge using canvas, pure HTML CSS JavaScript, and node:test tests.'
+  );
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-game-recovery',
+    title: 'Implement game logic',
+    description: 'Implement canvas game logic and rendering.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/logic.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['Playable by opening index.html', 'npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan, {
+    taskId: task.id,
+    approved: false,
+    issues: ['logic is incomplete'],
+    suggestions: [],
+    securityConcerns: [],
+    needsFix: true,
+    fixSuggestions: ['Create a full browser game scaffold'],
+    reviewedAt: now,
+  });
+
+  assert.ok(recovery);
+  assert.ok(fs.existsSync(path.join(root, 'index.html')));
+  assert.ok(fs.existsSync(path.join(root, 'src/logic.js')));
+  assert.ok(fs.existsSync(path.join(root, 'test/logic.test.js')));
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic Arkanoid recovery creates a verifiable 10-level game', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt(
+    'Build a complete Arkanoid style browser game called Neon Brick Breaker with canvas, 10 levels, keyboard controls, and node:test coverage.'
+  );
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-arkanoid-recovery',
+    title: 'Implement Arkanoid game',
+    description: 'Implement paddle, ball, bricks, ten levels, rendering, and tests.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/logic.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['Playable by opening index.html', '10 levels exist', 'npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  assert.ok(fs.existsSync(path.join(root, 'index.html')));
+  assert.ok(fs.existsSync(path.join(root, 'src/logic.js')));
+  assert.ok(fs.existsSync(path.join(root, 'test/logic.test.js')));
+  assert.match(fs.readFileSync(path.join(root, 'src/logic.js'), 'utf8'), /MAX_LEVEL = 10/);
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('agent infers misspelled short Vietnamese Arkanoid prompt as a 10-level browser game', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('tạo game akanoid 10 level');
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-akanoid-prompt',
+    title: 'Implement game',
+    description: 'Create the runnable game product from the user prompt.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/logic.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['10 levels exist', 'npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const brief = orchestrator._fallbackProjectBrief('tạo game akanoid 10 level');
+  assert.equal(brief.appType, 'game');
+  assert.deepEqual(brief.chosenStack, ['HTML Canvas', 'CSS', 'JavaScript', 'node:test']);
+  assert.ok(brief.coreFeatures.some(feature => /10 playable levels/.test(feature)));
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  assert.match(fs.readFileSync(path.join(root, 'src/logic.js'), 'utf8'), /MAX_LEVEL = 10/);
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic CLI recovery creates a verifiable local tool', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Build a complete CLI called Focus Tool with add list done stats commands and node:test coverage.');
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-cli-recovery',
+    title: 'Implement CLI product',
+    description: 'Create a runnable command line tool.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/cli.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  assert.ok(fs.existsSync(path.join(root, 'src/cli.js')));
+  assert.ok(fs.existsSync(path.join(root, 'test/cli.test.js')));
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic REST API recovery creates a verifiable API', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Build a complete REST API called Pantry API with health, items, JSON routes, and node:test coverage.');
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-api-recovery',
+    title: 'Implement API product',
+    description: 'Create a runnable Node REST API server.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/server.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  assert.ok(fs.existsSync(path.join(root, 'src/server.js')));
+  assert.ok(fs.existsSync(path.join(root, 'test/server.test.js')));
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic React recovery creates a verifiable React scaffold', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Build a complete React app called Insight Board with Vite, dashboard UI, and smoke tests.');
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-react-recovery',
+    title: 'Implement React product',
+    description: 'Create a runnable frontend product scaffold.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/App.jsx'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  assert.ok(fs.existsSync(path.join(root, 'src/App.jsx')));
+  assert.ok(fs.existsSync(path.join(root, 'src/main.jsx')));
+  assert.ok(fs.existsSync(path.join(root, 'test/app.test.js')));
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic Node library recovery creates a verifiable package', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Build a complete Node library package called Tiny Utils with reusable helpers and node:test coverage.');
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-library-recovery',
+    title: 'Implement library package',
+    description: 'Create a reusable npm package with tests.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/index.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  assert.ok(fs.existsSync(path.join(root, 'src/index.js')));
+  assert.ok(fs.existsSync(path.join(root, 'test/index.test.js')));
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic static web recovery creates a verifiable web product', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Build a complete static website called Signal Desk with HTML CSS JavaScript and smoke tests.');
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-web-recovery',
+    title: 'Implement static web product',
+    description: 'Create a runnable static browser app.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['index.html'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = {
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  assert.ok(fs.existsSync(path.join(root, 'index.html')));
+  assert.ok(fs.existsSync(path.join(root, 'src/app.js')));
+  assert.ok(fs.existsSync(path.join(root, 'test/smoke.test.js')));
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});

@@ -422,6 +422,15 @@ export type ExtensionToWebviewMessage =
   | { type: 'showPatchApproval'; patchId: string; preview: string; targetFiles: string[] }
   | { type: 'showCommandApproval'; commandId: string; command: string; reason: string };
 
+// ----- Web Fetcher -----
+
+export interface WebFetchResult {
+  url: string;
+  success: boolean;
+  text: string;
+  error?: string;
+}
+
 // ----- Orchestrator Callbacks -----
 
 export interface OrchestratorCallbacks {

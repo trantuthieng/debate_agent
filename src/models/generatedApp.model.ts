@@ -1,3 +1,5 @@
+import type { FileModel } from './file.model';
+
 /**
  * Represents a generated application structure.
  * Contains the application name, version, list of files, and dependencies.

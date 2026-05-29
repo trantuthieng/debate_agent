@@ -84,14 +84,14 @@ export class CodeGenerationService {
   private generateBaseFiles(template: string, prompt: string): FileModel[] {
     return [
       {
-        path: 'README.md',
-        content: `# Generated App
+        filePath: 'README.md',
+        fileContent: `# Generated App
 
 Template: ${template}
 
 Prompt: ${prompt}
 `,
-        language: 'markdown',
+        programmingLanguage: 'markdown',
       },
     ];
   }

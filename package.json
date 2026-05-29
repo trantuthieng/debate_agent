@@ -2,7 +2,7 @@
   "name": "local-multi-agent-coder",
   "displayName": "Local Multi-Agent Coder",
   "description": "Create software projects using multiple local LLM agents through Ollama. Sequential multi-agent workflow with file-based agent communication.",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "local-dev",
   "engines": {
     "vscode": "^1.85.0"
@@ -79,7 +79,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
-    "test": "node --test test/*.test.js",
+    "test": "node --test test/*.test.js test/unit/*.test.js test/integration/*.test.js",
     "lint": "eslint src"
   },
   "devDependencies": {

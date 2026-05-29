@@ -1,61 +1,92 @@
-// appGeneratorService.test.ts
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
 import { AppGeneratorService } from '../../src/services/appGeneratorService';
-import { PromptModel } from '../../src/models/prompt.model';
-import { GeneratedApp } from '../../src/models/generatedApp.model';
+import { CodeGenerationService } from '../../src/services/codeGenerationService';
+import { DependencyResolverService } from '../../src/services/dependencyResolverService';
+import { TemplateMatcherService } from '../../src/services/templateMatcherService';
+import type { FileModel, GeneratedApp, PromptModel } from '../../src/models';
 
-jest.mock('../../src/services/templateMatcherService');
-jest.mock('../../src/services/codeGenerationService');
-jest.mock('../../src/services/dependencyResolverService');
+test('app generator coordinates template, code, and dependency services', async () => {
+  const prompt: PromptModel = { content: 'Sample prompt', timestamp: new Date().toISOString() };
+  const generatedFiles: FileModel[] = [
+    {
+      filePath: 'README.md',
+      fileContent: '# Sample',
+      programmingLanguage: 'markdown',
+    },
+  ];
 
-const mockTemplateMatcher = require('../../src/services/templateMatcherService').default;
-const mockCodeGenerator = require('../../src/services/codeGenerationService').default;
-const mockDependencyResolver = require('../../src/services/dependencyResolverService').default;
+  const calls: unknown[][] = [];
+  class MockTemplateMatcher extends TemplateMatcherService {
+    override async matchTemplate(receivedPrompt: PromptModel): Promise<string> {
+      calls.push(['matchTemplate', receivedPrompt]);
+      return 'template-key';
+    }
+  }
 
-describe('AppGeneratorService', () => {
-  let appGenerator: AppGeneratorService;
+  class MockCodeGenerator extends CodeGenerationService {
+    override async generateCode(template: string, variables: Record<string, unknown>): Promise<FileModel[]> {
+      calls.push(['generateCode', template, variables]);
+      return generatedFiles;
+    }
+  }
 
-  beforeEach(() => {
-    appGenerator = new AppGeneratorService();
-    jest.clearAllMocks();
+  class MockDependencyResolver extends DependencyResolverService {
+    override async resolveDependencies(app: GeneratedApp): Promise<string[]> {
+      calls.push(['resolveDependencies', app]);
+      return ['express'];
+    }
+  }
+
+  const appGenerator = new AppGeneratorService(
+    new MockTemplateMatcher(),
+    new MockCodeGenerator(),
+    new MockDependencyResolver()
+  );
+
+  const result = await appGenerator.generate(prompt);
+
+  assert.equal(result.name, 'SamplePrompt');
+  assert.equal(result.dependencies.length, 1);
+  assert.equal(result.dependencies[0], 'express');
+  assert.deepEqual(result.files, generatedFiles);
+  assert.equal(calls[0][0], 'matchTemplate');
+  assert.equal(calls[1][0], 'generateCode');
+  assert.equal(calls[1][1], 'template-key');
+  assert.deepEqual(calls[1][2], {
+    prompt: 'Sample prompt',
+    timestamp: prompt.timestamp,
   });
+  assert.equal(calls[2][0], 'resolveDependencies');
+});
 
-  describe('generate', () => {
-    describe('when prompt is valid', () => {
-      it('should successfully generate an app', async () => {
-        const mockPrompt: PromptModel = { content: 'Sample prompt', timestamp: new Date() };
-        const mockGeneratedApp: GeneratedApp = { name: 'SampleApp', files: [], dependencies: [] };
+test('app generator rejects empty prompts before matching templates', async () => {
+  class FailingTemplateMatcher extends TemplateMatcherService {
+    override async matchTemplate(): Promise<string> {
+      throw new Error('template matcher should not run');
+    }
+  }
 
-        mockTemplateMatcher.match.mockResolvedValue('templateKey');
-        mockCodeGenerator.generate.mockResolvedValue(mockGeneratedApp);
-        mockDependencyResolver.resolveDependencies.mockResolvedValue([]);
+  const appGenerator = new AppGeneratorService(new FailingTemplateMatcher());
 
-        const result = await appGenerator.generate(mockPrompt);
+  await assert.rejects(
+    () => appGenerator.generate({ content: '   ', timestamp: new Date().toISOString() }),
+    /Prompt content cannot be empty/
+  );
+});
 
-        expect(mockTemplateMatcher.match).toHaveBeenCalledWith(mockPrompt);
-        expect(mockCodeGenerator.generate).toHaveBeenCalledWith('templateKey', mockPrompt);
-        expect(mockDependencyResolver.resolveDependencies).toHaveBeenCalledWith(mockGeneratedApp);
-        expect(result).toEqual(mockGeneratedApp);
-      });
-    });
+test('app generator surfaces missing template errors', async () => {
+  class EmptyTemplateMatcher extends TemplateMatcherService {
+    override async matchTemplate(): Promise<string> {
+      return '';
+    }
+  }
 
-    describe('when prompt is invalid', () => {
-      it('should throw an error for empty prompt', async () => {
-        const mockPrompt: PromptModel = { content: '', timestamp: new Date() };
+  const appGenerator = new AppGeneratorService(new EmptyTemplateMatcher());
 
-        mockTemplateMatcher.match.mockResolvedValue(null);
-
-        await expect(appGenerator.generate(mockPrompt)).rejects.toThrow('Invalid prompt');
-        expect(mockTemplateMatcher.match).toHaveBeenCalledWith(mockPrompt);
-      });
-
-      it('should throw an error when template matching fails', async () => {
-        const mockPrompt: PromptModel = { content: 'Invalid prompt', timestamp: new Date() };
-
-        mockTemplateMatcher.match.mockResolvedValue(null);
-
-        await expect(appGenerator.generate(mockPrompt)).rejects.toThrow('Invalid prompt');
-        expect(mockTemplateMatcher.match).toHaveBeenCalledWith(mockPrompt);
-      });
-    });
-  });
+  await assert.rejects(
+    () => appGenerator.generate({ content: 'Build something', timestamp: new Date().toISOString() }),
+    /No template found for the given prompt/
+  );
 });

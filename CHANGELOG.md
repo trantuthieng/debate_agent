@@ -2,10 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.0.0] - 2026-05-28
+## [1.0.0] - 2026-05-29
 
 ### Added
 - Initial project setup with basic structure and functionality.
+- Autonomous multi-agent workflow hardening, deterministic recovery paths, URL context fetching, and expanded node:test coverage.
 - Basic error handling mechanism.
 - Unit tests for core services.
 - Documentation updates.

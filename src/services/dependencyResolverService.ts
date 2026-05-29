@@ -1,5 +1,6 @@
 // src/services/dependencyResolverService.ts
 import type { GeneratedApp } from '../models';
+import type { FileModel } from '../models';
 
 /**
  * Dependency detection rules mapping file patterns to package names.
@@ -47,10 +48,10 @@ export class DependencyResolverService {
    * @param file - The file to analyze
    * @param dependencies - Set to accumulate found dependencies
    */
-  private checkFileAgainstRules(file: any, dependencies: Set<string>): void {
+  private checkFileAgainstRules(file: FileModel, dependencies: Set<string>): void {
     for (const rule of DEPENDENCY_RULES) {
       const matchesPattern = rule.patterns.some(pattern =>
-        file.content.includes(pattern) || file.language === pattern
+        file.fileContent.includes(pattern) || file.programmingLanguage === pattern
       );
 
       if (matchesPattern) {

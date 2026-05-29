@@ -14,6 +14,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   outputChannel.appendLine('[Local Multi-Agent Coder] Extension activated.');
 
+  const panelProvider = new PanelProvider(context);
   registerWebviewPanelProvider(context, panelProvider);
   registerCommands(context, panelProvider, outputChannel);
 

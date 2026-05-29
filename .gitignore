@@ -3,7 +3,10 @@ out/
 dist/
 *.vsix
 .vscode-test/
-.agent-workspace/logs/
-.agent-workspace/tasks/
-.agent-workspace/patches/
+.DS_Store
+.agent-workspace/*
+!.agent-workspace/
+!.agent-workspace/model_config.json
+agent-products/
+note.txt
 *.js.map

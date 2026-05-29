@@ -1,45 +1,38 @@
-// Import necessary modules and services
-import { AppGenerator } from '../../src/services/appGeneratorService';
-import { PromptModel } from '../../src/models/prompt.model';
-import { GeneratedApp } from '../../src/models/generatedApp.model';
+import assert from 'node:assert/strict';
+import test from 'node:test';
 
-// Mock dependencies if needed
-jest.mock('../../src/services/templateMatcherService');
-jest.mock('../../src/services/codeGenerationService');
-jest.mock('../../src/services/dependencyResolverService');
+import { AppGeneratorService } from '../../src/services/appGeneratorService';
 
-// Test suite for AppGeneratorService
-describe('AppGeneratorService Integration Tests', () => {
-  let appGenerator: AppGenerator;
-
-  beforeEach(() => {
-    appGenerator = new AppGenerator();
+test('app generator produces a default README app from a general prompt', async () => {
+  const appGenerator = new AppGeneratorService();
+  const result = await appGenerator.generate({
+    content: 'Create a simple web app',
+    timestamp: new Date().toISOString(),
   });
 
-  describe('Valid Prompt Generation', () => {
-    it('should generate an application from a valid prompt', async () => {
-      const prompt: PromptModel = { content: 'Create a simple web app', timestamp: new Date() };
-      const expectedApp: GeneratedApp = { name: 'SimpleWebApp', files: [], dependencies: [] };
+  assert.equal(result.name, 'CreateASimple');
+  assert.equal(result.files.length, 1);
+  assert.equal(result.files[0].filePath, 'README.md');
+  assert.match(result.files[0].fileContent, /Template: default-template/);
+  assert.deepEqual(result.dependencies, []);
+});
 
-      // Mock the generate method to return the expected app
-      jest.spyOn(appGenerator, 'generate').mockResolvedValue(expectedApp);
-
-      const result = await appGenerator.generate(prompt);
-      expect(result).toEqual(expectedApp);
-    });
+test('app generator detects React dependencies from generated content', async () => {
+  const appGenerator = new AppGeneratorService();
+  const result = await appGenerator.generate({
+    content: 'Create a react dashboard',
+    timestamp: new Date().toISOString(),
   });
 
-  describe('Error Handling', () => {
-    it('should throw an error for an empty prompt content', async () => {
-      const prompt: PromptModel = { content: '', timestamp: new Date() };
+  assert.equal(result.name, 'CreateAReact');
+  assert.deepEqual(result.dependencies.sort(), ['react', 'react-dom']);
+});
 
-      await expect(appGenerator.generate(prompt)).rejects.toThrow('Prompt content cannot be empty');
-    });
+test('app generator rejects empty prompt content', async () => {
+  const appGenerator = new AppGeneratorService();
 
-    it('should throw an error if no template matches the prompt', async () => {
-      const prompt: PromptModel = { content: 'Create a non-existent app type', timestamp: new Date() };
-
-      await expect(appGenerator.generate(prompt)).rejects.toThrow('No template found for the given prompt');
-    });
-  });
+  await assert.rejects(
+    () => appGenerator.generate({ content: '', timestamp: new Date().toISOString() }),
+    /Prompt content cannot be empty/
+  );
 });
