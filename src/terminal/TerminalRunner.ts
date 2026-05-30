@@ -1,7 +1,8 @@
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import type { TerminalRunResult } from '../types';
+import type { CommandPolicyConfig, TerminalRunResult } from '../types';
+import { CommandPolicy } from './CommandPolicy';
 import { DangerousCommandError, UserAbortError } from '../utils/errors';
 import { logInfo, logWarn, logError } from '../utils/logging';
 
@@ -66,12 +67,14 @@ const SAFE_PREFIXES: string[] = [
 export class TerminalRunner {
   private readonly workspaceRoot: string;
   private readonly terminalLogPath: string;
+  private readonly commandPolicy: CommandPolicy;
   private readonly activeProcesses = new Set<cp.ChildProcess>();
   private cancellationRequested = false;
 
-  constructor(workspaceRoot: string, terminalLogPath: string) {
+  constructor(workspaceRoot: string, terminalLogPath: string, commandPolicyConfig?: Partial<CommandPolicyConfig>) {
     this.workspaceRoot = workspaceRoot;
     this.terminalLogPath = terminalLogPath;
+    this.commandPolicy = new CommandPolicy(commandPolicyConfig);
   }
 
   // ------------------------------------------------------------------
@@ -82,15 +85,14 @@ export class TerminalRunner {
    * Check if a command is considered dangerous.
    */
   isDangerous(command: string): boolean {
-    return DANGEROUS_PATTERNS.some(pattern => pattern.test(command));
+    return this.commandPolicy.isDangerous(command);
   }
 
   /**
    * Check if a command is on the safe list.
    */
   isSafe(command: string): boolean {
-    const trimmed = command.trim().toLowerCase();
-    return SAFE_PREFIXES.some(prefix => trimmed.startsWith(prefix.toLowerCase()));
+    return this.commandPolicy.isSafe(command);
   }
 
   /**
@@ -98,7 +100,9 @@ export class TerminalRunner {
    * Throws DangerousCommandError if the command is dangerous (caller must get user approval first).
    */
   async runSafeCommand(command: string, timeoutMs: number = 120_000): Promise<TerminalRunResult> {
-    if (this.isDangerous(command)) {
+    const decision = this.commandPolicy.evaluate(command, this.workspaceRoot);
+    if (decision.risk !== 'safe') {
+      logWarn(`Command requires approval (${decision.reason}): ${command}`);
       throw new DangerousCommandError(command);
     }
     return this._run(command, timeoutMs);

@@ -2,7 +2,7 @@
   "name": "local-multi-agent-coder",
   "displayName": "Local Multi-Agent Coder",
   "description": "Create software projects using multiple local LLM agents through Ollama. Sequential multi-agent workflow with file-based agent communication.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "local-dev",
   "engines": {
     "vscode": "^1.85.0"

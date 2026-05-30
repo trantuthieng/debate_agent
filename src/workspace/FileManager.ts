@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { FileChange, PatchResult } from '../types';
+import { createHash } from 'crypto';
+import type { FileChange, FileSnapshot, PatchResult } from '../types';
 import { logInfo, logWarn } from '../utils/logging';
 
 // -----------------------------------------------------------------------
@@ -49,6 +50,76 @@ export class FileManager {
 
   fileExists(relativePath: string): boolean {
     return fs.existsSync(this._resolve(relativePath));
+  }
+
+  getFileSnapshot(relativePath: string): FileSnapshot {
+    const normalizedPath = relativePath.replace(/\\/g, '/');
+    const fullPath = this._resolve(normalizedPath);
+    if (!fs.existsSync(fullPath)) {
+      return {
+        path: normalizedPath,
+        exists: false,
+        capturedAt: new Date().toISOString(),
+      };
+    }
+
+    const stat = fs.statSync(fullPath);
+    if (!stat.isFile()) {
+      return {
+        path: normalizedPath,
+        exists: true,
+        capturedAt: new Date().toISOString(),
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+      };
+    }
+
+    const content = fs.readFileSync(fullPath);
+    return {
+      path: normalizedPath,
+      exists: true,
+      capturedAt: new Date().toISOString(),
+      hash: createHash('sha256').update(content).digest('hex'),
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    };
+  }
+
+  hasFileChangedSince(snapshot: FileSnapshot): boolean {
+    const current = this.getFileSnapshot(snapshot.path);
+    return current.exists !== snapshot.exists || current.hash !== snapshot.hash;
+  }
+
+  detectConflictingChanges(changes: FileChange[], baselines: Map<string, FileSnapshot> | undefined): string[] {
+    const errors: string[] = [];
+
+    for (const change of changes) {
+      const normalizedPath = change.path.replace(/\\/g, '/');
+      const baseline = baselines?.get(normalizedPath);
+      const current = this.getFileSnapshot(normalizedPath);
+
+      if (change.action === 'create') {
+        if (current.exists && (!baseline || !baseline.exists)) {
+          errors.push(`File "${normalizedPath}" already exists but the agent planned to create it without a baseline.`);
+        } else if (baseline && this.hasFileChangedSince(baseline)) {
+          errors.push(`File "${normalizedPath}" changed after the agent read it.`);
+        }
+        continue;
+      }
+
+      if (!baseline) {
+        if (current.exists) {
+          errors.push(`File "${normalizedPath}" exists but no read baseline was captured before the agent modified it.`);
+        }
+        continue;
+      }
+
+      if (this.hasFileChangedSince(baseline)) {
+        errors.push(`File "${normalizedPath}" changed after the agent read it.`);
+      }
+    }
+
+    return errors;
   }
 
   listWorkspaceFiles(relativeDir: string = '', extensions?: string[]): string[] {
@@ -110,17 +181,37 @@ export class FileManager {
       if (change.description) {
         lines.push(`> ${change.description}\n`);
       }
-      if (change.content !== undefined) {
+      if (change.patch) {
+        lines.push('```diff');
+        lines.push(change.patch);
+        lines.push('```\n');
+        continue;
+      }
+      const rawContent = typeof change.content === 'string' ? change.content : String(change.content ?? '');
+      const existingContent = this._readExistingChangeTarget(change.path);
+      if (
+        change.content !== undefined &&
+        existingContent !== null &&
+        (change.action === 'modify' || change.action === 'append')
+      ) {
+        const afterContent = change.action === 'append' ? `${existingContent}${rawContent}` : rawContent;
+        lines.push('```diff');
+        lines.push(...this._createFocusedDiff(change.path, existingContent, afterContent));
+        lines.push('```\n');
+      } else if (change.action === 'delete' && existingContent !== null) {
+        lines.push('```diff');
+        lines.push(...this._createFocusedDiff(change.path, existingContent, ''));
+        lines.push('```\n');
+      } else if (change.content !== undefined) {
         const ext = path.extname(change.path).replace('.', '') || 'text';
         lines.push('```' + ext);
         // Show first 100 lines to keep preview manageable
-        const rawContent = typeof change.content === 'string' ? change.content : String(change.content ?? '');
         const contentLines = rawContent.split('\n');
         if (contentLines.length > 100) {
           lines.push(...contentLines.slice(0, 100));
           lines.push(`\n... (${contentLines.length - 100} more lines) ...`);
         } else {
-          lines.push(change.content);
+          lines.push(rawContent);
         }
         lines.push('```\n');
       }
@@ -265,5 +356,65 @@ export class FileManager {
       if (content && content.split('\n').length > 300) { return true; }
     }
     return false;
+  }
+
+  private _readExistingChangeTarget(relativePath: string): string | null {
+    try {
+      const fullPath = this._resolve(relativePath);
+      if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) { return null; }
+      return fs.readFileSync(fullPath, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  private _createFocusedDiff(filePath: string, before: string, after: string): string[] {
+    if (before === after) {
+      return [`--- a/${filePath}`, `+++ b/${filePath}`, '@@ no content changes @@'];
+    }
+
+    const beforeLines = before.split('\n');
+    const afterLines = after.split('\n');
+    let prefix = 0;
+    while (
+      prefix < beforeLines.length &&
+      prefix < afterLines.length &&
+      beforeLines[prefix] === afterLines[prefix]
+    ) {
+      prefix += 1;
+    }
+
+    let suffix = 0;
+    while (
+      suffix < beforeLines.length - prefix &&
+      suffix < afterLines.length - prefix &&
+      beforeLines[beforeLines.length - 1 - suffix] === afterLines[afterLines.length - 1 - suffix]
+    ) {
+      suffix += 1;
+    }
+
+    const contextBefore = Math.max(0, prefix - 3);
+    const beforeEnd = Math.max(prefix, beforeLines.length - suffix);
+    const afterEnd = Math.max(prefix, afterLines.length - suffix);
+    const beforeHunk = beforeLines.slice(contextBefore, beforeEnd + 3).slice(0, 120);
+    const afterChanged = afterLines.slice(prefix, afterEnd).slice(0, 120);
+    const leadingContext = beforeLines.slice(contextBefore, prefix).slice(-3);
+    const trailingContext = beforeLines.slice(beforeEnd, Math.min(beforeEnd + 3, beforeLines.length));
+    const omittedBefore = Math.max(0, beforeEnd - prefix - 120);
+    const omittedAfter = Math.max(0, afterEnd - prefix - 120);
+
+    const diff = [
+      `--- a/${filePath}`,
+      `+++ b/${filePath}`,
+      `@@ -${contextBefore + 1},${beforeHunk.length} +${contextBefore + 1},${leadingContext.length + afterChanged.length + trailingContext.length} @@`,
+      ...leadingContext.map(line => ` ${line}`),
+      ...beforeLines.slice(prefix, beforeEnd).slice(0, 120).map(line => `-${line}`),
+      ...(omittedBefore > 0 ? [`-... (${omittedBefore} more removed lines)`] : []),
+      ...afterChanged.map(line => `+${line}`),
+      ...(omittedAfter > 0 ? [`+... (${omittedAfter} more added lines)`] : []),
+      ...trailingContext.map(line => ` ${line}`),
+    ];
+
+    return diff;
   }
 }

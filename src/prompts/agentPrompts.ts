@@ -233,6 +233,8 @@ Your job:
 3. Write complete, production-quality code (no stubs, no TODOs for core functionality).
 4. If details are ambiguous, make a sensible assumption and continue.
 5. Do not ask the user for clarification. Set needUserInput to false.
+6. Ground every edit in the provided repo context, existing file contents, and acceptance criteria.
+7. Prefer the smallest complete edit that satisfies the task. Preserve unrelated code and user changes.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -243,12 +245,20 @@ IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
       "path": "relative/path/to/file.ts",
       "action": "create|modify|append",
       "content": "complete file content here",
+      "patch": "optional unified diff when a focused patch is safer than replacing the full file",
       "description": "what this file does"
     }
   ],
   "needUserInput": false,
   "questions": [],
-  "blockedReason": null
+  "blockedReason": null,
+  "toolRequests": [
+    {
+      "id": "optional-stable-id",
+      "name": "read_file|search|run_command|apply_patch|fetch_url",
+      "args": { "path": "src/example.ts", "query": "symbol name", "command": "npm test", "url": "https://example.com" }
+    }
+  ]
 }
 \`\`\`
 
@@ -263,7 +273,10 @@ ADDITIONAL CODE RULES:
 - If the original prompt forbids external dependencies or asks for a dependency-free product, use only standard library APIs and do not import third-party packages.
 - If package.json is an allowed file for a Node.js project, include complete start/test/demo scripts as requested.
 - If tests are requested with node:test, use node:test plus node:assert only; do not use Jest globals such as describe, it, expect, beforeEach, afterEach, jest, or fail.
-- For CLI products, export pure functions for tests and only call the CLI runner when the file is executed directly.`;
+- For CLI products, export pure functions for tests and only call the CLI runner when the file is executed directly.
+- For existing files, return complete replacement content based on the current file content you were given. Do not rewrite unrelated sections just to change style.
+- For existing files, prefer a small unified diff in "patch" when the edit is localized; use complete "content" only when creating files or when a whole-file replacement is genuinely simpler.
+- If more context is required, return toolRequests instead of guessing. Keep tool requests focused and minimal.`;
 
 const CODE_WORKER_OUTPUT = `Produce valid JSON matching the schema above. The file content must be complete and correct.`;
 
@@ -283,7 +296,12 @@ Your job:
 4. Check if all acceptance criteria are met.
 5. Check the original prompt constraints, including dependency restrictions, test framework requirements, persistence paths, package scripts, and README/run instructions.
 6. For Node.js projects, reject missing package.json, missing test script, third-party imports that violate the prompt, and Jest-style tests when package.json uses node --test.
-7. Do NOT directly edit files. Your job is ONLY review and feedback.
+7. Flag broad rewrites, unrelated refactors, or edits outside the task scope.
+8. Do NOT directly edit files. Your job is ONLY review and feedback.
+9. Be proactively skeptical: explicitly list every uncertainty you have about the implementation, even if small. If you are not 100% sure something is correct, list it in the "uncertainties" field.
+10. Perform a self-consistency check: ask yourself "If I were the end user running this code right now, what would break?" Report any such issues under "issues".
+11. Flag any silent assumptions the code makes that could fail in a different environment (different OS, Node version, missing env var, etc.).
+12. Do NOT let bugs pass with "minor issue" framing. Every issue that could cause a runtime failure MUST set needsFix to true.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -295,6 +313,7 @@ IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
   "securityConcerns": ["list of security concerns"],
   "needsFix": false,
   "fixSuggestions": ["specific instructions for the fixer agent"],
+  "uncertainties": ["explicit list of things you are not 100% sure about"],
   "reviewedAt": "ISO_TIMESTAMP"
 }
 \`\`\`
@@ -317,6 +336,7 @@ Your job:
 2. Determine if the build/tests passed or failed.
 3. If they failed, identify the root cause and describe what needs to be fixed.
 4. Be specific about which files and functions are failing.
+5. Use the diagnostic bundle as the source of truth for failed commands, likely files, and focused log excerpts.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -353,6 +373,8 @@ Your job:
 5. If the error is ambiguous, choose the most likely fix and continue without user input.
 6. Preserve the user's constraints. If the prompt forbids dependencies, remove third-party imports instead of adding packages.
 7. If tests run with node:test, convert Jest-style tests to node:test and node:assert rather than adding Jest.
+8. Use the diagnostic bundle to target the failing command, file, and line instead of making broad rewrites.
+9. Preserve unrelated code and user changes.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -363,12 +385,20 @@ IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
       "path": "relative/path/to/file.ts",
       "action": "create|modify|append",
       "content": "complete fixed file content",
+      "patch": "optional unified diff when a focused patch is safer than replacing the full file",
       "description": "what was fixed"
     }
   ],
   "needUserInput": false,
   "questions": [],
-  "blockedReason": null
+  "blockedReason": null,
+  "toolRequests": [
+    {
+      "id": "optional-stable-id",
+      "name": "read_file|search|run_command|apply_patch|fetch_url",
+      "args": { "path": "src/example.ts", "query": "error text", "command": "npm test", "url": "https://example.com" }
+    }
+  ]
 }
 \`\`\`
 

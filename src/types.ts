@@ -74,6 +74,42 @@ export interface SelfHealingConfig {
   compactContextChars: number;
 }
 
+export interface CommandPolicyConfig {
+  approvedPrefixes: string[];
+  requireApprovalForNetwork: boolean;
+  requireApprovalForExternalWrites: boolean;
+  allowLongRunningSessions: boolean;
+}
+
+export interface WebSearchConfig {
+  enabled: boolean;
+  maxResults: number;
+  officialDocsOnly: boolean;
+  allowedDomains: string[];
+}
+
+export interface AppVerificationConfig {
+  enabled: boolean;
+  startServer: boolean;
+  httpSmokeTest: boolean;
+  browserSmokeTest: boolean;
+}
+
+export interface GitHubIntegrationConfig {
+  enabled: boolean;
+  preferGhCli: boolean;
+}
+
+export interface SkillConfig {
+  enabled: boolean;
+  skillDirs: string[];
+}
+
+export interface ToolCallingConfig {
+  enabled: boolean;
+  maxToolRounds: number;
+}
+
 export interface ModelConfig {
   ollamaBaseUrl: string;
   requestTimeoutMs: number;
@@ -87,6 +123,12 @@ export interface ModelConfig {
   createFinalArchive: boolean;
   requireVerificationScripts: boolean;
   selfHealing: SelfHealingConfig;
+  commandPolicy: CommandPolicyConfig;
+  webSearch: WebSearchConfig;
+  appVerification: AppVerificationConfig;
+  githubIntegration: GitHubIntegrationConfig;
+  skills: SkillConfig;
+  toolCalling: ToolCallingConfig;
   defaultOptions: ModelOptions;
   agents: Record<AgentRole, AgentConfig>;
 }
@@ -291,13 +333,48 @@ export interface DeliveryManifest {
   notes: string[];
 }
 
+// ----- Structured Memory -----
+
+export interface StructuredMemoryEvent {
+  timestamp: string;
+  type:
+    | 'activity'
+    | 'assumption'
+    | 'command'
+    | 'diagnostic'
+    | 'file_baseline'
+    | 'github'
+    | 'patch'
+    | 'phase'
+    | 'plan'
+    | 'search'
+    | 'skill'
+    | 'tool'
+    | 'verification';
+  phase?: WorkflowPhase;
+  agentRole?: AgentRole;
+  taskId?: string;
+  summary: string;
+  data?: Record<string, unknown>;
+}
+
 // ----- File Operations -----
+
+export interface FileSnapshot {
+  path: string;
+  exists: boolean;
+  capturedAt: string;
+  hash?: string;
+  size?: number;
+  mtimeMs?: number;
+}
 
 export interface FileChange {
   path: string;
   action: 'create' | 'modify' | 'append' | 'delete';
   content?: string;
   description?: string;
+  patch?: string;
 }
 
 export interface CodeWorkerOutput {
@@ -306,6 +383,8 @@ export interface CodeWorkerOutput {
   needUserInput: boolean;
   questions: string[];
   blockedReason?: string;
+  toolRequests?: ToolCallRequest[];
+  toolResults?: ToolCallResult[];
 }
 
 // ----- Review -----
@@ -318,6 +397,7 @@ export interface ReviewResult {
   securityConcerns: string[];
   needsFix: boolean;
   fixSuggestions: string[];
+  uncertainties?: string[];
   reviewedAt: string;
 }
 
@@ -343,6 +423,13 @@ export interface TerminalRunResult {
   durationMs: number;
   success: boolean;
   error?: string;
+}
+
+export interface TerminalSessionResult extends TerminalRunResult {
+  sessionId: string;
+  startedAt: string;
+  endedAt?: string;
+  timedOut: boolean;
 }
 
 // ----- Patches -----
@@ -429,6 +516,90 @@ export interface WebFetchResult {
   success: boolean;
   text: string;
   error?: string;
+}
+
+export interface SearchResult {
+  file: string;
+  line: number;
+  text: string;
+}
+
+export interface RepositorySearchReport {
+  generatedAt: string;
+  queries: string[];
+  results: SearchResult[];
+  filesInspected: string[];
+  warnings: string[];
+}
+
+export interface ToolCallRequest {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
+export interface ToolCallResult {
+  id: string;
+  name: string;
+  success: boolean;
+  output: string;
+  error?: string;
+}
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  safe: boolean;
+}
+
+export interface SkillDescriptor {
+  name: string;
+  path: string;
+  description: string;
+  triggers: string[];
+}
+
+export interface SkillMatch {
+  skill: SkillDescriptor;
+  score: number;
+  matchedTriggers: string[];
+}
+
+export interface GitHubRepositoryContext {
+  generatedAt: string;
+  available: boolean;
+  remoteUrl?: string;
+  owner?: string;
+  repo?: string;
+  currentBranch?: string;
+  pullRequestNumber?: number;
+  warnings: string[];
+}
+
+export interface AppVerificationResult {
+  generatedAt: string;
+  checks: TerminalRunResult[];
+  smokeUrls: string[];
+  warnings: string[];
+  failed: boolean;
+  summary: string;
+}
+
+export interface PlanStep {
+  id: string;
+  title: string;
+  status: 'pending' | 'in_progress' | 'completed' | 'blocked';
+  evidence: string[];
+  nextAction?: string;
+}
+
+export interface AutonomousPlanReport {
+  generatedAt: string;
+  goal: string;
+  steps: PlanStep[];
+  currentStep?: string;
+  summary: string;
 }
 
 // ----- Orchestrator Callbacks -----

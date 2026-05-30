@@ -576,6 +576,79 @@ test('worker output normalization prevents missing files from crashing coding', 
   assert.match(output.reasoning, /incomplete response/);
 });
 
+test('patch application blocks stale file baselines instead of overwriting user edits', async () => {
+  const root = makeTempWorkspace();
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/index.js'), 'module.exports = "before";\n');
+  const orchestrator = await makeOrchestrator(root);
+  const output = {
+    reasoning: 'Update implementation.',
+    files: [
+      { path: 'src/index.js', action: 'modify', content: 'module.exports = "agent";\n' },
+    ],
+    needUserInput: false,
+    questions: [],
+  };
+
+  const baseline = orchestrator._captureFileBaselines(['src/index.js'], 'task-stale', 'codeWorker');
+  orchestrator._attachChangeBaseline(output, baseline);
+  fs.writeFileSync(path.join(root, 'src/index.js'), 'module.exports = "user edit";\n');
+
+  const applied = await orchestrator._applyCodeChanges('patch-stale', output, makeState({ currentPhase: 'coding' }));
+
+  assert.equal(applied, false);
+  assert.equal(fs.readFileSync(path.join(root, 'src/index.js'), 'utf8'), 'module.exports = "user edit";\n');
+  const memoryEvents = fs.readFileSync(orchestrator.workspace.memoryEventsPath, 'utf8');
+  assert.match(memoryEvents, /blocked because target files changed/);
+});
+
+test('tester receives a focused diagnostic bundle before raw logs', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  let capturedMessages = null;
+  orchestrator.ollama = {
+    callWithFallbackJson: async (_model, _fallback, messages) => {
+      capturedMessages = messages;
+      return {
+        passed: false,
+        testsRun: 1,
+        errors: ['TypeError in test/cli.test.js'],
+        warnings: [],
+        needsFix: true,
+        fixDescription: 'Fix src/cli.js export used by test/cli.test.js.',
+      };
+    },
+  };
+
+  const result = await orchestrator._analyzeProjectChecks({
+    compileResult: null,
+    testResult: makeResult('npm test', false, 'TypeError: runCli is not a function\n    at test/cli.test.js:3:1'),
+    output: '## Tests\nCommand: npm test\nExit: 1\nTypeError: runCli is not a function\n    at test/cli.test.js:3:1',
+    failed: true,
+    failedCommands: ['npm test'],
+    skippedChecks: ['compile/build script not found'],
+  });
+
+  assert.equal(result.needsFix, true);
+  assert.match(capturedMessages[1].content, /# Diagnostic Bundle/);
+  assert.match(capturedMessages[1].content, /Likely files: test\/cli.test.js/);
+  assert.match(capturedMessages[1].content, /Failed commands: npm test/);
+});
+
+test('workflow router skips debate for focused maintenance prompts', async () => {
+  const root = makeTempWorkspace();
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/index.js'), 'module.exports = {};\n');
+  const orchestrator = await makeOrchestrator(root);
+
+  const route = orchestrator._selectWorkflowRoute(makeState({
+    projectGoal: 'Fix the failing node:test coverage in src/index.js.',
+  }));
+
+  assert.equal(route.kind, 'maintenance');
+  assert.equal(route.skipDebate, true);
+});
+
 test('static quality gate blocks dependency-free Node projects with external imports and Jest tests', async () => {
   const root = makeTempWorkspace();
   fs.mkdirSync(path.join(root, 'src'), { recursive: true });

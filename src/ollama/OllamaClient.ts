@@ -41,7 +41,8 @@ export class OllamaClient {
 
   /**
    * Send a chat request to Ollama.
-   * Always unloads the model immediately after (keep_alive: 0).
+   * Model is kept warm in VRAM for 60 s after the response so rapid
+   * consecutive calls (e.g. brainstorm → critic) avoid reload overhead.
    */
   async chat(
     model: string,
@@ -79,11 +80,8 @@ export class OllamaClient {
         outputFile,
         usedFallback: false,
       });
-      // Always unload after completed calls; skip it for explicit user stops so
-      // cancellation returns control to the extension immediately.
-      if (!aborted) {
-        try { await this.unloadModel(model); } catch { /* ignore unload errors */ }
-      }
+      // keep_alive:60 in the request body lets Ollama evict the model
+      // automatically after 60 s of inactivity. No explicit unload needed.
     }
   }
 
@@ -128,9 +126,8 @@ export class OllamaClient {
         outputFile,
         usedFallback: false,
       });
-      if (!aborted) {
-        try { await this.unloadModel(model); } catch { /* ignore */ }
-      }
+      // keep_alive:0 is already set in the request body by _sendChatRequest
+      // for JSON calls, so Ollama unloads the model automatically.
     }
   }
 
@@ -304,11 +301,15 @@ export class OllamaClient {
       throw new ModelNotFoundError(model);
     }
 
+    // Keep the model warm in VRAM for 60 s when it is expected to be called
+    // again soon (all non-JSON text calls, e.g. brainstorm → critic → brief).
+    // JSON calls unload immediately because they are typically one-shot per task.
+    const keepAliveSeconds = jsonFormat ? 0 : 60;
     const body: OllamaChatRequest = {
       model,
       messages,
       stream: false,
-      keep_alive: 0, // Immediately unload after response
+      keep_alive: keepAliveSeconds,
       ...(jsonFormat ? { format: 'json' } : {}),
       options: options ?? {},
     };

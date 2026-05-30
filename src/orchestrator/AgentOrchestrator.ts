@@ -6,7 +6,9 @@ import type {
   AgentActivity,
   ArchitectPlan,
   CodeWorkerOutput,
+  ModelOptions,
   DeliveryManifest,
+  FileSnapshot,
   GitRepositorySnapshot,
   ModelConfig,
   OllamaMessage,
@@ -22,6 +24,7 @@ import type {
   TerminalRunResult,
   TimelineEntry,
   ToolchainReport,
+  ToolCallResult,
   UserQuestion,
   WebFetchResult,
   WorkflowPhase,
@@ -36,6 +39,17 @@ import { parseJsonResponse, prettyJson } from '../utils/json';
 import { logInfo, logWarn, logError } from '../utils/logging';
 import { UserAbortError, WorkflowError, formatError } from '../utils/errors';
 import { WebFetcherService } from '../services/webFetcherService';
+import { SearchService } from '../services/searchService';
+import { PatchService } from '../services/patchService';
+import { AppVerificationService } from '../services/appVerificationService';
+import { GitHubIntegrationService } from '../services/githubIntegrationService';
+import { PlanController } from '../services/planController';
+import { SkillManager } from '../services/skillManager';
+import { WebSearchService } from '../services/webSearchService';
+import { TerminalSessionRunner } from '../terminal/TerminalSessionRunner';
+import { AutonomousToolRegistry } from '../tools/AutonomousToolRegistry';
+import { ContextCache } from '../context/ContextCache';
+import type { ContextSection } from '../context/ContextCache';
 
 interface ImprovementConsensus {
   agentRole: 'brainstorm' | 'critic' | 'secondBrainstorm';
@@ -71,6 +85,12 @@ interface PromptFileContext {
   files: string[];
 }
 
+interface WorkflowRoute {
+  kind: 'full_project' | 'maintenance';
+  skipDebate: boolean;
+  reason: string;
+}
+
 // -----------------------------------------------------------------------
 // AgentOrchestrator
 // -----------------------------------------------------------------------
@@ -78,8 +98,16 @@ export class AgentOrchestrator {
   private readonly workspace: AgentWorkspace;
   private readonly fileManager: FileManager;
   private readonly gitReader: GitRepositoryReader;
+  private readonly searchService: SearchService;
+  private readonly patchService: PatchService;
+  private readonly planController = new PlanController();
   private ollama!: OllamaClient;
   private terminal!: TerminalRunner;
+  private terminalSessions!: TerminalSessionRunner;
+  private toolRegistry!: AutonomousToolRegistry;
+  private skillManager!: SkillManager;
+  private githubIntegration!: GitHubIntegrationService;
+  private webSearch!: WebSearchService;
   private modelConfig!: ModelConfig;
   private callbacks: OrchestratorCallbacks = {};
   private _aborted = false;
@@ -90,6 +118,12 @@ export class AgentOrchestrator {
   private _promptFileContextCache: PromptFileContext | null = null;
   private readonly webFetcher = new WebFetcherService();
   private _webContextCache: { prompt: string; context: string } | null = null;
+  private readonly _changeBaselines = new WeakMap<CodeWorkerOutput, Map<string, FileSnapshot>>();
+  private readonly _contextCache = new ContextCache();
+
+  // Per-run state for effort control and mid-task context injection
+  private _taskPlanComplexity: 'low' | 'medium' | 'high' = 'medium';
+  private _lastMicroCheckSummary = '';
 
   // Pending approvals (patch / command) resolved via user interaction
   private _pendingPatchResolvers = new Map<string, (approved: boolean) => void>();
@@ -99,6 +133,8 @@ export class AgentOrchestrator {
     this.workspace = new AgentWorkspace(workspaceRoot);
     this.fileManager = new FileManager(workspaceRoot);
     this.gitReader = new GitRepositoryReader(workspaceRoot);
+    this.searchService = new SearchService(workspaceRoot);
+    this.patchService = new PatchService(workspaceRoot);
   }
 
   // ------------------------------------------------------------------
@@ -131,6 +167,9 @@ export class AgentOrchestrator {
       this._activityCounter = 0;
       this._promptFileContextCache = null;
       this._webContextCache = null;
+      this._contextCache.clear();
+      this._lastMicroCheckSummary = '';
+      this._taskPlanComplexity = 'medium';
       const state = this._newState(prompt);
       this.workspace.writeProjectState(state);
       this.workspace.writeUserPrompt(prompt);
@@ -168,6 +207,7 @@ export class AgentOrchestrator {
       this._loadConfig();
       this._promptFileContextCache = null;
       this._webContextCache = null;
+      this._contextCache.clear();
       this._buildTimeline();
       this._emitTimeline();
       state.status = 'running';
@@ -188,6 +228,7 @@ export class AgentOrchestrator {
     this._aborted = true;
     this.ollama?.cancelActiveRequests();
     this.terminal?.cancelActiveCommands();
+    this.terminalSessions?.stopAll();
     this._clearPendingApprovals(false);
     this._emit('info', 'Stop requested. Cancelling active model or terminal work...');
 
@@ -260,20 +301,33 @@ export class AgentOrchestrator {
 
   private async _runWorkflow(state: ProjectState): Promise<void> {
     const phase = this._resumePhase(state);
+    const route = this._selectWorkflowRoute(state);
 
     const completedPhases: WorkflowPhase[] = phase !== 'idle' && phase !== 'intake' ? ['intake'] : [];
 
     try {
+      this.workspace.appendMemoryEvent({
+        type: 'phase',
+        phase: state.currentPhase,
+        summary: `Workflow route selected: ${route.kind}. ${route.reason}`,
+        data: { route },
+      });
       // The workflow starts with debate/brainstorming, then turns that consensus
       // into an executable brief and small implementation sprints.
-      if (!this._phaseAlreadyDone(phase, 'brainstorm', completedPhases)) {
+      if (!route.skipDebate && !this._phaseAlreadyDone(phase, 'brainstorm', completedPhases)) {
         await this._phaseBrainstorm(state);
+      } else if (route.skipDebate) {
+        this._updateTimeline('brainstorm', 'skipped');
       }
-      if (!this._phaseAlreadyDone(phase, 'critique', completedPhases)) {
+      if (!route.skipDebate && !this._phaseAlreadyDone(phase, 'critique', completedPhases)) {
         await this._phaseCritique(state);
+      } else if (route.skipDebate) {
+        this._updateTimeline('critique', 'skipped');
       }
-      if (!this._phaseAlreadyDone(phase, 'second_brainstorm', completedPhases)) {
+      if (!route.skipDebate && !this._phaseAlreadyDone(phase, 'second_brainstorm', completedPhases)) {
         await this._phaseSecondBrainstorm(state);
+      } else if (route.skipDebate) {
+        this._updateTimeline('second_brainstorm', 'skipped');
       }
       if (!this._phaseAlreadyDone(phase, 'briefing', completedPhases)) {
         await this._phaseBriefing(state);
@@ -360,6 +414,7 @@ export class AgentOrchestrator {
     this._setPhase(state, 'briefing', 'Autonomous brief: resolving prompt into a build plan...');
 
     await this._prefetchPromptUrls();
+    await this._prefetchWebSearch();
 
     const prompt = this._userPromptWithFileContext();
     const promptFiles = this._promptReferencedFilePaths();
@@ -367,12 +422,12 @@ export class AgentOrchestrator {
     const brainstorm = this.workspace.readFile(this.workspace.brainstormPath) ?? '';
     const critique = this.workspace.readFile(this.workspace.criticPath) ?? '';
     const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
-    const context = [
-      `# User Prompt\n\n${prompt}`,
-      brainstorm ? `# Brainstorm Consensus\n\n${brainstorm}` : '',
-      critique ? `# Critique Consensus\n\n${critique}` : '',
-      secondBrainstorm ? `# Product Consensus\n\n${secondBrainstorm}` : '',
-    ].filter(Boolean).join('\n\n');
+    const context = this._assembleContext([
+      this._sec('# User Prompt', prompt, 1),
+      this._sec('# Brainstorm Consensus', brainstorm, 5),
+      this._sec('# Critique Consensus', critique, 6),
+      this._sec('# Product Consensus', secondBrainstorm, 7),
+    ]);
     const { model, fallbackModel } = this._agentConfig('briefBuilder');
     const messages = this._buildMessages('briefBuilder', context);
 
@@ -412,7 +467,10 @@ export class AgentOrchestrator {
     const prompt = this._userPromptWithFileContext();
     const promptFiles = this._promptReferencedFilePaths();
     const brief = this.workspace.readFile(this.workspace.projectBriefPath) ?? '';
-    const context = brief ? `# User Prompt\n\n${prompt}\n\n# Autonomous Project Brief\n\n${brief}` : prompt;
+    const context = this._assembleContext([
+      this._sec('# User Prompt', prompt, 1),
+      this._sec('# Autonomous Project Brief', brief, 2),
+    ]);
     const { model, fallbackModel } = this._agentConfig('brainstorm');
     const messages = this._buildMessages('brainstorm', context);
 
@@ -463,12 +521,13 @@ export class AgentOrchestrator {
         round,
         totalRounds: this._debateRounds(),
       });
-      const context =
-        `# Debate Round\n\n${round}/${this._debateRounds()}\n\n` +
-        `# User Prompt\n\n${prompt}\n\n` +
-        `# Autonomous Project Brief\n\n${brief}\n\n` +
-        `${brainstorm}\n\n` +
-        (priorRounds ? `# Prior Debate Notes\n\n${priorRounds}` : '');
+      const context = this._assembleContext([
+        this._sec('', `Debate Round ${round}/${this._debateRounds()}`, 1, 0.02),
+        this._sec('# User Prompt', prompt, 1),
+        this._sec('# Autonomous Project Brief', brief, 2),
+        this._sec('', brainstorm, 3),
+        this._sec('# Prior Debate Notes', priorRounds, 7),
+      ]);
       const messages = this._buildMessages('critic', context);
       const roundPath = this.workspace.agentNotePath(`02_critic_round_${String(round).padStart(2, '0')}.md`);
 
@@ -524,12 +583,14 @@ export class AgentOrchestrator {
         round,
         totalRounds: this._debateRounds(),
       });
-      const context =
-        `# Debate Round\n\n${round}/${this._debateRounds()}\n\n` +
-        `# User Prompt\n\n${prompt}\n\n` +
-        `# Autonomous Project Brief\n\n${brief}\n\n` +
-        `${brainstorm}\n\n${critique}\n\n` +
-        (priorRounds ? `# Prior Product/UX Debate Notes\n\n${priorRounds}` : '');
+      const context = this._assembleContext([
+        this._sec('', `Debate Round ${round}/${this._debateRounds()}`, 1, 0.02),
+        this._sec('# User Prompt', prompt, 1),
+        this._sec('# Autonomous Project Brief', brief, 2),
+        this._sec('', brainstorm, 4),
+        this._sec('', critique, 5),
+        this._sec('# Prior Product/UX Debate Notes', priorRounds, 7),
+      ]);
       const messages = this._buildMessages('secondBrainstorm', context);
       const roundPath = this.workspace.agentNotePath(`03_second_brainstorm_round_${String(round).padStart(2, '0')}.md`);
 
@@ -564,6 +625,7 @@ export class AgentOrchestrator {
   private async _phaseToolchainDiscovery(state: ProjectState): Promise<void> {
     this._checkAborted();
     this._setPhase(state, 'toolchain_discovery', 'Inspecting local toolchain...');
+    this._ensureCapabilityServices();
 
     const packageManager = this.terminal.detectPackageManager();
     const commands: Array<[string, string]> = [
@@ -622,6 +684,48 @@ export class AgentOrchestrator {
       status: gitSnapshot.isRepository ? 'completed' : 'warn',
     });
 
+    const prompt = this.workspace.readUserPrompt();
+    const searchQueries = this.searchService.deriveQueriesFromPrompt(prompt);
+    const repoSearch = await this.searchService.buildReport(searchQueries, { maxResultsPerQuery: 8 });
+    this.workspace.writeFile(this.workspace.repoSearchPath, prettyJson(repoSearch));
+    this.workspace.appendMemoryEvent({
+      type: 'search',
+      phase: 'toolchain_discovery',
+      summary: `Repository search prepared ${repoSearch.results.length} result(s) for ${repoSearch.queries.length} query term(s).`,
+      data: { queries: repoSearch.queries, filesInspected: repoSearch.filesInspected },
+    });
+    this._recordActivity({
+      phase: 'toolchain_discovery',
+      title: 'Repository search context ready',
+      detail: `${repoSearch.results.length} result(s) across ${repoSearch.filesInspected.length} file(s).`,
+      status: repoSearch.results.length > 0 ? 'completed' : 'info',
+    });
+
+    const skillMatches = this.skillManager.match(prompt);
+    const skillContext = this.skillManager.readSkillContext(skillMatches);
+    if (skillContext) {
+      this.workspace.writeFile(this.workspace.skillContextPath, skillContext);
+    }
+    this.workspace.appendMemoryEvent({
+      type: 'skill',
+      phase: 'toolchain_discovery',
+      summary: skillMatches.length > 0
+        ? `Matched skills: ${skillMatches.map(match => match.skill.name).join(', ')}`
+        : 'No local skills matched the prompt.',
+      data: { matches: skillMatches.map(match => ({ name: match.skill.name, score: match.score })) },
+    });
+
+    const githubContext = await this.githubIntegration.readContext();
+    this.workspace.writeFile(this.workspace.githubContextPath, prettyJson(githubContext));
+    this.workspace.appendMemoryEvent({
+      type: 'github',
+      phase: 'toolchain_discovery',
+      summary: githubContext.available
+        ? `GitHub context: ${githubContext.owner}/${githubContext.repo}${githubContext.pullRequestNumber ? ` PR #${githubContext.pullRequestNumber}` : ''}.`
+        : 'GitHub context unavailable.',
+      data: githubContext as unknown as Record<string, unknown>,
+    });
+
     const report: ToolchainReport = {
       generatedAt: new Date().toISOString(),
       packageManager,
@@ -658,12 +762,17 @@ export class AgentOrchestrator {
     const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
     const openQns = this.workspace.readFile(this.workspace.openQuestionsPath) ?? '';
     const assumptions = this.workspace.readFile(this.workspace.assumptionsPath) ?? '';
-    const context =
-      `# User Prompt\n\n${prompt}\n\n` +
-      `# Autonomous Project Brief\n\n${brief}\n\n` +
-      `# Local Toolchain Report\n\n${toolchain}\n\n` +
-      `# Git Repository Snapshot\n\n${gitSnapshot}\n\n` +
-      `${brainstorm}\n\n${critique}\n\n${secondBrainstorm}\n\n${openQns}\n\n${assumptions}`;
+    const context = this._assembleContext([
+      this._sec('# User Prompt', prompt, 1),
+      this._sec('# Autonomous Project Brief', brief, 2),
+      this._sec('# Local Toolchain Report', toolchain, 3),
+      this._sec('# Git Repository Snapshot', gitSnapshot, 4),
+      this._sec('', brainstorm, 5),
+      this._sec('', critique, 6),
+      this._sec('', secondBrainstorm, 7),
+      this._sec('', openQns, 8),
+      this._sec('', assumptions, 9),
+    ]);
 
     const { model, fallbackModel } = this._agentConfig('architect');
     const messages = this._buildMessages('architect', context);
@@ -769,12 +878,16 @@ export class AgentOrchestrator {
     const assumptions = this.workspace.readFile(this.workspace.assumptionsPath) ?? '';
     const decisions = this.workspace.readFile(this.workspace.decisionsPath) ?? '';
     const openQns = this.workspace.readFile(this.workspace.openQuestionsPath) ?? '';
-    const context =
-      `# User Prompt And Referenced Files\n\n${prompt}\n\n` +
-      `# Autonomous Project Brief\n\n${brief}\n\n` +
-      `# Local Toolchain Report\n\n${toolchain}\n\n` +
-      `# Git Repository Snapshot\n\n${gitSnapshot}\n\n` +
-      `${architectMd}\n\n${decisions}\n\n${openQns}\n\n${assumptions}`;
+    const context = this._assembleContext([
+      this._sec('# User Prompt And Referenced Files', prompt, 1),
+      this._sec('# Autonomous Project Brief', brief, 2),
+      this._sec('', architectMd, 2),
+      this._sec('# Local Toolchain Report', toolchain, 3),
+      this._sec('# Git Repository Snapshot', gitSnapshot, 4),
+      this._sec('', decisions, 5),
+      this._sec('', openQns, 8),
+      this._sec('', assumptions, 9),
+    ]);
 
     const { model, fallbackModel } = this._agentConfig('taskManager');
     const messages = this._buildMessages('taskManager', context);
@@ -820,6 +933,14 @@ export class AgentOrchestrator {
     state.completedTasks = [];
     state.failedTasks = [];
     this.workspace.writeProjectState(state);
+    const planReport = this.planController.createReport(state.projectGoal, taskPlan.tasks, state.completedTasks, state.failedTasks);
+    this.workspace.writeFile(this.workspace.planControllerPath, prettyJson(planReport));
+    this.workspace.appendMemoryEvent({
+      type: 'plan',
+      phase: 'task_planning',
+      summary: `Dynamic plan initialized: ${planReport.summary}`,
+      data: { currentStep: planReport.currentStep, totalSteps: planReport.steps.length },
+    });
 
     this.callbacks.onTaskUpdate?.(taskPlan.tasks);
     this._recordActivity({
@@ -842,23 +963,43 @@ export class AgentOrchestrator {
       throw new Error('Cannot start coding: task_plan.json is missing or invalid.');
     }
 
+    // Store plan complexity so _optionsForRole() can scale LLM settings per task
+    this._taskPlanComplexity = taskPlan.estimatedComplexity ?? 'medium';
+
     const taskResults: TaskResults = this._loadTaskResults() ?? { results: {}, updatedAt: new Date().toISOString() };
-    const architectMd = this.workspace.readFile(this.workspace.architectMdPath) ?? '';
-    const rollingSummary = this.workspace.readFile(this.workspace.rollingSummaryPath) ?? '';
 
-    for (const task of taskPlan.tasks) {
+    // Wave-based execution: in each wave, run code workers for all dependency-free
+    // tasks in parallel, then apply patches + review + fix sequentially to avoid
+    // file-write races.
+    let madeProgress = true;
+    while (madeProgress && !this._aborted) {
       this._checkAborted();
+      madeProgress = false;
 
-      // Skip already completed / failed tasks
-      if (state.completedTasks.includes(task.id) || state.failedTasks.includes(task.id)) {
-        continue;
-      }
+      // Re-read on every wave so workers see the latest architecture and summary
+      const architectMd = this.workspace.readFile(this.workspace.architectMdPath) ?? '';
+      const rollingSummary = this.workspace.readFile(this.workspace.rollingSummaryPath) ?? '';
 
-      // Wait for dependencies
-      const unmetDeps = task.dependsOn.filter(dep => !state.completedTasks.includes(dep));
-      if (unmetDeps.length > 0) {
-        const failedDeps = unmetDeps.filter(dep => state.failedTasks.includes(dep));
-        const pendingDeps = unmetDeps.filter(dep => !state.failedTasks.includes(dep));
+      // Build the set of permanently terminal task IDs
+      const skippedIds = new Set(
+        taskPlan.tasks.filter(t => t.status === 'skipped').map(t => t.id)
+      );
+      const terminalIds = new Set([...state.completedTasks, ...state.failedTasks, ...skippedIds]);
+
+      // Collect the next wave: tasks whose dependencies are all resolved
+      const wave: TaskItem[] = [];
+      for (const task of taskPlan.tasks) {
+        if (terminalIds.has(task.id)) { continue; }
+
+        const unmetDeps = task.dependsOn.filter(dep => !state.completedTasks.includes(dep));
+        if (unmetDeps.length === 0) {
+          wave.push(task);
+          continue;
+        }
+
+        const failedDeps = unmetDeps.filter(dep => state.failedTasks.includes(dep) || skippedIds.has(dep));
+        const pendingDeps = unmetDeps.filter(dep => !terminalIds.has(dep));
+
         if (pendingDeps.length > 0) {
           this._emit('log', `Task "${task.id}" deferred: waiting for dependencies [${pendingDeps.join(', ')}]`, 'warn');
           task.status = 'pending';
@@ -874,6 +1015,7 @@ export class AgentOrchestrator {
             'codeWorker',
             `Task ${task.id} continued although dependencies failed: ${failedDeps.join(', ')}. Assumption: downstream tasks should recreate any missing setup they need.`
           );
+          wave.push(task);
         } else {
           this._emit('log', `Task "${task.id}" skipped: unmet dependencies [${unmetDeps.join(', ')}]`, 'warn');
           task.status = 'skipped';
@@ -881,185 +1023,118 @@ export class AgentOrchestrator {
           this.workspace.writeProjectState(state);
           this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
           this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-          continue;
         }
       }
 
-      // Mark in progress
-      task.status = 'in_progress';
-      task.startedAt = new Date().toISOString();
-      state.currentTaskId = task.id;
+      if (wave.length === 0) { break; }
+      madeProgress = true;
+
+      // Mark all wave tasks as in-progress
+      for (const task of wave) {
+        task.status = 'in_progress';
+        task.startedAt = new Date().toISOString();
+        state.activeTasks = [...new Set([...state.activeTasks, task.id])];
+        this._emit('log', `Starting task: [${task.id}] ${task.title}`, 'info');
+        this._recordActivity({
+          phase: 'coding',
+          agentRole: 'codeWorker',
+          title: `Coding ${task.id}`,
+          detail: task.title,
+          status: 'running',
+          taskId: task.id,
+          files: task.allowedFiles,
+        });
+      }
+      state.currentTaskId = wave[0].id;
       this.workspace.writeProjectState(state);
       this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-      this._emit('log', `Starting task: [${task.id}] ${task.title}`, 'info');
-      this._recordActivity({
-        phase: 'coding',
-        agentRole: 'codeWorker',
-        title: `Coding ${task.id}`,
-        detail: task.title,
-        status: 'running',
-        taskId: task.id,
-        files: task.allowedFiles,
-      });
 
-      // Execute code worker
-      let workerResultAlreadyApplied = false;
-      let workerResult = await this._executeCodeWorker(task, architectMd, rollingSummary, state);
-      if (!workerResult) {
-        const recoveryResult = await this._tryDeterministicTaskRecovery(task, state, taskPlan);
-        if (recoveryResult) {
-          workerResult = recoveryResult;
-          workerResultAlreadyApplied = true;
+      // === PARALLEL: run code workers for all wave tasks simultaneously ===
+      if (wave.length > 1) {
+        this._emit('log', `Parallel execution: ${wave.length} independent tasks [${wave.map(t => t.id).join(', ')}]`, 'info');
+      }
+      const workerOutcomes = await Promise.allSettled(
+        wave.map(task => this._executeCodeWorker(task, architectMd, rollingSummary, state))
+      );
+
+      // === SEQUENTIAL: apply patches + review + fix for each wave task ===
+      for (let wi = 0; wi < wave.length; wi++) {
+        this._checkAborted();
+        const task = wave[wi];
+        const outcome = workerOutcomes[wi];
+
+        let workerResult: CodeWorkerOutput | null = null;
+        let workerResultAlreadyApplied = false;
+        if (outcome.status === 'fulfilled') {
+          workerResult = outcome.value;
         } else {
-        task.status = 'failed';
-        task.error = 'Code worker produced no output after self-healing attempts.';
-        this._recordFailedTask(state, task.id);
-        state.activeTasks = state.activeTasks.filter(id => id !== task.id);
-        this.workspace.writeProjectState(state);
-        this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
-        this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-        this.workspace.appendAssumption(
-          'codeWorker',
-          `Task ${task.id} failed because the code worker produced no output. Self-healing will let dependent tasks continue and verification/fixer phases repair missing files when possible.`
-        );
-        continue;
-        }
-      }
-      this._normalizeAutonomousWorkerOutput('codeWorker', task, workerResult);
-
-      // Handle user input needed
-      if (workerResult.needUserInput && workerResult.questions.length > 0) {
-        const questions = workerResult.questions.map((q, i) =>
-          this._createQuestion('codeWorker', 'coding', q, `Code worker Q for task ${task.id} #${i + 1}`));
-        // Save partial progress before pausing
-        taskPlan.tasks.find(t => t.id === task.id)!.status = 'pending';
-        this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
-        throw new WaitForUserError(questions);
-      }
-
-      // Apply file changes (safe mode = ask approval for large changes)
-      if (!workerResultAlreadyApplied && workerResult.files.length > 0) {
-        const expandedAllowedFiles = this._selfHealAllowedFiles(task, workerResult, 'codeWorker');
-        if (expandedAllowedFiles.length > 0) {
-          this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
-          this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-        }
-        const validationErrors = this._validateTaskFileChanges(task, workerResult);
-        if (validationErrors.length > 0) {
-          task.status = 'failed';
-          task.error = validationErrors.join('\n');
-          this._recordFailedTask(state, task.id);
-          state.activeTasks = state.activeTasks.filter(id => id !== task.id);
-          this.workspace.writeProjectState(state);
-          this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
-          this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-          this._emit('error', `Task "${task.id}" produced unsafe file changes: ${task.error}`);
-          this._recordActivity({
-            phase: 'coding',
-            agentRole: 'codeWorker',
-            title: `Task ${task.id} blocked`,
-            detail: task.error,
-            status: 'failed',
-            taskId: task.id,
-          });
-          continue;
-        }
-        const patchId = `${task.id}-${Date.now()}`;
-        const applied = await this._applyCodeChanges(patchId, workerResult, state);
-        if (!applied) {
-          task.status = 'failed';
-          task.error = 'File changes were not applied.';
-          this._recordFailedTask(state, task.id);
-          state.activeTasks = state.activeTasks.filter(id => id !== task.id);
-          this.workspace.writeProjectState(state);
-          this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-          continue;
-        }
-      }
-
-      // Run reviewer
-      this._setPhase(state, 'reviewing', `Reviewing task: ${task.title}`);
-      this._recordActivity({
-        phase: 'reviewing',
-        agentRole: 'reviewer',
-        title: `Reviewing ${task.id}`,
-        detail: task.title,
-        status: 'running',
-        taskId: task.id,
-        files: workerResult.files.map(file => file.path),
-      });
-      let review = await this._executeReviewer(task, workerResult, state);
-
-      if (review.needsFix) {
-        // Try to fix
-        const maxRetries = this.modelConfig.maxFixRetries;
-        let fixed = false;
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-          this._checkAborted();
-          this._emit('log', `Fix attempt ${attempt}/${maxRetries} for task "${task.id}"`, 'warn');
-          this._setPhase(state, 'fixing', `Fixing task: ${task.title} (attempt ${attempt})`);
-          this._recordActivity({
-            phase: 'fixing',
-            agentRole: 'fixer',
-            title: `Fix attempt ${attempt}/${maxRetries}`,
-            detail: `Task ${task.id}: ${review.issues.concat(review.fixSuggestions).slice(0, 2).join(' ') || task.title}`,
-            status: 'running',
-            round: attempt,
-            totalRounds: maxRetries,
-            taskId: task.id,
-          });
-          state.fixRetryCount = attempt;
-          this.workspace.writeProjectState(state);
-
-          const fixResult = await this._executeFixer(task, review, state);
-          if (!fixResult) { break; }
-          this._normalizeAutonomousWorkerOutput('fixer', task, fixResult);
-
-          // Re-apply fix changes
-          if (fixResult.files.length > 0) {
-            const expandedAllowedFiles = this._selfHealAllowedFiles(task, fixResult, 'fixer');
-            if (expandedAllowedFiles.length > 0) {
-              this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
-              this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-            }
-            const validationErrors = this._validateTaskFileChanges(task, fixResult);
-            if (validationErrors.length > 0) {
-              this._emit('error', `Fixer produced unsafe file changes for task "${task.id}": ${validationErrors.join('; ')}`);
-              break;
-            }
-            const patchId = `${task.id}-fix-${attempt}-${Date.now()}`;
-            const applied = await this._applyCodeChanges(patchId, fixResult, state);
-            if (!applied) { break; }
-          }
-
-          // Re-review
-          const reReview = await this._executeReviewer(task, fixResult, state);
-          if (!reReview.needsFix) {
-            fixed = true;
-            Object.assign(review, reReview);
-            break;
-          }
-          Object.assign(review, reReview);
+          this._emit('error', `Code worker failed for task "${task.id}": ${formatError(outcome.reason)}`);
         }
 
-        if (!fixed) {
-          const recoveryResult = await this._tryDeterministicTaskRecovery(task, state, taskPlan, review);
+        if (!workerResult) {
+          const recoveryResult = await this._tryDeterministicTaskRecovery(task, state, taskPlan);
           if (recoveryResult) {
             workerResult = recoveryResult;
-            review = {
-              taskId: task.id,
-              approved: true,
-              issues: [],
-              suggestions: ['Task recovered with deterministic browser game scaffold after model fixes failed.'],
-              securityConcerns: [],
-              needsFix: false,
-              fixSuggestions: [],
-              reviewedAt: new Date().toISOString(),
-            };
+            workerResultAlreadyApplied = true;
           } else {
-            this._emit('log', `Task "${task.id}" could not be fixed after ${maxRetries} attempts.`, 'warn');
             task.status = 'failed';
-            task.error = `Failed after ${maxRetries} fix attempts. Last issues: ${review.issues.join('; ')}`;
+            task.error = 'Code worker produced no output after self-healing attempts.';
+            this._recordFailedTask(state, task.id);
+            state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+            this.workspace.writeProjectState(state);
+            this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+            this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+            this.workspace.appendAssumption(
+              'codeWorker',
+              `Task ${task.id} failed because the code worker produced no output. Self-healing will let dependent tasks continue and verification/fixer phases repair missing files when possible.`
+            );
+            continue;
+          }
+        }
+        this._normalizeAutonomousWorkerOutput('codeWorker', task, workerResult);
+
+        // Handle user input needed
+        if (workerResult.needUserInput && workerResult.questions.length > 0) {
+          const questions = workerResult.questions.map((q, i) =>
+            this._createQuestion('codeWorker', 'coding', q, `Code worker Q for task ${task.id} #${i + 1}`));
+          // Save partial progress before pausing
+          taskPlan.tasks.find(t => t.id === task.id)!.status = 'pending';
+          this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+          throw new WaitForUserError(questions);
+        }
+
+        // Apply file changes (safe mode = ask approval for large changes)
+        if (!workerResultAlreadyApplied && workerResult.files.length > 0) {
+          const expandedAllowedFiles = this._selfHealAllowedFiles(task, workerResult, 'codeWorker');
+          if (expandedAllowedFiles.length > 0) {
+            this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+            this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+          }
+          const validationErrors = this._validateTaskFileChanges(task, workerResult);
+          if (validationErrors.length > 0) {
+            task.status = 'failed';
+            task.error = validationErrors.join('\n');
+            this._recordFailedTask(state, task.id);
+            state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+            this.workspace.writeProjectState(state);
+            this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+            this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+            this._emit('error', `Task "${task.id}" produced unsafe file changes: ${task.error}`);
+            this._recordActivity({
+              phase: 'coding',
+              agentRole: 'codeWorker',
+              title: `Task ${task.id} blocked`,
+              detail: task.error,
+              status: 'failed',
+              taskId: task.id,
+            });
+            continue;
+          }
+          const patchId = `${task.id}-${Date.now()}`;
+          const applied = await this._applyCodeChanges(patchId, workerResult, state);
+          if (!applied) {
+            task.status = 'failed';
+            task.error = 'File changes were not applied.';
             this._recordFailedTask(state, task.id);
             state.activeTasks = state.activeTasks.filter(id => id !== task.id);
             this.workspace.writeProjectState(state);
@@ -1067,39 +1142,148 @@ export class AgentOrchestrator {
             continue;
           }
         }
+
+        // Run reviewer
+        this._setPhase(state, 'reviewing', `Reviewing task: ${task.title}`);
+        this._recordActivity({
+          phase: 'reviewing',
+          agentRole: 'reviewer',
+          title: `Reviewing ${task.id}`,
+          detail: task.title,
+          status: 'running',
+          taskId: task.id,
+          files: workerResult.files.map(file => file.path),
+        });
+        let review = await this._executeReviewer(task, workerResult, state);
+
+        if (review.needsFix) {
+          // Try to fix
+          const maxRetries = this.modelConfig.maxFixRetries;
+          let fixed = false;
+          for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            this._checkAborted();
+            this._emit('log', `Fix attempt ${attempt}/${maxRetries} for task "${task.id}"`, 'warn');
+            this._setPhase(state, 'fixing', `Fixing task: ${task.title} (attempt ${attempt})`);
+            this._recordActivity({
+              phase: 'fixing',
+              agentRole: 'fixer',
+              title: `Fix attempt ${attempt}/${maxRetries}`,
+              detail: `Task ${task.id}: ${review.issues.concat(review.fixSuggestions).slice(0, 2).join(' ') || task.title}`,
+              status: 'running',
+              round: attempt,
+              totalRounds: maxRetries,
+              taskId: task.id,
+            });
+            state.fixRetryCount = attempt;
+            this.workspace.writeProjectState(state);
+
+            const fixResult = await this._executeFixer(task, review, state);
+            if (!fixResult) { break; }
+            this._normalizeAutonomousWorkerOutput('fixer', task, fixResult);
+
+            // Re-apply fix changes
+            if (fixResult.files.length > 0) {
+              const expandedAllowedFiles = this._selfHealAllowedFiles(task, fixResult, 'fixer');
+              if (expandedAllowedFiles.length > 0) {
+                this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+                this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+              }
+              const validationErrors = this._validateTaskFileChanges(task, fixResult);
+              if (validationErrors.length > 0) {
+                this._emit('error', `Fixer produced unsafe file changes for task "${task.id}": ${validationErrors.join('; ')}`);
+                break;
+              }
+              const patchId = `${task.id}-fix-${attempt}-${Date.now()}`;
+              const applied = await this._applyCodeChanges(patchId, fixResult, state);
+              if (!applied) { break; }
+            }
+
+            // Re-review
+            const reReview = await this._executeReviewer(task, fixResult, state);
+            if (!reReview.needsFix) {
+              fixed = true;
+              // Record lesson learned for future runs
+              this._appendLesson({
+                issue: review.issues.join('; '),
+                fix: fixResult.reasoning ?? 'No reasoning provided',
+                taskTitle: task.title,
+                filesAffected: fixResult.files.map(f => f.path),
+                attempt,
+              });
+              Object.assign(review, reReview);
+              break;
+            }
+            Object.assign(review, reReview);
+          }
+
+          if (!fixed) {
+            const recoveryResult = await this._tryDeterministicTaskRecovery(task, state, taskPlan, review);
+            if (recoveryResult) {
+              workerResult = recoveryResult;
+              review = {
+                taskId: task.id,
+                approved: true,
+                issues: [],
+                suggestions: ['Task recovered with deterministic browser game scaffold after model fixes failed.'],
+                securityConcerns: [],
+                needsFix: false,
+                fixSuggestions: [],
+                reviewedAt: new Date().toISOString(),
+              };
+            } else {
+              this._emit('log', `Task "${task.id}" could not be fixed after ${maxRetries} attempts.`, 'warn');
+              task.status = 'failed';
+              task.error = `Failed after ${maxRetries} fix attempts. Last issues: ${review.issues.join('; ')}`;
+              this._recordFailedTask(state, task.id);
+              state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+              this.workspace.writeProjectState(state);
+              this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+              this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+              continue;
+            }
+          }
+        }
+
+        // Task complete
+        task.status = 'completed';
+        task.completedAt = new Date().toISOString();
+        task.reviewResult = review;
+        state.completedTasks.push(task.id);
+        state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+        state.fixRetryCount = 0;
+        this.workspace.writeProjectState(state);
+
+        taskResults.results[task.id] = {
+          taskId: task.id,
+          status: 'completed',
+          files: workerResult.files,
+          completedAt: task.completedAt,
+        };
+        taskResults.updatedAt = new Date().toISOString();
+        this.workspace.writeFile(this.workspace.taskResultsPath, prettyJson(taskResults));
+        this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+        this._writeDynamicPlanReport(state, taskPlan);
+        this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+        this._emit('log', `Task "${task.id}" completed.`, 'info');
+        this._recordActivity({
+          phase: 'coding',
+          agentRole: 'codeWorker',
+          title: `Task ${task.id} complete`,
+          detail: `${task.title} (${workerResult.files.length} file change(s))`,
+          status: 'completed',
+          taskId: task.id,
+          files: workerResult.files.map(file => file.path),
+        });
+
       }
-
-      // Task complete
-      task.status = 'completed';
-      task.completedAt = new Date().toISOString();
-      task.reviewResult = review;
-      state.completedTasks.push(task.id);
-      state.activeTasks = state.activeTasks.filter(id => id !== task.id);
-      state.fixRetryCount = 0;
-      this.workspace.writeProjectState(state);
-
-      taskResults.results[task.id] = {
-        taskId: task.id,
-        status: 'completed',
-        files: workerResult.files,
-        completedAt: task.completedAt,
-      };
-      taskResults.updatedAt = new Date().toISOString();
-      this.workspace.writeFile(this.workspace.taskResultsPath, prettyJson(taskResults));
-      this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
-      this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-      this._emit('log', `Task "${task.id}" completed.`, 'info');
-      this._recordActivity({
-        phase: 'coding',
-        agentRole: 'codeWorker',
-        title: `Task ${task.id} complete`,
-        detail: `${task.title} (${workerResult.files.length} file change(s))`,
-        status: 'completed',
-        taskId: task.id,
-        files: workerResult.files.map(file => file.path),
-      });
-
-      await this._runMicroSprintChecks(task, state);
+      // Run micro-sprint checks once per wave (not per task) to avoid redundant
+      // compile/test runs when multiple tasks complete in the same wave.
+      if (madeProgress && wave.length > 0) {
+        const lastCompletedTask = wave.filter(t => state.completedTasks.includes(t.id)).at(-1);
+        if (lastCompletedTask) {
+          await this._runMicroSprintChecks(lastCompletedTask, state);
+        }
+      }
     }
 
     state.currentTaskId = null;
@@ -1177,6 +1361,11 @@ export class AgentOrchestrator {
     });
 
     const checks = await this._runProjectChecks(this.terminal.detectPackageManager());
+    // Store summary so the next code worker can see what failed/passed
+    this._lastMicroCheckSummary = `## Micro-Check After ${task.id} (${new Date().toISOString()})\n` +
+      (checks.failed
+        ? `STATUS: FAILED\nFailed commands: ${checks.failedCommands.join(', ')}\n${checks.output.substring(0, 1000)}`
+        : `STATUS: PASSED\n${checks.output.substring(0, 400)}`);
     this.workspace.appendFile(
       this.workspace.testResultLogPath,
       `\n\n---\n\n## Micro-Sprint Verification: ${task.id}\n\n${checks.output}\n`
@@ -1430,6 +1619,7 @@ export class AgentOrchestrator {
   }
 
   private async _runProjectChecks(packageManager: 'npm' | 'pnpm' | 'yarn'): Promise<ProjectCheckResults> {
+    this._ensureCapabilityServices();
     const skippedChecks: string[] = [];
 
     let compileResult: TerminalRunResult | null = null;
@@ -1481,6 +1671,17 @@ export class AgentOrchestrator {
       failedCommands.push('static quality gate');
     }
 
+    const appVerification = await new AppVerificationService(
+      this.workspace.rootDir,
+      this.terminal,
+      this.terminalSessions,
+      this.modelConfig.appVerification
+    ).verify();
+    this.workspace.writeFile(this.workspace.appVerificationPath, prettyJson(appVerification));
+    if (appVerification.failed) {
+      failedCommands.push('app smoke verification');
+    }
+
     if (this.modelConfig.requireVerificationScripts && !compileResult && !testResult && !nativeResult) {
       failedCommands.push('missing compile/build/test script');
     }
@@ -1496,10 +1697,29 @@ export class AgentOrchestrator {
         ? this._formatCommandResult('Native Project Verification', nativeResult)
         : '## Native Project Verification\n_No native project verification command found_',
       qualityGate.output,
+      this._formatAppVerificationResult(appVerification),
       this.modelConfig.requireVerificationScripts && !compileResult && !testResult && !nativeResult
         ? '## Verification Gate\nFailed: generated project must include at least one compile, build, or test script.'
         : '',
     ].join('\n\n');
+
+    this.workspace.appendMemoryEvent({
+      type: 'verification',
+      phase: 'testing',
+      agentRole: 'tester',
+      summary: failedCommands.length > 0
+        ? `Verification failed: ${failedCommands.join(', ')}`
+        : 'Verification commands passed.',
+      data: {
+        failedCommands,
+        skippedChecks,
+        compileCommand: compileResult?.command,
+        testCommand: testResult?.command,
+        nativeCommand: nativeResult?.command,
+        staticQualityIssues: qualityGate.issues,
+        appVerification,
+      },
+    });
 
     return {
       compileResult,
@@ -1663,7 +1883,9 @@ export class AgentOrchestrator {
 
   private async _analyzeProjectChecks(checks: ProjectCheckResults): Promise<TesterOutput> {
     const { model, fallbackModel } = this._agentConfig('tester');
+    const diagnosticBundle = this._verificationDiagnosticBundle(checks);
     const context =
+      `# Diagnostic Bundle\n\n${diagnosticBundle}\n\n` +
       `# Test Run Results\n\n${checks.output}\n\n` +
       `# Command Status\n\n` +
       `Failed commands: ${checks.failedCommands.join(', ') || 'none'}\n` +
@@ -1691,6 +1913,19 @@ export class AgentOrchestrator {
     testerOutput.errors = testerOutput.errors ?? [];
     testerOutput.warnings = testerOutput.warnings ?? [];
     testerOutput.rawOutput = testerOutput.rawOutput ?? checks.output.substring(0, 2000);
+    this.workspace.appendMemoryEvent({
+      type: 'diagnostic',
+      phase: 'testing',
+      agentRole: 'tester',
+      summary: checks.failed
+        ? `Verification failed: ${checks.failedCommands.join(', ')}`
+        : 'Verification checks passed.',
+      data: {
+        failedCommands: checks.failedCommands,
+        skippedChecks: checks.skippedChecks,
+        filesMentioned: this._extractWorkspaceFileMentions(checks.output),
+      },
+    });
 
     // Exit codes are the source of truth. The tester agent may explain failures,
     // but it cannot turn a failing command into a passing verification result.
@@ -1710,6 +1945,51 @@ export class AgentOrchestrator {
     return testerOutput;
   }
 
+  private _verificationDiagnosticBundle(checks: ProjectCheckResults): string {
+    return this._buildDiagnosticBundle(
+      checks.output,
+      checks.failedCommands,
+      checks.skippedChecks
+    );
+  }
+
+  private _latestVerificationDiagnosticBundle(extraContext: string = ''): string {
+    const latestOutput = this.workspace.readFile(this.workspace.testResultLogPath) ?? '';
+    return this._buildDiagnosticBundle(latestOutput, [], [], extraContext);
+  }
+
+  private _buildDiagnosticBundle(
+    output: string,
+    failedCommands: string[] = [],
+    skippedChecks: string[] = [],
+    extraContext: string = ''
+  ): string {
+    const text = [output, extraContext].filter(Boolean).join('\n');
+    const mentionedFiles = this._extractWorkspaceFileMentions(text).slice(0, 25);
+    const excerpts = this._extractDiagnosticExcerpts(text);
+    return [
+      `Failed commands: ${failedCommands.join(', ') || 'none recorded'}`,
+      `Skipped checks: ${skippedChecks.join(', ') || 'none recorded'}`,
+      `Likely files: ${mentionedFiles.join(', ') || 'none detected'}`,
+      '',
+      'Relevant output excerpts:',
+      excerpts || '_No focused diagnostic lines found._',
+    ].join('\n');
+  }
+
+  private _extractDiagnosticExcerpts(text: string): string {
+    const interesting = /(error|failed|failure|exception|cannot|not found|missing|syntaxerror|typeerror|referenceerror|assertionerror|ts\d{4}|exit:\s*[1-9])/i;
+    const lines = text
+      .split(/\r?\n/)
+      .map(line => line.trimEnd())
+      .filter(line => interesting.test(line));
+    const selected = (lines.length > 0 ? lines : text.split(/\r?\n/).slice(-60))
+      .filter(Boolean)
+      .slice(0, 120);
+    const joined = selected.join('\n');
+    return joined.length > 12_000 ? `${joined.slice(0, 12_000)}\n[Diagnostic excerpt truncated.]` : joined;
+  }
+
   private _formatCommandResult(label: string, result: TerminalRunResult): string {
     return [
       `## ${label}`,
@@ -1721,6 +2001,17 @@ export class AgentOrchestrator {
     ].filter(Boolean).join('\n');
   }
 
+  private _formatAppVerificationResult(result: { summary: string; smokeUrls: string[]; warnings: string[]; checks: TerminalRunResult[]; failed: boolean }): string {
+    return [
+      '## App Smoke Verification',
+      `Status: ${result.failed ? 'failed' : 'passed/skipped'}`,
+      result.summary,
+      result.smokeUrls.length > 0 ? `URLs: ${result.smokeUrls.join(', ')}` : '',
+      result.warnings.length > 0 ? `Warnings:\n${result.warnings.map(warning => `- ${warning}`).join('\n')}` : '',
+      ...result.checks.map(check => this._formatCommandResult('Smoke Check', check)),
+    ].filter(Boolean).join('\n');
+  }
+
   private _packageScriptCommand(packageManager: 'npm' | 'pnpm' | 'yarn', scriptName: string): string {
     if (packageManager === 'yarn') { return `yarn ${scriptName}`; }
     return `${packageManager} run ${scriptName}`;
@@ -1729,9 +2020,11 @@ export class AgentOrchestrator {
   private _userPromptWithFileContext(): string {
     const promptContext = this._promptFileContext();
     const webContext = this._webContext();
+    const webSearchContext = this._webSearchContext();
     const parts: string[] = [promptContext.prompt];
     if (promptContext.context) { parts.push(promptContext.context); }
     if (webContext) { parts.push(webContext); }
+    if (webSearchContext) { parts.push(webSearchContext); }
     return parts.join('\n\n---\n\n');
   }
 
@@ -1775,6 +2068,12 @@ export class AgentOrchestrator {
     return '';
   }
 
+  private _webSearchContext(): string {
+    const raw = this.workspace.readFile(this.workspace.webSearchPath);
+    if (!raw) { return ''; }
+    return `# Web Search Context\n\n${raw}`;
+  }
+
   /**
    * Detect URLs in the user prompt, fetch their content, and store the
    * result in the cache so `_webContext()` can return it synchronously.
@@ -1812,6 +2111,29 @@ export class AgentOrchestrator {
         context
       );
     }
+  }
+
+  private async _prefetchWebSearch(): Promise<void> {
+    this._ensureCapabilityServices();
+    if (!this.modelConfig.webSearch?.enabled) { return; }
+    const prompt = this.workspace.readUserPrompt();
+    const shouldSearch =
+      /\b(latest|current|docs?|documentation|api reference|version|breaking change|library|framework)\b/i.test(prompt);
+    if (!shouldSearch) { return; }
+
+    this._emit('log', 'Running policy-controlled web search for current documentation context.', 'info');
+    const report = await this.webSearch.searchAndFetch(prompt);
+    this.workspace.writeFile(this.workspace.webSearchPath, prettyJson(report));
+    this.workspace.appendMemoryEvent({
+      type: 'search',
+      phase: 'briefing',
+      summary: `Web search fetched ${report.fetched.filter(item => item.success).length} page(s).`,
+      data: {
+        query: report.query,
+        hits: report.hits.map(hit => hit.url),
+        warnings: report.warnings,
+      },
+    });
   }
 
   /**
@@ -2044,15 +2366,16 @@ export class AgentOrchestrator {
     // Gather changed files summary
     const changedFiles = this._collectChangedFiles();
 
-    const context =
-      `# Original User Prompt\n\n${prompt}\n\n` +
-      `# Autonomous Project Brief\n\n${projectBrief}\n\n` +
-      `# Architecture\n\n${architectMd}\n\n` +
-      `# Task Results\n\n${taskResults}\n\n` +
-      `# Test Results\n\n${testerNote}\n\n` +
-      `# Delivery Manifest\n\n${deliveryManifest}\n\n` +
-      `# Git Repository Snapshot\n\n${gitSnapshot}\n\n` +
-      `# Changed Files\n\n${changedFiles.join('\n')}`;
+    const context = this._assembleContext([
+      this._sec('# Original User Prompt', prompt, 1),
+      this._sec('# Autonomous Project Brief', projectBrief, 2),
+      this._sec('# Task Results', taskResults, 2),
+      this._sec('# Test Results', testerNote, 3),
+      this._sec('# Delivery Manifest', deliveryManifest, 3),
+      this._sec('# Architecture', architectMd, 4),
+      this._sec('# Changed Files', changedFiles.join('\n'), 4),
+      this._sec('# Git Repository Snapshot', gitSnapshot, 7),
+    ]);
 
     const { model, fallbackModel } = this._agentConfig('finalIntegrator');
     const messages = this._buildMessages('finalIntegrator', context);
@@ -2094,17 +2417,17 @@ export class AgentOrchestrator {
     const testerNote = this.workspace.readFile(this.workspace.testerPath) ?? '';
     const rollingSummary = this.workspace.readFile(this.workspace.rollingSummaryPath) ?? '';
     const changedFiles = this._collectChangedFiles();
-    const baseContext = [
-      `# Original User Prompt\n\n${prompt}`,
-      `# Sprint\n\n${sprint}`,
-      `# Project Brief\n\n${projectBrief}`,
-      `# Architecture\n\n${architecture}`,
-      `# Current Task Plan\n\n${taskPlan}`,
-      `# Completed Task Results\n\n${taskResults}`,
-      `# Verification Results\n\n${testerNote}`,
-      `# Changed Files\n\n${changedFiles.join('\n') || 'No changed files recorded.'}`,
-      `# Rolling Summary\n\n${rollingSummary}`,
-    ].join('\n\n');
+    const baseContext = this._assembleContext([
+      this._sec('# Original User Prompt', prompt, 1),
+      this._sec('', `# Sprint\n\n${sprint}`, 1, 0.02),
+      this._sec('# Project Brief', projectBrief, 2),
+      this._sec('# Completed Task Results', taskResults, 2),
+      this._sec('# Verification Results', testerNote, 3),
+      this._sec('# Architecture', architecture, 4),
+      this._sec('# Current Task Plan', taskPlan, 5),
+      this._sec('# Changed Files', changedFiles.join('\n') || 'No changed files recorded.', 5),
+      this._sec('# Rolling Summary', rollingSummary, 6),
+    ]);
 
     const roles: ImprovementConsensus['agentRole'][] = ['brainstorm', 'critic', 'secondBrainstorm'];
     const consensus: ImprovementConsensus[] = [];
@@ -2212,33 +2535,54 @@ export class AgentOrchestrator {
     _state: ProjectState
   ): Promise<CodeWorkerOutput | null> {
     // Build context: task + architecture + existing file contents
+    this._ensureCapabilityServices();
+    const promptFiles = this._promptReferencedFilePaths();
+    const baseline = this._captureFileBaselines([...task.allowedFiles, ...promptFiles], task.id, 'codeWorker');
     const existingFilesContent = task.allowedFiles.length > 0
       ? this.fileManager.readFilesAsContext(task.allowedFiles)
       : '';
     const answeredQuestions = this.workspace.readFile(this.workspace.openQuestionsPath) ?? '';
     const assumptions = this.workspace.readFile(this.workspace.assumptionsPath) ?? '';
     const promptWithFiles = this._userPromptWithFileContext();
-    const promptFiles = this._promptReferencedFilePaths();
     const projectBrief = this.workspace.readFile(this.workspace.projectBriefPath) ?? '';
     const toolchain = this.workspace.readFile(this.workspace.toolchainReportPath) ?? '';
     const gitSnapshot = this.workspace.readFile(this.workspace.gitSnapshotPath) ?? '';
+    const githubContext = this.workspace.readFile(this.workspace.githubContextPath) ?? '';
+    const repoSearch = this.workspace.readFile(this.workspace.repoSearchPath) ?? '';
+    const skillContext = this.workspace.readFile(this.workspace.skillContextPath) ?? '';
+    const planContext = this.workspace.readFile(this.workspace.planControllerPath) ?? '';
+    const toolManifest = this.toolRegistry.manifestForPrompt();
+    const structuredMemory = this._structuredMemoryContext();
+    const lessonsContext = this._loadLessons(5);
+    const microCheckContext = this._lastMicroCheckSummary;
 
-    const context =
-      `# Task\n\n` +
+    const taskDesc =
       `**ID:** ${task.id}\n**Title:** ${task.title}\n\n` +
       `**Description:**\n${task.description}\n\n` +
       `**Allowed Files:** ${task.allowedFiles.join(', ') || 'any'}\n` +
       `**Forbidden Actions:** ${task.forbiddenActions.join(', ') || 'none'}\n\n` +
-      `**Acceptance Criteria:**\n${task.acceptanceCriteria.map(c => `- ${c}`).join('\n')}\n\n` +
-      `# Original User Prompt And Referenced Files\n\n${promptWithFiles}\n\n` +
-      `# Autonomous Project Brief\n\n${projectBrief}\n\n` +
-      `# Architecture\n\n${architectMd}\n\n` +
-      `# Local Toolchain Report\n\n${toolchain}\n\n` +
-      `# Git Repository Snapshot\n\n${gitSnapshot}\n\n` +
-      `# Rolling Summary\n\n${rollingSummary}\n\n` +
-      `# User Answers And Clarifications\n\n${answeredQuestions}\n\n` +
-      `# Autonomous Assumptions\n\n${assumptions}` +
-      (existingFilesContent ? `\n\n# Existing File Contents${existingFilesContent}` : '');
+      `**Acceptance Criteria:**\n${task.acceptanceCriteria.map(c => `- ${c}`).join('\n')}`;
+
+    const context = this._assembleContext([
+      this._sec('# Task', taskDesc, 1),
+      this._sec('# Existing File Contents', existingFilesContent, 2),
+      this._sec('# Original User Prompt And Referenced Files', promptWithFiles, 3),
+      this._sec('# Autonomous Project Brief', projectBrief, 4),
+      this._sec('# Architecture', architectMd, 4),
+      this._sec('# Structured Memory Events', structuredMemory, 5),
+      this._sec('# Rolling Summary', rollingSummary, 5),
+      this._sec('# Local Toolchain Report', toolchain, 6),
+      this._sec('# Lessons Learned From Previous Runs', lessonsContext, 6, 0.05),
+      this._sec('# Git Repository Snapshot', gitSnapshot, 7),
+      this._sec('# Last Micro-Sprint Check Results', microCheckContext, 7, 0.04),
+      this._sec('# GitHub Context', githubContext, 8),
+      this._sec('# Repository Search Context', repoSearch, 9),
+      this._sec('# Matched Skill Context', skillContext, 10),
+      this._sec('# Dynamic Plan Controller', planContext, 11),
+      this._sec('# Tool Registry', toolManifest, 12),
+      this._sec('# User Answers And Clarifications', answeredQuestions, 13),
+      this._sec('# Autonomous Assumptions', assumptions, 14),
+    ]);
 
     const { model, fallbackModel } = this._agentConfig('codeWorker');
     const messages = this._buildMessages('codeWorker', context);
@@ -2249,7 +2593,10 @@ export class AgentOrchestrator {
         [...task.allowedFiles, ...promptFiles]
       );
       this._normalizeWorkerOutputShape('codeWorker', task, result);
-      return result;
+      const finalResult = await this._runWorkerToolLoop('codeWorker', task, messages, this.workspace.codeWorkerPath, [...task.allowedFiles, ...promptFiles], result);
+      this._normalizeWorkerOutputShape('codeWorker', task, finalResult);
+      this._attachChangeBaseline(finalResult, baseline);
+      return finalResult;
     } catch (err) {
       this._emit('error', `Code worker failed for task "${task.id}": ${formatError(err)}`);
       return null;
@@ -2270,17 +2617,21 @@ export class AgentOrchestrator {
     const architecture = this.workspace.readFile(this.workspace.architectMdPath) ?? '';
     const gitSnapshot = this.workspace.readFile(this.workspace.gitSnapshotPath) ?? '';
 
-    const context =
-      `# Original User Prompt\n\n${prompt}\n\n` +
-      `# Autonomous Project Brief\n\n${projectBrief}\n\n` +
-      `# Architecture\n\n${architecture.substring(0, 6000)}\n\n` +
-      `# Git Repository Snapshot\n\n${gitSnapshot}\n\n` +
-      `# Task to Review\n\n**ID:** ${task.id}\n**Title:** ${task.title}\n\n` +
+    const reviewTaskDesc =
+      `**ID:** ${task.id}\n**Title:** ${task.title}\n\n` +
       `**Description:**\n${task.description}\n\n` +
       `**Acceptance Criteria:**\n${task.acceptanceCriteria.map(c => `- ${c}`).join('\n')}\n\n` +
       `**Allowed Files:** ${task.allowedFiles.join(', ') || 'any'}\n` +
-      `**Forbidden Actions:** ${task.forbiddenActions.join(', ') || 'none'}\n\n` +
-      `# Files Changed\n\n${filesContext}`;
+      `**Forbidden Actions:** ${task.forbiddenActions.join(', ') || 'none'}`;
+
+    const context = this._assembleContext([
+      this._sec('# Task to Review', reviewTaskDesc, 1),
+      this._sec('# Files Changed', filesContext, 2),
+      this._sec('# Original User Prompt', prompt, 3),
+      this._sec('# Autonomous Project Brief', projectBrief, 4),
+      this._sec('# Architecture', architecture, 4),
+      this._sec('# Git Repository Snapshot', gitSnapshot, 7),
+    ]);
 
     const { model, fallbackModel } = this._agentConfig('reviewer');
     const messages = this._buildMessages('reviewer', context);
@@ -2315,6 +2666,9 @@ export class AgentOrchestrator {
     review: ReviewResult,
     _state: ProjectState
   ): Promise<CodeWorkerOutput | null> {
+    this._ensureCapabilityServices();
+    const promptFiles = this._promptReferencedFilePaths();
+    const baseline = this._captureFileBaselines([...task.allowedFiles, ...promptFiles], task.id, 'fixer');
     const errorContext = [
       ...review.issues.map(i => `- Issue: ${i}`),
       ...review.securityConcerns.map(c => `- Security: ${c}`),
@@ -2327,28 +2681,45 @@ export class AgentOrchestrator {
     const answeredQuestions = this.workspace.readFile(this.workspace.openQuestionsPath) ?? '';
     const assumptions = this.workspace.readFile(this.workspace.assumptionsPath) ?? '';
     const prompt = this._userPromptWithFileContext();
-    const promptFiles = this._promptReferencedFilePaths();
     const projectBrief = this.workspace.readFile(this.workspace.projectBriefPath) ?? '';
     const architecture = this.workspace.readFile(this.workspace.architectMdPath) ?? '';
     const toolchain = this.workspace.readFile(this.workspace.toolchainReportPath) ?? '';
     const gitSnapshot = this.workspace.readFile(this.workspace.gitSnapshotPath) ?? '';
+    const githubContext = this.workspace.readFile(this.workspace.githubContextPath) ?? '';
+    const repoSearch = this.workspace.readFile(this.workspace.repoSearchPath) ?? '';
+    const skillContext = this.workspace.readFile(this.workspace.skillContextPath) ?? '';
+    const planContext = this.workspace.readFile(this.workspace.planControllerPath) ?? '';
+    const toolManifest = this.toolRegistry.manifestForPrompt();
     const latestTestOutput = this.workspace.readFile(this.workspace.testResultLogPath) ?? '';
+    const diagnosticBundle = this._latestVerificationDiagnosticBundle(errorContext);
+    const structuredMemory = this._structuredMemoryContext();
 
-    const context =
-      `# Original User Prompt\n\n${prompt}\n\n` +
-      `# Autonomous Project Brief\n\n${projectBrief}\n\n` +
-      `# Architecture\n\n${architecture.substring(0, 6000)}\n\n` +
-      `# Local Toolchain Report\n\n${toolchain}\n\n` +
-      `# Git Repository Snapshot\n\n${gitSnapshot}\n\n` +
-      `# Task\n\n**ID:** ${task.id}\n**Title:** ${task.title}\n\n` +
+    const fixerTaskDesc =
+      `**ID:** ${task.id}\n**Title:** ${task.title}\n\n` +
       `**Description:**\n${task.description}\n\n` +
       `**Allowed Files:** ${task.allowedFiles.join(', ') || 'none'}\n` +
-      `**Acceptance Criteria:**\n${task.acceptanceCriteria.map(c => `- ${c}`).join('\n')}\n\n` +
-      `# Errors to Fix\n\n${errorContext}\n\n` +
-      `# Latest Verification Output\n\n${latestTestOutput.substring(0, 8000)}\n\n` +
-      `# User Answers And Clarifications\n\n${answeredQuestions}\n\n` +
-      `# Autonomous Assumptions\n\n${assumptions}\n\n` +
-      (existingFilesContent ? `# Current File Contents${existingFilesContent}` : '');
+      `**Acceptance Criteria:**\n${task.acceptanceCriteria.map(c => `- ${c}`).join('\n')}`;
+
+    const context = this._assembleContext([
+      this._sec('# Task', fixerTaskDesc, 1),
+      this._sec('# Errors to Fix', errorContext, 1),
+      this._sec('# Diagnostic Bundle', diagnosticBundle, 2),
+      this._sec('# Current File Contents', existingFilesContent, 2),
+      this._sec('# Latest Verification Output', latestTestOutput, 2),
+      this._sec('# Original User Prompt', prompt, 3),
+      this._sec('# Autonomous Project Brief', projectBrief, 4),
+      this._sec('# Architecture', architecture, 4),
+      this._sec('# Structured Memory Events', structuredMemory, 5),
+      this._sec('# Local Toolchain Report', toolchain, 6),
+      this._sec('# Git Repository Snapshot', gitSnapshot, 7),
+      this._sec('# GitHub Context', githubContext, 8),
+      this._sec('# Repository Search Context', repoSearch, 9),
+      this._sec('# Matched Skill Context', skillContext, 10),
+      this._sec('# Dynamic Plan Controller', planContext, 11),
+      this._sec('# Tool Registry', toolManifest, 12),
+      this._sec('# User Answers And Clarifications', answeredQuestions, 13),
+      this._sec('# Autonomous Assumptions', assumptions, 14),
+    ]);
 
     const { model, fallbackModel } = this._agentConfig('fixer');
     const messages = this._buildMessages('fixer', context);
@@ -2358,11 +2729,97 @@ export class AgentOrchestrator {
         'fixer', model, fallbackModel, messages, this.workspace.codeWorkerPath, [...task.allowedFiles, ...promptFiles]
       );
       this._normalizeWorkerOutputShape('fixer', task, result);
-      return result;
+      const finalResult = await this._runWorkerToolLoop('fixer', task, messages, this.workspace.codeWorkerPath, [...task.allowedFiles, ...promptFiles], result);
+      this._normalizeWorkerOutputShape('fixer', task, finalResult);
+      this._attachChangeBaseline(finalResult, baseline);
+      return finalResult;
     } catch (err) {
       this._emit('error', `Fixer failed: ${formatError(err)}`);
       return null;
     }
+  }
+
+  private async _runWorkerToolLoop(
+    role: 'codeWorker' | 'fixer',
+    task: TaskItem,
+    baseMessages: OllamaMessage[],
+    outputFile: string,
+    inputFiles: string[],
+    initialResult: CodeWorkerOutput
+  ): Promise<CodeWorkerOutput> {
+    this._ensureCapabilityServices();
+    if (!this.modelConfig.toolCalling?.enabled) {
+      return initialResult;
+    }
+
+    let result = initialResult;
+    const messages = [...baseMessages];
+    const { model, fallbackModel } = this._agentConfig(role);
+    const maxRounds = this.modelConfig.toolCalling.maxToolRounds;
+
+    for (let round = 1; round <= maxRounds; round++) {
+      const requests = (result.toolRequests ?? [])
+        .filter(request => request && typeof request.name === 'string')
+        .slice(0, 6);
+      if (requests.length === 0) { break; }
+
+      const toolResults: ToolCallResult[] = [];
+      for (const request of requests) {
+        this._checkAborted();
+        const normalizedRequest = {
+          id: request.id || `${role}-${task.id}-tool-${round}-${toolResults.length + 1}`,
+          name: request.name,
+          args: request.args ?? {},
+        };
+        const toolResult = await this.toolRegistry.execute(normalizedRequest);
+        toolResults.push(toolResult);
+        this.workspace.appendMemoryEvent({
+          type: 'tool',
+          phase: this.workspace.readProjectState().currentPhase,
+          agentRole: role,
+          taskId: task.id,
+          summary: `${role} tool ${toolResult.name} ${toolResult.success ? 'succeeded' : 'failed'}.`,
+          data: {
+            request: normalizedRequest,
+            error: toolResult.error,
+            outputPreview: toolResult.output.slice(0, 1000),
+          },
+        });
+      }
+
+      messages.push({
+        role: 'assistant',
+        content: JSON.stringify({ reasoning: result.reasoning, toolRequests: requests }),
+      });
+      messages.push({
+        role: 'user',
+        content:
+          `Tool round ${round}/${maxRounds} results for task ${task.id}:\n\n` +
+          `${prettyJson(toolResults)}\n\n` +
+          'Use these observations to produce the final CodeWorkerOutput JSON. Return file changes when ready. If more tool calls are still necessary, include toolRequests again.',
+      });
+
+      result = await this._callWithFallbackJson<CodeWorkerOutput>(
+        role,
+        model,
+        fallbackModel,
+        messages,
+        outputFile,
+        inputFiles
+      );
+      result.toolResults = toolResults;
+      this._normalizeWorkerOutputShape(role, task, result);
+    }
+
+    if ((result.toolRequests ?? []).length > 0) {
+      this.workspace.appendAssumption(
+        role,
+        `Task ${task.id} reached the tool-calling round limit. Continuing with the last available worker output.`
+      );
+      result.toolRequests = [];
+    }
+
+    return result;
   }
 
   // ------------------------------------------------------------------
@@ -2382,6 +2839,19 @@ export class AgentOrchestrator {
     // Save patch for auditing
     this.fileManager.savePatch(patchId, preview);
 
+    const baselineConflicts = this._detectBaselineConflicts(workerOutput);
+    if (baselineConflicts.length > 0) {
+      const message = baselineConflicts.join('\n');
+      this.workspace.appendMemoryEvent({
+        type: 'patch',
+        phase: this.workspace.readProjectState().currentPhase,
+        summary: `Patch ${patchId} blocked because target files changed after the agent read them.`,
+        data: { patchId, targetFiles, conflicts: baselineConflicts },
+      });
+      this._emit('error', `Patch "${patchId}" blocked to avoid overwriting user changes:\n${message}`);
+      return false;
+    }
+
     if (this.modelConfig.safeMode && this._requiresPatchApproval(workerOutput) && this._shouldAskUser()) {
       // Request user approval
       const approved = await this._requestPatchApproval(patchId, preview, targetFiles);
@@ -2394,11 +2864,26 @@ export class AgentOrchestrator {
       this._emit('log', `Autonomous mode auto-approved large patch "${patchId}".`, 'warn');
     }
 
-    const result = this.fileManager.applyApprovedChanges(workerOutput.files);
+    const postApprovalConflicts = this._detectBaselineConflicts(workerOutput);
+    if (postApprovalConflicts.length > 0) {
+      const message = postApprovalConflicts.join('\n');
+      this._emit('error', `Patch "${patchId}" blocked after approval because files changed:\n${message}`);
+      return false;
+    }
+
+    const result = this.patchService.hasUnifiedPatch(workerOutput.files)
+      ? this.patchService.applyFileChanges(workerOutput.files)
+      : this.fileManager.applyApprovedChanges(workerOutput.files);
     if (!result.applied) {
       this._emit('error', `Failed to apply changes: ${result.error}`);
       return false;
     } else {
+      this.workspace.appendMemoryEvent({
+        type: 'patch',
+        phase: this.workspace.readProjectState().currentPhase,
+        summary: `Applied patch ${patchId}.`,
+        data: { patchId, targetFiles, changeCount: workerOutput.files.length },
+      });
       this._emit('log', `Applied ${workerOutput.files.length} file change(s).`, 'info');
       return true;
     }
@@ -2432,6 +2917,10 @@ export class AgentOrchestrator {
       `Task ${task.id} used deterministic product recovery after model output could not produce a complete verifiable product.`
     );
     this._emit('log', `Task "${task.id}" is using deterministic product recovery.`, 'warn');
+    this._attachChangeBaseline(
+      recovery,
+      this._captureFileBaselines(recovery.files.map(change => change.path), task.id, 'fixer')
+    );
 
     const applied = await this._applyCodeChanges(`${task.id}-deterministic-recovery-${Date.now()}`, recovery, state);
     return applied ? recovery : null;
@@ -4399,9 +4888,20 @@ export class AgentOrchestrator {
           path: this._normalizeRelativePath(file.path),
           action: normalizedAction,
           content: normalizedContent,
+          patch: file.patch === undefined ? undefined : String(file.patch),
           description: file.description === undefined ? undefined : String(file.description),
         };
       });
+    output.toolRequests = Array.isArray(output.toolRequests)
+      ? output.toolRequests
+        .filter(request => request && typeof request.name === 'string')
+        .map((request, index) => ({
+          id: request.id || `${role}-${task.id}-tool-${index + 1}`,
+          name: String(request.name),
+          args: request.args && typeof request.args === 'object' ? request.args : {},
+        }))
+      : [];
+    output.toolResults = Array.isArray(output.toolResults) ? output.toolResults : [];
   }
 
   private _normalizeReviewResult(task: TaskItem, review: ReviewResult): void {
@@ -4522,6 +5022,97 @@ export class AgentOrchestrator {
   // Internal utilities
   // ------------------------------------------------------------------
 
+  private _captureFileBaselines(
+    pathsToObserve: string[],
+    taskId: string | undefined,
+    agentRole: 'codeWorker' | 'fixer'
+  ): Map<string, FileSnapshot> {
+    const paths = this._expandBaselinePaths(pathsToObserve);
+    const baselines = new Map<string, FileSnapshot>();
+    for (const file of paths) {
+      baselines.set(file, this.fileManager.getFileSnapshot(file));
+    }
+
+    if (baselines.size > 0) {
+      this.workspace.appendMemoryEvent({
+        type: 'file_baseline',
+        phase: this.workspace.readProjectState().currentPhase,
+        agentRole,
+        taskId,
+        summary: `Captured ${baselines.size} file baseline(s) before ${agentRole} edit planning.`,
+        data: { files: [...baselines.keys()] },
+      });
+    }
+
+    return baselines;
+  }
+
+  private _expandBaselinePaths(pathsToObserve: string[]): string[] {
+    const files = new Set<string>();
+    for (const rawPath of pathsToObserve) {
+      const normalized = this._normalizeRelativePath(String(rawPath ?? ''));
+      if (!this._isSafeWorkspaceRelativePath(normalized)) { continue; }
+
+      const looksLikeDirectory =
+        normalized.endsWith('/') ||
+        (!this.fileManager.fileExists(normalized) && path.posix.extname(normalized) === '');
+
+      if (looksLikeDirectory) {
+        for (const file of this.fileManager.listWorkspaceFiles(normalized, this._textFileExtensions())) {
+          const normalizedFile = this._normalizeRelativePath(file);
+          if (this._isSafeWorkspaceRelativePath(normalizedFile)) {
+            files.add(normalizedFile);
+          }
+        }
+      } else {
+        files.add(normalized);
+      }
+    }
+    return [...files].sort();
+  }
+
+  private _attachChangeBaseline(output: CodeWorkerOutput, baseline: Map<string, FileSnapshot>): void {
+    this._changeBaselines.set(output, baseline);
+  }
+
+  private _detectBaselineConflicts(output: CodeWorkerOutput): string[] {
+    const baseline = this._changeBaselines.get(output);
+    return this.fileManager.detectConflictingChanges(output.files, baseline);
+  }
+
+  private _structuredMemoryContext(maxLines: number = 80): string {
+    const raw = this.workspace.readFile(this.workspace.memoryEventsPath);
+    if (!raw) { return '_No structured memory events recorded yet._'; }
+    const lines = raw.split(/\r?\n/).filter(Boolean).slice(-maxLines);
+    return lines.join('\n');
+  }
+
+  private _selectWorkflowRoute(state: ProjectState): WorkflowRoute {
+    const prompt = (state.projectGoal || this.workspace.readUserPrompt()).toLowerCase();
+    const looksLikeMaintenance =
+      /(fix|bug|failing|failure|error|lint|compile|test|review|refactor|update|change|patch|sửa|lỗi|kiểm tra|cải tiến)/i.test(prompt);
+    const looksLikeNewProject =
+      /(build|create|generate|scaffold|new project|entire project|tạo|xây dựng|làm app|làm game)/i.test(prompt);
+    const hasExistingSource =
+      this.fileManager.listWorkspaceFiles('src', this._textFileExtensions()).length > 0 ||
+      this.fileManager.fileExists('package.json') ||
+      this.fileManager.fileExists('README.md');
+
+    if (hasExistingSource && looksLikeMaintenance && !looksLikeNewProject) {
+      return {
+        kind: 'maintenance',
+        skipDebate: true,
+        reason: 'Prompt looks like a focused change in an existing workspace, so the workflow skips broad debate and moves to grounded planning.',
+      };
+    }
+
+    return {
+      kind: 'full_project',
+      skipDebate: false,
+      reason: 'Prompt looks like a product/project generation request, so the full multi-agent debate remains useful.',
+    };
+  }
+
   private _loadConfig(): void {
     this.modelConfig = this.workspace.readModelConfig();
     this.ollama = new OllamaClient(
@@ -4531,8 +5122,52 @@ export class AgentOrchestrator {
     );
     this.terminal = new TerminalRunner(
       this.workspace.rootDir,
-      this.workspace.terminalLogPath
+      this.workspace.terminalLogPath,
+      this.modelConfig.commandPolicy
     );
+    this.terminalSessions = new TerminalSessionRunner(
+      this.workspace.rootDir,
+      this.workspace.logsDir,
+      this.modelConfig.commandPolicy
+    );
+    this.toolRegistry = new AutonomousToolRegistry(
+      this.fileManager,
+      this.searchService,
+      this.terminal,
+      this.patchService,
+      this.webFetcher
+    );
+    this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig.skills);
+    this.githubIntegration = new GitHubIntegrationService(this.workspace.rootDir, this.modelConfig.githubIntegration);
+    this.webSearch = new WebSearchService(this.modelConfig.webSearch);
+  }
+
+  private _ensureCapabilityServices(): void {
+    if (!this.terminalSessions) {
+      this.terminalSessions = new TerminalSessionRunner(
+        this.workspace.rootDir,
+        this.workspace.logsDir,
+        this.modelConfig?.commandPolicy
+      );
+    }
+    if (!this.toolRegistry) {
+      this.toolRegistry = new AutonomousToolRegistry(
+        this.fileManager,
+        this.searchService,
+        this.terminal,
+        this.patchService,
+        this.webFetcher
+      );
+    }
+    if (!this.skillManager) {
+      this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig?.skills);
+    }
+    if (!this.githubIntegration) {
+      this.githubIntegration = new GitHubIntegrationService(this.workspace.rootDir, this.modelConfig?.githubIntegration);
+    }
+    if (!this.webSearch) {
+      this.webSearch = new WebSearchService(this.modelConfig?.webSearch);
+    }
   }
 
   private _agentConfig(role: AgentRole): { model: string; fallbackModel: string } {
@@ -4547,6 +5182,121 @@ export class AgentOrchestrator {
     ];
   }
 
+  // ------------------------------------------------------------------
+  // Compact-context helpers
+  // ------------------------------------------------------------------
+
+  /**
+   * Character budget for the user message = 60 % of the model's context
+   * window (approximated as num_ctx × 4 chars/token).
+   * The remaining 40 % is reserved for the system prompt and model overhead.
+   */
+  /**
+   * Return per-role LLM options scaled by plan complexity.
+   * Creative agents get higher temperature; precise agents get lower.
+   * High-complexity plans get a larger context window for all roles.
+   */
+  private _optionsForRole(role: AgentRole): ModelOptions {
+    const base = { ...this.modelConfig.defaultOptions };
+    const complexity = this._taskPlanComplexity;
+    const baseCtx = base.num_ctx ?? 32_768;
+    const ctxScale = complexity === 'low' ? 0.5 : complexity === 'high' ? 1.5 : 1.0;
+    const scaledCtx = Math.round(baseCtx * ctxScale);
+    switch (role) {
+      case 'codeWorker':
+      case 'fixer':
+        return { ...base, temperature: 0.05, num_ctx: scaledCtx };
+      case 'reviewer':
+        return { ...base, temperature: 0.03, num_ctx: Math.min(scaledCtx, baseCtx) };
+      case 'architect':
+      case 'taskManager':
+        return { ...base, temperature: 0.07, num_ctx: Math.max(Math.round(baseCtx * 0.75), 16_384) };
+      case 'brainstorm':
+      case 'critic':
+      case 'secondBrainstorm':
+        // Cap output length for creative agents — they don't need to emit code
+        return { ...base, temperature: 0.2, num_ctx: Math.round(baseCtx * 0.5), num_predict: 2048 };
+      case 'tester':
+        return { ...base, temperature: 0.0, num_ctx: Math.round(baseCtx * 0.75) };
+      case 'briefBuilder':
+        return { ...base, temperature: 0.07, num_ctx: Math.round(baseCtx * 0.75) };
+      case 'finalIntegrator':
+        return { ...base, temperature: 0.05, num_ctx: scaledCtx };
+      default:
+        return base;
+    }
+  }
+
+  /** Append a lesson learned to the cross-session JSONL file. */
+  private _appendLesson(lesson: {
+    issue: string;
+    fix: string;
+    taskTitle: string;
+    filesAffected: string[];
+    attempt: number;
+  }): void {
+    try {
+      const entry = JSON.stringify({ ...lesson, recordedAt: new Date().toISOString() }) + '\n';
+      fs.appendFileSync(this.workspace.lessonsLearnedPath, entry, 'utf8');
+    } catch {
+      // Non-critical: do not fail the workflow if lesson logging fails
+    }
+  }
+
+  /** Load the N most recent lessons from the cross-session lessons file. */
+  private _loadLessons(maxCount = 5): string {
+    try {
+      const filePath = this.workspace.lessonsLearnedPath;
+      if (!fs.existsSync(filePath)) { return ''; }
+      const lines = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim());
+      const recent = lines.slice(-maxCount);
+      if (recent.length === 0) { return ''; }
+      const entries = recent.map(l => {
+        try {
+          const e = JSON.parse(l) as { issue: string; fix: string; taskTitle: string; attempt: number };
+          return `- Issue: ${e.issue}\n  Fix (attempt ${e.attempt}): ${e.fix}`;
+        } catch { return null; }
+      }).filter((x): x is string => x !== null);
+      return entries.join('\n\n');
+    } catch {
+      return '';
+    }
+  }
+
+  private _contextBudget(): number {
+    const numCtx = this.modelConfig?.defaultOptions?.num_ctx ?? 32_768;
+    return Math.floor(numCtx * 4 * 0.60);
+  }
+
+  /**
+   * Convenience factory for a `ContextSection`.
+   *
+   * @param heading    Markdown heading, e.g. `'# User Prompt'`.
+   *                   Pass `''` when the content already has its own heading.
+   * @param content    Raw text content.
+   * @param priority   1 = highest priority; sections are allocated budget
+   *                   in ascending priority order.
+   * @param maxFraction  Optional cap on what fraction of the total budget
+   *                     this section may consume (default: tier-based).
+   */
+  private _sec(
+    heading: string,
+    content: string,
+    priority: number,
+    maxFraction?: number,
+  ): ContextSection {
+    return { heading, content, priority, maxFraction };
+  }
+
+  /**
+   * Assemble `sections` into a single string that fits within
+   * `_contextBudget()` characters.  Uses `ContextCache.buildContext`
+   * internally so the budget logic and middle-truncation are centralised.
+   */
+  private _assembleContext(sections: ContextSection[]): string {
+    return this._contextCache.buildContext(sections, this._contextBudget());
+  }
+
   private async _callWithFallback(
     role: AgentRole,
     model: string,
@@ -4558,7 +5308,7 @@ export class AgentOrchestrator {
     try {
       return await this.ollama.callWithFallback(
         model, fallbackModel, messages, role,
-        this.modelConfig.defaultOptions, outputFile, inputFiles
+        this._optionsForRole(role), outputFile, inputFiles
       );
     } catch (err) {
       return await this._selfHealTextModelCall(role, model, fallbackModel, messages, outputFile, inputFiles, err);
@@ -4576,7 +5326,7 @@ export class AgentOrchestrator {
     try {
       return await this.ollama.callWithFallbackJson<T>(
         model, fallbackModel, messages, role,
-        this.modelConfig.defaultOptions, outputFile, inputFiles
+        this._optionsForRole(role), outputFile, inputFiles
       );
     } catch (err) {
       return await this._selfHealJsonModelCall<T>(role, model, fallbackModel, messages, outputFile, inputFiles, err);
@@ -4601,12 +5351,14 @@ export class AgentOrchestrator {
 
     for (let attempt = 1; attempt <= healing.modelCallRetries; attempt++) {
       this._checkAborted();
-      await this._delay(healing.retryDelayMs * attempt);
+      // Exponential backoff with jitter to avoid thundering-herd on overloaded model
+      const jitter = Math.floor(Math.random() * healing.retryDelayMs * 0.5);
+      await this._delay(healing.retryDelayMs * Math.pow(2, attempt - 1) + jitter);
       try {
         this._emit('log', `Retrying ${role} model call (${attempt}/${healing.modelCallRetries}) with compact context...`, 'warn');
         return await this.ollama.callWithFallback(
           model, fallbackModel, recoveryMessages, role,
-          this.modelConfig.defaultOptions, outputFile, inputFiles
+          this._optionsForRole(role), outputFile, inputFiles
         );
       } catch (err) {
         lastError = err;
@@ -4620,7 +5372,7 @@ export class AgentOrchestrator {
         this._emit('log', `Trying alternate local model "${alternateModel}" for ${role}...`, 'warn');
         return await this.ollama.chat(
           alternateModel, recoveryMessages, role,
-          this.modelConfig.defaultOptions, outputFile, inputFiles
+          this._optionsForRole(role), outputFile, inputFiles
         );
       } catch (err) {
         lastError = err;
@@ -4649,12 +5401,14 @@ export class AgentOrchestrator {
 
     for (let attempt = 1; attempt <= healing.modelCallRetries; attempt++) {
       this._checkAborted();
-      await this._delay(healing.retryDelayMs * attempt);
+      // Exponential backoff with jitter
+      const jitter = Math.floor(Math.random() * healing.retryDelayMs * 0.5);
+      await this._delay(healing.retryDelayMs * Math.pow(2, attempt - 1) + jitter);
       try {
         this._emit('log', `Retrying ${role} JSON call (${attempt}/${healing.modelCallRetries}) with compact context...`, 'warn');
         return await this.ollama.callWithFallbackJson<T>(
           model, fallbackModel, recoveryMessages, role,
-          this.modelConfig.defaultOptions, outputFile, inputFiles
+          this._optionsForRole(role), outputFile, inputFiles
         );
       } catch (err) {
         lastError = err;
@@ -4668,7 +5422,7 @@ export class AgentOrchestrator {
         this._emit('log', `Trying alternate local model "${alternateModel}" for ${role} JSON...`, 'warn');
         return await this.ollama.chatJson<T>(
           alternateModel, recoveryMessages, role,
-          this.modelConfig.defaultOptions, outputFile, inputFiles
+          this._optionsForRole(role), outputFile, inputFiles
         );
       } catch (err) {
         lastError = err;
@@ -4782,6 +5536,12 @@ export class AgentOrchestrator {
     });
     this.callbacks.onStateUpdate?.(state);
     this._emit('phase', phase, message);
+    this.workspace.appendMemoryEvent({
+      type: 'phase',
+      phase,
+      agentRole: this._agentRoleForPhase(phase),
+      summary: message,
+    });
     logInfo(`Phase: ${phase} – ${message}`);
   }
 
@@ -4939,6 +5699,25 @@ export class AgentOrchestrator {
     const raw = this.workspace.readFile(this.workspace.taskPlanPath);
     if (!raw) { return null; }
     try { return JSON.parse(raw) as TaskPlan; } catch { return null; }
+  }
+
+  private _writeDynamicPlanReport(state: ProjectState, taskPlan: TaskPlan): void {
+    const report = this.planController.createReport(
+      state.projectGoal,
+      taskPlan.tasks,
+      state.completedTasks,
+      state.failedTasks
+    );
+    this.workspace.writeFile(this.workspace.planControllerPath, prettyJson(report));
+    this.workspace.appendMemoryEvent({
+      type: 'plan',
+      phase: state.currentPhase,
+      summary: `Dynamic plan updated: ${report.summary}`,
+      data: {
+        currentStep: report.currentStep,
+        nextAction: this.planController.nextAction(report),
+      },
+    });
   }
 
   private _loadTaskResults(): TaskResults | null {
@@ -5175,6 +5954,19 @@ export class AgentOrchestrator {
       ...input,
     };
     this._activities = [activity, ...this._activities].slice(0, 100);
+    this.workspace.appendMemoryEvent({
+      type: 'activity',
+      phase: activity.phase,
+      agentRole: activity.agentRole,
+      taskId: activity.taskId,
+      summary: `${activity.title}: ${activity.detail}`,
+      data: {
+        status: activity.status,
+        files: activity.files,
+        round: activity.round,
+        totalRounds: activity.totalRounds,
+      },
+    });
     this.callbacks.onActivityUpdate?.(this._activities);
   }
 

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import type { ModelConfig, ProjectState } from '../types';
+import type { ModelConfig, ProjectState, StructuredMemoryEvent } from '../types';
 import { prettyJson } from '../utils/json';
 import { logInfo } from '../utils/logging';
 
@@ -26,9 +26,45 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
     alternateModelLimit: 3,
     compactContextChars: 12_000,
   },
+  commandPolicy: {
+    approvedPrefixes: [],
+    requireApprovalForNetwork: true,
+    requireApprovalForExternalWrites: true,
+    allowLongRunningSessions: true,
+  },
+  webSearch: {
+    enabled: false,
+    maxResults: 5,
+    officialDocsOnly: true,
+    allowedDomains: [
+      'developer.mozilla.org',
+      'docs.github.com',
+      'nodejs.org',
+      'react.dev',
+      'typescriptlang.org',
+    ],
+  },
+  appVerification: {
+    enabled: true,
+    startServer: true,
+    httpSmokeTest: true,
+    browserSmokeTest: false,
+  },
+  githubIntegration: {
+    enabled: true,
+    preferGhCli: true,
+  },
+  skills: {
+    enabled: true,
+    skillDirs: ['.agent-workspace/skills', 'skills'],
+  },
+  toolCalling: {
+    enabled: true,
+    maxToolRounds: 6,
+  },
   defaultOptions: {
     temperature: 0.1,
-    num_ctx: 8192,
+    num_ctx: 32768,
     top_p: 0.9,
   },
   agents: {
@@ -127,6 +163,8 @@ export class AgentWorkspace {
   get constraintsPath(): string    { return path.join(this.memoryDir, 'constraints.md'); }
   get openQuestionsPath(): string  { return path.join(this.memoryDir, 'open_questions.md'); }
   get assumptionsPath(): string    { return path.join(this.memoryDir, 'assumptions.md'); }
+  get lessonsLearnedPath(): string  { return path.join(this.memoryDir, 'lessons_learned.jsonl'); }
+  get memoryEventsPath(): string   { return path.join(this.memoryDir, 'events.jsonl'); }
 
   get agentsDir(): string          { return path.join(this.agentDir, 'agents'); }
   get tasksDir(): string           { return path.join(this.agentDir, 'tasks'); }
@@ -151,6 +189,12 @@ export class AgentWorkspace {
   get projectBriefPath(): string    { return this.agentNotePath('00_project_brief.json'); }
   get toolchainReportPath(): string { return this.agentNotePath('00_toolchain_report.json'); }
   get gitSnapshotPath(): string     { return this.agentNotePath('00_git_snapshot.json'); }
+  get githubContextPath(): string   { return this.agentNotePath('00_github_context.json'); }
+  get repoSearchPath(): string      { return this.agentNotePath('00_repo_search.json'); }
+  get skillContextPath(): string    { return this.agentNotePath('00_skill_context.md'); }
+  get webSearchPath(): string       { return this.agentNotePath('00_web_search.json'); }
+  get planControllerPath(): string  { return this.agentNotePath('00_plan_controller.json'); }
+  get appVerificationPath(): string { return this.agentNotePath('08_app_verification.json'); }
   get architectMdPath(): string     { return this.agentNotePath('04_architect.md'); }
   get architectJsonPath(): string   { return this.agentNotePath('04_architect_plan.json'); }
   get taskManagerPath(): string     { return this.agentNotePath('05_task_manager.md'); }
@@ -258,6 +302,12 @@ export class AgentWorkspace {
         ...parsed,
         agents: { ...DEFAULT_MODEL_CONFIG.agents, ...(parsed.agents ?? {}) },
         selfHealing: { ...DEFAULT_MODEL_CONFIG.selfHealing, ...(parsed.selfHealing ?? {}) },
+        commandPolicy: { ...DEFAULT_MODEL_CONFIG.commandPolicy, ...(parsed.commandPolicy ?? {}) },
+        webSearch: { ...DEFAULT_MODEL_CONFIG.webSearch, ...(parsed.webSearch ?? {}) },
+        appVerification: { ...DEFAULT_MODEL_CONFIG.appVerification, ...(parsed.appVerification ?? {}) },
+        githubIntegration: { ...DEFAULT_MODEL_CONFIG.githubIntegration, ...(parsed.githubIntegration ?? {}) },
+        skills: { ...DEFAULT_MODEL_CONFIG.skills, ...(parsed.skills ?? {}) },
+        toolCalling: { ...DEFAULT_MODEL_CONFIG.toolCalling, ...(parsed.toolCalling ?? {}) },
         defaultOptions: { ...DEFAULT_MODEL_CONFIG.defaultOptions, ...(parsed.defaultOptions ?? {}) },
       };
       merged.debateRounds = Math.max(1, Math.min(10, Number(merged.debateRounds) || DEFAULT_MODEL_CONFIG.debateRounds));
@@ -273,6 +323,8 @@ export class AgentWorkspace {
       merged.selfHealing.retryDelayMs = Number.isFinite(retryDelayMs) ? Math.max(0, retryDelayMs) : DEFAULT_MODEL_CONFIG.selfHealing.retryDelayMs;
       merged.selfHealing.alternateModelLimit = Number.isFinite(alternateModelLimit) ? Math.max(0, Math.min(10, alternateModelLimit)) : DEFAULT_MODEL_CONFIG.selfHealing.alternateModelLimit;
       merged.selfHealing.compactContextChars = Number.isFinite(compactContextChars) ? Math.max(2_000, compactContextChars) : DEFAULT_MODEL_CONFIG.selfHealing.compactContextChars;
+      merged.webSearch!.maxResults = Math.max(1, Math.min(10, Number(merged.webSearch!.maxResults) || DEFAULT_MODEL_CONFIG.webSearch!.maxResults));
+      merged.toolCalling!.maxToolRounds = Math.max(1, Math.min(12, Number(merged.toolCalling!.maxToolRounds) || DEFAULT_MODEL_CONFIG.toolCalling!.maxToolRounds));
       if (merged.autonomousMode || merged.askPolicy === 'never') {
         merged.safeMode = false;
         merged.askPolicy = 'never';
@@ -350,6 +402,27 @@ export class AgentWorkspace {
       `\n## ${new Date().toISOString()} — ${source}\n\n` +
       `${assumption}\n`;
     this.appendFile(this.assumptionsPath, entry);
+    this.appendMemoryEvent({
+      type: 'assumption',
+      summary: assumption,
+      data: { source },
+    });
+  }
+
+  /**
+   * Append a machine-readable memory event for future agents.
+   */
+  appendMemoryEvent(event: Omit<StructuredMemoryEvent, 'timestamp'> & { timestamp?: string }): void {
+    const normalized: StructuredMemoryEvent = {
+      timestamp: event.timestamp ?? new Date().toISOString(),
+      type: event.type,
+      phase: event.phase,
+      agentRole: event.agentRole,
+      taskId: event.taskId,
+      summary: event.summary,
+      data: event.data,
+    };
+    this.appendFile(this.memoryEventsPath, `${JSON.stringify(normalized)}\n`);
   }
 
   /**
