@@ -635,6 +635,7 @@ export class AgentOrchestrator {
       ['yarn', 'yarn --version'],
       ['git', 'git --version'],
       ['java', 'java -version'],
+      ['swift', 'swift --version'],
       ['xcodebuild', 'xcodebuild -version'],
       ['android-sdk', 'adb version'],
       ['flutter', 'flutter --version'],
@@ -1731,18 +1732,27 @@ export class AgentOrchestrator {
     };
   }
 
+  private _isXcodebuildAvailable(): boolean {
+    const report = this._readToolchainReport();
+    if (!report) { return false; }
+    return report.checks.some(c => c.name === 'xcodebuild' && c.available);
+  }
+
   private _nativeVerificationCommand(): string | null {
     if (this.fileManager.fileExists('Package.swift')) {
-      return 'swift test';
+      return 'swift build';
     }
 
     const workspace = this._findWorkspaceEntryByExtension('.xcworkspace');
     if (workspace) {
+      // Only emit xcodebuild commands when the tool is actually available
+      if (!this._isXcodebuildAvailable()) { return null; }
       return `xcodebuild -list -workspace ${this._quoteShell(workspace)}`;
     }
 
     const project = this._findWorkspaceEntryByExtension('.xcodeproj');
     if (project) {
+      if (!this._isXcodebuildAvailable()) { return null; }
       return `xcodebuild -list -project ${this._quoteShell(project)}`;
     }
 
@@ -1761,22 +1771,26 @@ export class AgentOrchestrator {
     const jsFiles = this.fileManager.listWorkspaceFiles('', ['.js', '.mjs', '.cjs']);
     const testFiles = this.fileManager.listWorkspaceFiles('test', ['.js', '.mjs', '.cjs']);
     const packageJson = this.fileManager.readWorkspaceFile('package.json');
-    const hasPackageVerification =
-      this.terminal.hasPackageScript('compile') ||
-      this.terminal.hasPackageScript('build') ||
-      this.terminal.hasPackageScript('test');
+    const packageSwift = this.fileManager.readWorkspaceFile('Package.swift');
     const hasNativeVerification = this._nativeVerificationCommand() !== null;
 
-    const looksLikeNodeProject =
-      jsFiles.some(file => file.startsWith('src/') || file.startsWith('test/')) ||
-      /node\.js|npm|cli|command line|terminal/.test(prompt + projectBrief);
+    // Swift/Apple project detection: skip Node quality checks for these.
+    const looksLikeSwiftProject =
+      packageSwift !== null ||
+      /swift|swiftui|ios|macos|iphone|ipad|xcode|cocoa/.test(prompt + projectBrief);
 
-    if (looksLikeNodeProject && !packageJson && !hasPackageVerification && !hasNativeVerification) {
-      issues.push('Node.js project is missing package.json, so install/run/test scripts cannot be verified.');
+    const looksLikeNodeProject =
+      !looksLikeSwiftProject && (
+        jsFiles.some(file => file.startsWith('src/') || file.startsWith('test/')) ||
+        /node\.js|npm|cli|command line|terminal/.test(prompt + projectBrief)
+      );
+
+    if (looksLikeSwiftProject && !packageSwift && !hasNativeVerification) {
+      issues.push('Swift project is missing Package.swift. The first task must create a valid Package.swift with all targets declared.');
     }
 
     let parsedPackage: { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } | null = null;
-    if (packageJson) {
+    if (packageJson && !looksLikeSwiftProject) {
       try {
         parsedPackage = JSON.parse(packageJson);
       } catch (err) {
@@ -2926,7 +2940,18 @@ export class AgentOrchestrator {
     return applied ? recovery : null;
   }
 
+  private _isApplePlatformProject(): boolean {
+    const prompt = this.workspace.readUserPrompt().toLowerCase();
+    const brief = (this.workspace.readFile(this.workspace.projectBriefPath) ?? '').toLowerCase();
+    return /swift|swiftui|ios|macos|iphone|ipad|xcode|cocoa/.test(prompt + brief)
+      || this.fileManager.fileExists('Package.swift')
+      || this._findWorkspaceEntryByExtension('.xcodeproj') !== null
+      || this._findWorkspaceEntryByExtension('.xcworkspace') !== null;
+  }
+
   private _deterministicProductRecovery(task: TaskItem, review?: ReviewResult): CodeWorkerOutput | null {
+    // Never generate web/game/Node.js files for Apple platform projects
+    if (this._isApplePlatformProject()) { return null; }
     return this._deterministicArkanoidGameRecovery(task, review)
       ?? this._deterministicBrowserGameRecovery(task, review)
       ?? this._deterministicApiRecovery(task, review)

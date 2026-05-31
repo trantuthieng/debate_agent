@@ -9,6 +9,10 @@ type TemplateRule = {
 export class TemplateMatcherService {
   private readonly templateRules: TemplateRule[] = [
     {
+      keywords: ['finance', 'expense', 'asset', 'gold', 'stock', 'currency', 'thu chi', 'tai san', 'vang', 'chung khoan', 'ngoai te'],
+      templateId: 'personal-finance-tracker',
+    },
+    {
       keywords: ['react'],
       templateId: 'react-app',
     },

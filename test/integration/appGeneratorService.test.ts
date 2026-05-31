@@ -28,6 +28,28 @@ test('app generator detects React dependencies from generated content', async ()
   assert.deepEqual(result.dependencies.sort(), ['react', 'react-dom']);
 });
 
+test('app generator creates a personal finance tracker prototype', async () => {
+  const appGenerator = new AppGeneratorService();
+  const result = await appGenerator.generate({
+    content: 'Create a finance app to track cash, gold, stocks, and foreign currency assets',
+    timestamp: new Date().toISOString(),
+  });
+
+  assert.equal(result.name, 'CreateAFinance');
+  assert.deepEqual(
+    result.files.map((file) => file.filePath).sort(),
+    ['README.md', 'app.js', 'index.html', 'manifest.webmanifest', 'styles.css']
+  );
+  assert.match(
+    result.files.find((file) => file.filePath === 'index.html')?.fileContent ?? '',
+    /Theo doi thu chi/
+  );
+  assert.match(
+    result.files.find((file) => file.filePath === 'app.js')?.fileContent ?? '',
+    /Vang SJC/
+  );
+});
+
 test('app generator rejects empty prompt content', async () => {
   const appGenerator = new AppGeneratorService();
 

@@ -1,12 +1,30 @@
+# Dependencies
 node_modules/
+
+# Build and packaged output
 out/
 dist/
 *.vsix
+*.js.map
+
+# Test and editor artifacts
 .vscode-test/
+coverage/
 .DS_Store
+
+# Local environment files
+.env
+.env.*
+*.local
+
+# Agent runtime state and generated products
 .agent-workspace/*
 !.agent-workspace/
 !.agent-workspace/model_config.json
 agent-products/
+generated-apps/
+
+# Local scratch files
 note.txt
-*.js.map
+AGENT_IMPROVEMENT_REPORT.md
+test/run_*.js

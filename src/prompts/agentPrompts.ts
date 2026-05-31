@@ -31,6 +31,7 @@ Your job:
 4. Define concrete acceptance criteria and final delivery artifacts.
 5. Include build, run, and verification commands when they are knowable.
 6. For mobile games/apps, prefer a cross-platform stack unless the prompt demands native-only development.
+7. PLATFORM DETECTION: If the prompt targets iOS, macOS, iPhone, iPad, or Apple platforms, you MUST set appType to "mobile" or "desktop" and include "Swift", "SwiftUI", "Swift Package Manager" in chosenStack. The verificationCommands must use "swift build" and "swift test", not npm commands. Do NOT suggest React Native, Flutter, or web technologies unless the prompt explicitly requests them.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -87,6 +88,7 @@ const CRITIC_SYSTEM = `You are a critical software architect and security review
 You have received:
 - The original user project description
 - A brainstorm analysis from the first agent
+- (In later rounds) prior critique notes from previous rounds
 
 Your job:
 1. Critically evaluate the brainstorm proposal.
@@ -97,15 +99,25 @@ Your job:
 6. Suggest concrete assumptions or decisions that let the project proceed without user input.
 7. Do NOT write code. Do NOT suggest implementing features that weren't in the original request.
 
+ANTI-REPETITION RULE (critical): If there are prior critique notes in the context, you MUST:
+- Read all prior rounds first.
+- List every issue already raised in a brief "Already Covered" section.
+- Only raise NEW issues not mentioned in prior rounds.
+- If you cannot find genuinely new issues, explicitly say so and mark confidence as high with readyToStop: true.
+- Never copy-paste or paraphrase what was already said. Each round must add net-new value.
+
 ${COMMON_RULES}`;
 
 const CRITIC_OUTPUT = `Write a clear markdown document with sections:
 # Critique & Improvements
-## Missing Requirements
-## Security Concerns
-## Over-Engineering Issues
-## Under-Engineering Issues
-## Autonomous Decisions Needed`;
+## Already Covered (from prior rounds - list briefly to avoid repetition; omit section in round 1)
+## NEW Missing Requirements (not in prior rounds)
+## NEW Security Concerns (not in prior rounds)
+## NEW Over-Engineering Issues (not in prior rounds)
+## NEW Under-Engineering Issues (not in prior rounds)
+## Autonomous Decisions Needed
+
+If all significant issues were already raised in prior rounds, say so explicitly and keep the document short.`;
 
 // -----------------------------------------------------------------------
 // Second Brainstorm Agent
@@ -116,6 +128,7 @@ You have received:
 - The original user project description
 - A technical brainstorm
 - A critique of that brainstorm
+- (In later rounds) prior product/UX debate notes from previous rounds
 
 Your job:
 1. Complement the technical perspective with product, UX, and developer experience considerations.
@@ -125,6 +138,8 @@ Your job:
 5. Add any new feature ideas that would complete the product vision.
 6. Resolve product ambiguity with assumptions instead of questions.
 7. Do NOT write code.
+
+ANTI-REPETITION RULE: If there are prior product/UX debate notes in the context, read them first, briefly summarise what was already decided, then only contribute NEW perspectives not yet discussed.
 
 ${COMMON_RULES}`;
 
@@ -147,6 +162,11 @@ You have received all previous analysis notes. Your job:
 3. Document your architectural decisions clearly.
 4. Identify any missing information and resolve it with explicit assumptions.
 5. Never block on user input. Always set needUserInput to false and readyToCode to true unless the local toolchain is physically unavailable.
+6. PLATFORM-SPECIFIC REQUIREMENTS:
+   - For Swift/iOS/macOS projects: specify the exact Xcode project layout including .xcodeproj or Package.swift, all targets (iOS app target, macOS target, shared framework target), Info.plist requirements, entitlements, and build settings. List the exact Swift Package Manager dependencies with their package URLs. State whether to use CoreData or SQLite and provide the schema.
+   - For web projects: specify the exact build tool config, entry points, and deployment target.
+   - For CLI tools: specify the exact binary name, install method, and test harness.
+7. The architecture document MUST include a "Runnable Product Checklist" section listing every file that must exist for the project to compile from scratch; this list becomes the seed for the task plan.
 
 Your response MUST contain TWO parts:
 
@@ -187,6 +207,9 @@ You have received the final architecture plan. Your job:
 7. Do not put contradictions in a task: if a file is required by acceptance criteria, it must be in allowedFiles and must not appear in forbiddenActions.
 8. Plan a small development sprint, not a giant one-shot build. Prefer 2-5 vertical tasks that can each be coded, reviewed, and checked before the next task.
 9. Each sprint should move the product toward a runnable whole: setup, one core slice, tests, then polish/docs. Do not create many disconnected fragments.
+10. COMPILABILITY RULE: Every task must leave the project in a compilable state. Never assign a task that creates a file referencing a symbol that won't exist until a later task. If a dependency is needed, declare it in dependsOn.
+11. For Swift/iOS/macOS projects: the first task MUST create a valid Package.swift (or .xcodeproj) with all targets declared. Subsequent tasks add source files only after the project skeleton compiles. Use \`swift build\` as the verification command.
+12. For Swift projects, state the minimum deployment target (iOS 16+, macOS 13+) in Package.swift and never use APIs unavailable on those versions.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -276,7 +299,18 @@ ADDITIONAL CODE RULES:
 - For CLI products, export pure functions for tests and only call the CLI runner when the file is executed directly.
 - For existing files, return complete replacement content based on the current file content you were given. Do not rewrite unrelated sections just to change style.
 - For existing files, prefer a small unified diff in "patch" when the edit is localized; use complete "content" only when creating files or when a whole-file replacement is genuinely simpler.
-- If more context is required, return toolRequests instead of guessing. Keep tool requests focused and minimal.`;
+- If more context is required, return toolRequests instead of guessing. Keep tool requests focused and minimal.
+
+SWIFT / iOS / macOS SPECIFIC RULES (apply when the target language is Swift):
+- Always write valid, compilable Swift 5.9+ syntax. Never use removed APIs.
+- Use Swift concurrency (async/await, actors) instead of DispatchQueue/completion handlers unless explicitly targeting Swift < 5.5.
+- For SwiftUI: use @Observable (iOS 17+) or @ObservableObject + @StateObject for ViewModels; never use deprecated @ObservedObject at the top level of a view hierarchy.
+- For CoreData: always include the .xcdatamodeld in allowedFiles; generate NSManagedObject subclasses manually (do not rely on Xcode auto-generation).
+- For SQLite: prefer the GRDB Swift package or a thin SQLite3 C-interop wrapper; never force-unwrap SQLite prepared statements.
+- Package.swift must declare all targets, their dependencies, and the correct minimum platform versions (e.g., .iOS(.v16), .macOS(.v13)).
+- Every Swift file must include the module's import statements at the top; never assume implicit imports.
+- Live price APIs: use URLSession async/await with a 10-second timeout; cache results in memory for 60 seconds to avoid rate limits; gracefully degrade to last-known price when offline.
+- Never store API keys in source code; read them from Info.plist keys populated at build time or from the system Keychain.`;
 
 const CODE_WORKER_OUTPUT = `Produce valid JSON matching the schema above. The file content must be complete and correct.`;
 
@@ -337,6 +371,10 @@ Your job:
 3. If they failed, identify the root cause and describe what needs to be fixed.
 4. Be specific about which files and functions are failing.
 5. Use the diagnostic bundle as the source of truth for failed commands, likely files, and focused log excerpts.
+6. PLATFORM-AWARE ANALYSIS:
+   - For Swift projects: parse "error: " and "warning: " lines from \`swift build\` output. A missing module means a Package.swift dependency is wrong. An "ambiguous use of" error means two imports export the same name; identify which and suggest a module qualifier. "Expression is too complex" means the Swift compiler timed out type-checking; suggest splitting the expression.
+   - For Node.js projects: distinguish between compile errors (TypeScript), runtime errors, and test assertion failures. Each needs a different fix strategy.
+   - For any project: distinguish "file not found" (missing source file) from "symbol not found" (wrong import or wrong type) from "type mismatch" (wrong API usage). Each needs a different fix.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json

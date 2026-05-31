@@ -381,6 +381,11 @@ test('testing uses xcode project verification when no package scripts exist', as
       needsFix: false,
     },
   });
+  orchestrator.workspace.writeFile(orchestrator.workspace.toolchainReportPath, JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    platform: process.platform,
+    checks: [{ name: 'xcodebuild', command: 'xcodebuild -version', available: true }],
+  }));
 
   await orchestrator._phaseTesting(makeState());
 
