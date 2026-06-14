@@ -762,6 +762,73 @@ test('improvement consensus stops only when all brainstorm agents agree no work 
   assert.equal(orchestrator._consensusReadyToStop(continueConsensus), false);
 });
 
+test('debate scoring aggregates the panel and selects the highest-scored direction', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const panel = [
+    { agentRole: 'brainstorm', scores: { feasibility: 8, completeness: 8, risk: 8, ux: 8, quality: 8 }, overall: 8, recommendation: 'Direction A', topRisk: 'r' },
+    { agentRole: 'critic', scores: { feasibility: 9, completeness: 9, risk: 9, ux: 9, quality: 9 }, overall: 9, recommendation: 'Direction B (best)', topRisk: 'r' },
+    { agentRole: 'secondBrainstorm', scores: { feasibility: 7, completeness: 7, risk: 7, ux: 7, quality: 7 }, overall: 7, recommendation: 'Direction C', topRisk: 'r' },
+    { agentRole: 'architect', scores: { feasibility: 8, completeness: 8, risk: 8, ux: 8, quality: 8 }, overall: 8, recommendation: 'Direction D', topRisk: 'r' },
+    { agentRole: 'reviewer', scores: { feasibility: 8, completeness: 8, risk: 8, ux: 8, quality: 8 }, overall: 8, recommendation: 'Direction E', topRisk: 'r' },
+  ];
+
+  const decision = orchestrator._aggregateDebateScores(panel);
+
+  assert.equal(decision.judgeCount, 5);
+  assert.equal(decision.winningDirection, 'Direction B (best)');
+  assert.equal(decision.weightedScore, 8); // mean of 8,9,7,8,8
+  assert.equal(decision.agreement, 'high'); // tight spread
+  assert.equal(decision.rankedRecommendations[0].agentRole, 'critic');
+});
+
+test('debate scoring reports low agreement when the panel disagrees and handles an empty panel', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const split = [
+    { agentRole: 'brainstorm', scores: { feasibility: 1, completeness: 1, risk: 1, ux: 1, quality: 1 }, overall: 1, recommendation: 'Low' },
+    { agentRole: 'critic', scores: { feasibility: 10, completeness: 10, risk: 10, ux: 10, quality: 10 }, overall: 10, recommendation: 'High (winner)' },
+  ];
+  const decision = orchestrator._aggregateDebateScores(split);
+  assert.equal(decision.agreement, 'low');
+  assert.equal(decision.winningDirection, 'High (winner)');
+
+  const empty = orchestrator._aggregateDebateScores([]);
+  assert.equal(empty.judgeCount, 0);
+  assert.equal(empty.weightedScore, 0);
+});
+
+test('debate score normalization clamps out-of-range values and derives a missing overall', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const normalized = orchestrator._normalizeDebateScore('architect', {
+    scores: { feasibility: 99, completeness: -4, risk: 'bad', ux: 6, quality: 6 },
+  });
+  assert.equal(normalized.scores.feasibility, 10);
+  assert.equal(normalized.scores.completeness, 0);
+  assert.equal(normalized.scores.risk, 5); // non-numeric falls back to 5
+  // overall derived from mean of (10,0,5,6,6) = 5.4
+  assert.equal(normalized.overall, 5.4);
+  assert.equal(normalized.agentRole, 'architect');
+});
+
+test('debate panel guard guarantees five distinct judge models even when roles share one', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  // Force a collision: critic and reviewer share the same primary model.
+  orchestrator.modelConfig.agents.reviewer.model = 'critic';
+  orchestrator.modelConfig.agents.reviewer.fallbackModel = 'critic';
+
+  const panelRoles = ['brainstorm', 'critic', 'secondBrainstorm', 'architect', 'reviewer'];
+  const { assignments, distinctCount } = orchestrator._assignDiversePanelModels(panelRoles);
+
+  const models = panelRoles.map(r => assignments.get(r).model);
+  assert.equal(distinctCount, 5, `expected 5 distinct models, got ${models.join(', ')}`);
+  assert.equal(new Set(models).size, 5);
+  // The colliding reviewer judge borrowed a different, still-unused model.
+  assert.notEqual(assignments.get('reviewer').model, assignments.get('critic').model);
+});
+
 test('fallback improvement consensus requires more than one clean sprint before stopping', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);

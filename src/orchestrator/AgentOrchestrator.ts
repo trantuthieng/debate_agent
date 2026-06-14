@@ -24,6 +24,7 @@ import type {
   TerminalRunResult,
   TimelineEntry,
   ToolchainReport,
+  ToolCallRequest,
   ToolCallResult,
   UserQuestion,
   WebFetchResult,
@@ -46,6 +47,7 @@ import { GitHubIntegrationService } from '../services/githubIntegrationService';
 import { PlanController } from '../services/planController';
 import { SkillManager } from '../services/skillManager';
 import { WebSearchService } from '../services/webSearchService';
+import { ResearchService } from '../services/researchService';
 import { TerminalSessionRunner } from '../terminal/TerminalSessionRunner';
 import { AutonomousToolRegistry } from '../tools/AutonomousToolRegistry';
 import { ContextCache } from '../context/ContextCache';
@@ -57,6 +59,32 @@ interface ImprovementConsensus {
   confidence: 'low' | 'medium' | 'high';
   remainingWork: string[];
   nextSprintGoal: string;
+  rationale: string;
+}
+
+// One judge's scorecard in the round-4 debate scoring panel. Each judge runs on
+// a different local model and rates the consolidated approach across weighted
+// criteria, then recommends the single best direction to proceed with.
+interface DebateScore {
+  agentRole: AgentRole;
+  scores: {
+    feasibility: number;   // can this be built locally with the chosen stack?
+    completeness: number;  // does it cover the user's actual request?
+    risk: number;          // higher = safer (fewer unmitigated risks)
+    ux: number;            // product / developer experience quality
+    quality: number;       // engineering quality of the proposed direction
+  };
+  overall: number;         // 0-10 weighted summary the judge assigns
+  recommendation: string;  // the direction this judge would proceed with
+  topRisk: string;
+}
+
+interface DebateDecision {
+  winningDirection: string;
+  weightedScore: number;       // 0-10 aggregate across all judges
+  judgeCount: number;
+  agreement: 'low' | 'medium' | 'high';
+  rankedRecommendations: Array<{ agentRole: AgentRole; overall: number; recommendation: string }>;
   rationale: string;
 }
 
@@ -108,6 +136,7 @@ export class AgentOrchestrator {
   private skillManager!: SkillManager;
   private githubIntegration!: GitHubIntegrationService;
   private webSearch!: WebSearchService;
+  private research!: ResearchService;
   private modelConfig!: ModelConfig;
   private callbacks: OrchestratorCallbacks = {};
   private _aborted = false;
@@ -128,6 +157,7 @@ export class AgentOrchestrator {
   // Pending approvals (patch / command) resolved via user interaction
   private _pendingPatchResolvers = new Map<string, (approved: boolean) => void>();
   private _pendingCommandResolvers = new Map<string, (approved: boolean) => void>();
+  private _approvalCounter = 0;
 
   constructor(workspaceRoot: string) {
     this.workspace = new AgentWorkspace(workspaceRoot);
@@ -305,6 +335,8 @@ export class AgentOrchestrator {
 
     const completedPhases: WorkflowPhase[] = phase !== 'idle' && phase !== 'intake' ? ['intake'] : [];
 
+    this.workspace.initializeJournal(state.projectGoal || this.workspace.readUserPrompt());
+
     try {
       this.workspace.appendMemoryEvent({
         type: 'phase',
@@ -312,6 +344,8 @@ export class AgentOrchestrator {
         summary: `Workflow route selected: ${route.kind}. ${route.reason}`,
         data: { route },
       });
+      this._journal('start', `Workflow started — route: ${route.kind}`,
+        `${route.reason}\n\n${route.skipDebate ? 'Debate is skipped for this focused maintenance task.' : 'Running the full multi-round debate before building.'}`);
       // The workflow starts with debate/brainstorming, then turns that consensus
       // into an executable brief and small implementation sprints.
       if (!route.skipDebate && !this._phaseAlreadyDone(phase, 'brainstorm', completedPhases)) {
@@ -328,6 +362,13 @@ export class AgentOrchestrator {
         await this._phaseSecondBrainstorm(state);
       } else if (route.skipDebate) {
         this._updateTimeline('second_brainstorm', 'skipped');
+      }
+      // Round 3: the original proposer reads every critique and responds/revises.
+      // Round 4: a multi-model judging panel scores the consolidated approach and
+      // picks the single best direction before it is frozen into the brief.
+      if (!route.skipDebate && !this._phaseAlreadyDone(phase, 'briefing', completedPhases)) {
+        await this._phaseDebateResponse(state);
+        await this._phaseDebateScoring(state);
       }
       if (!this._phaseAlreadyDone(phase, 'briefing', completedPhases)) {
         await this._phaseBriefing(state);
@@ -385,6 +426,8 @@ export class AgentOrchestrator {
       this.workspace.writeProjectState(state);
       this.callbacks.onStateUpdate?.(state);
       this._updateTimeline('completed', 'completed');
+      this._journal('done', 'Workflow completed successfully',
+        `Completed ${state.completedTasks.length} task(s). See the final report note for the full handoff.`);
       this._emit('phase', 'completed', 'Workflow completed successfully!');
     } catch (err) {
       if (err instanceof WaitForUserError) {
@@ -398,9 +441,12 @@ export class AgentOrchestrator {
         this.workspace.writeProjectState(state);
         this.callbacks.onStateUpdate?.(state);
         err.questions.forEach(q => this.callbacks.onQuestionNeeded?.(q));
+        this._journal('warn', 'Paused — waiting for the boss',
+          err.questions.map(q => `❓ ${q.question}`).join('\n'));
         this._emit('phase', 'waiting_for_user', `Waiting for user: ${err.questions.length} question(s)`);
         return;
       }
+      this._journal('error', 'Workflow stopped with an error', formatError(err));
       throw err;
     }
   }
@@ -422,8 +468,13 @@ export class AgentOrchestrator {
     const brainstorm = this.workspace.readFile(this.workspace.brainstormPath) ?? '';
     const critique = this.workspace.readFile(this.workspace.criticPath) ?? '';
     const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
+    const debateResponse = this.workspace.readFile(this._debateResponsePath) ?? '';
+    const debateDecision = this.workspace.readFile(this._debateDecisionPath) ?? '';
     const context = this._assembleContext([
       this._sec('# User Prompt', prompt, 1),
+      // The round-4 decision is the authoritative outcome, so it gets top priority.
+      this._sec('# Debate Decision (authoritative winning direction)', debateDecision, 2),
+      this._sec('# Proposer Response (converged direction)', debateResponse, 4),
       this._sec('# Brainstorm Consensus', brainstorm, 5),
       this._sec('# Critique Consensus', critique, 6),
       this._sec('# Product Consensus', secondBrainstorm, 7),
@@ -455,6 +506,13 @@ export class AgentOrchestrator {
       `Stack: ${brief.chosenStack.join(', ')}\n\n` +
       `Acceptance: ${brief.acceptanceCriteria.join('; ')}`
     );
+    this._journal('brief', 'Project brief locked', [
+      `**Goal:** ${brief.goal}`,
+      `**App type:** ${brief.appType}`,
+      `**Stack:** ${brief.chosenStack.join(', ')}`,
+      `**Core features:** ${brief.coreFeatures.join('; ')}`,
+      `**Acceptance criteria:**\n${brief.acceptanceCriteria.map(c => `- ${c}`).join('\n')}`,
+    ].join('\n'));
 
     this._updateTimeline('briefing', 'completed');
     this._emit('log', 'Autonomous project brief complete.', 'info');
@@ -486,6 +544,7 @@ export class AgentOrchestrator {
 
     this.workspace.writeFile(this.workspace.brainstormPath, this._wrapNote('Brainstorm Analysis', output));
     this.workspace.appendRollingSummary(`## Brainstorm Complete\n${output.substring(0, 500)}`);
+    this._journal('brainstorm', 'Round 1 — Initial proposal', output);
     this._recordActivity({
       phase: 'brainstorm',
       agentRole: 'brainstorm',
@@ -543,6 +602,7 @@ export class AgentOrchestrator {
       const wrapped = this._wrapNote(`Critique Round ${round}`, output);
       this.workspace.writeFile(roundPath, wrapped);
       priorRounds += `\n\n${wrapped}`;
+      this._journal('critique', `Round 2 — Critique (round ${round}/${this._debateRounds()})`, output);
       this._recordActivity({
         phase: 'critique',
         agentRole: 'critic',
@@ -606,6 +666,7 @@ export class AgentOrchestrator {
       const wrapped = this._wrapNote(`Second Brainstorm Round ${round}`, output);
       this.workspace.writeFile(roundPath, wrapped);
       priorRounds += `\n\n${wrapped}`;
+      this._journal('product', `Round 2 — Product/UX debate (round ${round}/${this._debateRounds()})`, output);
       this._recordActivity({
         phase: 'second_brainstorm',
         agentRole: 'secondBrainstorm',
@@ -620,6 +681,287 @@ export class AgentOrchestrator {
     this.workspace.writeFile(this.workspace.secondBrainstormPath, this._wrapNote('Second Brainstorm', output));
     this._updateTimeline('second_brainstorm', 'completed');
     this._emit('log', 'Second brainstorm complete.', 'info');
+  }
+
+  // Path of the round-3 rebuttal note (proposer responds to all critiques).
+  private get _debateResponsePath(): string {
+    return this.workspace.agentNotePath('04_debate_response.md');
+  }
+
+  // Path of the round-4 panel decision (markdown summary).
+  private get _debateDecisionPath(): string {
+    return this.workspace.agentNotePath('05_debate_decision.md');
+  }
+
+  /**
+   * Round 3 of the debate: the original proposer (brainstorm model) reads the
+   * critique and product-debate notes and answers them point by point, defending
+   * or revising the proposal. This closes the loop so critique is two-way.
+   */
+  private async _phaseDebateResponse(state: ProjectState): Promise<void> {
+    this._checkAborted();
+    if (this.workspace.fileExists(this._debateResponsePath)) { return; }
+    this._setPhase(state, 'second_brainstorm', 'Debate round 3: proposer responds to critiques...');
+
+    const prompt = this._userPromptWithFileContext();
+    const promptFiles = this._promptReferencedFilePaths();
+    const brainstorm = this.workspace.readFile(this.workspace.brainstormPath) ?? '';
+    const critique = this.workspace.readFile(this.workspace.criticPath) ?? '';
+    const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
+    const { model, fallbackModel } = this._agentConfig('brainstorm');
+
+    const context = this._assembleContext([
+      this._sec('# User Prompt', prompt, 1),
+      this._sec('# Your Original Proposal', brainstorm, 3),
+      this._sec('# Critique Raised Against It', critique, 4),
+      this._sec('# Product / UX Feedback', secondBrainstorm, 5),
+    ]);
+    const messages: OllamaMessage[] = [
+      {
+        role: 'system',
+        content: [
+          'You are the original proposing architect in a multi-agent debate.',
+          'Other agents have critiqued your proposal. Respond to that feedback directly.',
+          'For each significant critique: either defend your original choice with a concrete reason, or revise it and state the new decision.',
+          'Do not repeat the whole proposal. Focus on the points under dispute and converge on a single coherent direction.',
+          'Do NOT write code. Do not ask the user questions; resolve ambiguity with explicit assumptions.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: `${context}\n\n---\n\nOUTPUT: A markdown document with sections:\n# Debate Response\n## Accepted Critiques (with the revised decision)\n## Defended Decisions (with justification)\n## Converged Direction (the single approach to proceed with)\n## Updated Assumptions`,
+      },
+    ];
+
+    let output: string;
+    try {
+      output = await this._callWithFallback('brainstorm', model, fallbackModel, messages,
+        this._debateResponsePath,
+        [this.workspace.userPromptPath, ...promptFiles, this.workspace.brainstormPath, this.workspace.criticPath, this.workspace.secondBrainstormPath]);
+    } catch (err) {
+      output = this._fallbackAgentNote('brainstorm', context, err);
+      this.workspace.appendAssumption('brainstorm', `Self-healed failed debate response: ${formatError(err)}`);
+      this._emit('log', 'Debate response failed; continuing with a deterministic self-healed note.', 'warn');
+    }
+
+    this.workspace.writeFile(this._debateResponsePath, this._wrapNote('Debate Response (Round 3)', output));
+    this._journal('response', 'Round 3 — Proposer responds to critiques', output);
+    this._recordActivity({
+      phase: 'second_brainstorm',
+      agentRole: 'brainstorm',
+      title: 'Debate round 3 complete',
+      detail: 'Proposer answered every critique and converged on a single direction.',
+      status: 'completed',
+    });
+    this._emit('log', 'Debate response (round 3) complete.', 'info');
+  }
+
+  /**
+   * Round 4 of the debate: a panel of distinct local models independently scores
+   * the consolidated approach across weighted criteria and recommends the single
+   * best direction. The scores are aggregated into one decision used by the brief.
+   */
+  private async _phaseDebateScoring(state: ProjectState): Promise<void> {
+    this._checkAborted();
+    if (this.workspace.fileExists(this._debateDecisionPath)) { return; }
+    this._setPhase(state, 'second_brainstorm', 'Debate round 4: judging panel scores the approach...');
+
+    const prompt = this._userPromptWithFileContext();
+    const promptFiles = this._promptReferencedFilePaths();
+    const brainstorm = this.workspace.readFile(this.workspace.brainstormPath) ?? '';
+    const critique = this.workspace.readFile(this.workspace.criticPath) ?? '';
+    const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
+    const response = this.workspace.readFile(this._debateResponsePath) ?? '';
+
+    const baseContext = this._assembleContext([
+      this._sec('# User Prompt', prompt, 1),
+      this._sec('# Brainstorm Proposal', brainstorm, 3),
+      this._sec('# Critique', critique, 4),
+      this._sec('# Product / UX Perspective', secondBrainstorm, 5),
+      this._sec('# Proposer Response (converged direction)', response, 3),
+    ]);
+
+    // Five distinct models, each judging from its own lens, satisfy the
+    // "at least 5 agents of different models vote" requirement. A runtime guard
+    // guarantees the diversity even when two roles share a primary model.
+    const panelRoles: AgentRole[] = ['brainstorm', 'critic', 'secondBrainstorm', 'architect', 'reviewer'];
+    const lenses: Record<string, string> = {
+      brainstorm: 'overall technical soundness',
+      critic: 'risks, security, and correctness',
+      secondBrainstorm: 'product value and user/developer experience',
+      architect: 'architectural feasibility on a local-first stack',
+      reviewer: 'implementation quality and completeness',
+    };
+
+    const { assignments: panelModels, distinctCount } = this._assignDiversePanelModels(panelRoles);
+    if (distinctCount < panelRoles.length) {
+      const warning =
+        `Debate panel could only assign ${distinctCount} distinct model(s) for ${panelRoles.length} judges. ` +
+        `Install more local models (the roster currently exposes ${this._modelRoster().length}) so every judge votes on a different model.`;
+      this._emit('log', warning, 'warn');
+      this._journal('warn', 'Debate panel model diversity below target', warning);
+      this.workspace.appendAssumption('debate', warning);
+    } else {
+      this._journal('decision', 'Debate panel assembled',
+        panelRoles.map(r => `- **${r}** → \`${panelModels.get(r)!.model}\` (${lenses[r]})`).join('\n'));
+    }
+
+    const panel: DebateScore[] = [];
+    for (const role of panelRoles) {
+      this._checkAborted();
+      const { model, fallbackModel } = panelModels.get(role)!;
+      const outputPath = this.workspace.agentNotePath(`05_debate_score_${role}.json`);
+      const messages: OllamaMessage[] = [
+        {
+          role: 'system',
+          content: [
+            `You are a debate judge focused on ${lenses[role] ?? 'overall quality'}.`,
+            'Score the converged approach honestly on a 0-10 scale per criterion (10 = excellent).',
+            'For "risk", a HIGHER score means SAFER (fewer unmitigated risks).',
+            'Then recommend the single best direction to proceed with. Respond only with valid JSON.',
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: [
+            baseContext,
+            '',
+            'Return exactly this JSON shape:',
+            '{',
+            `  "agentRole": "${role}",`,
+            '  "scores": { "feasibility": 0, "completeness": 0, "risk": 0, "ux": 0, "quality": 0 },',
+            '  "overall": 0,',
+            '  "recommendation": "the single direction you would proceed with",',
+            '  "topRisk": "the most important remaining risk"',
+            '}',
+          ].join('\n'),
+        },
+      ];
+
+      let score: DebateScore;
+      try {
+        score = await this._callWithFallbackJson<DebateScore>(
+          role, model, fallbackModel, messages, outputPath,
+          [this.workspace.userPromptPath, ...promptFiles, this.workspace.brainstormPath, this.workspace.criticPath, this.workspace.secondBrainstormPath]
+        );
+      } catch (err) {
+        score = this._fallbackDebateScore(role, err);
+        this.workspace.appendAssumption(role, `Self-healed failed debate score: ${formatError(err)}`);
+      }
+      score = this._normalizeDebateScore(role, score);
+      panel.push(score);
+      this.workspace.writeFile(outputPath, prettyJson(score));
+      this._recordActivity({
+        phase: 'second_brainstorm',
+        agentRole: role,
+        title: `Debate score: ${role}`,
+        detail: `Overall ${score.overall}/10 — ${score.recommendation.slice(0, 80)}`,
+        status: 'completed',
+      });
+    }
+
+    const decision = this._aggregateDebateScores(panel);
+    this.workspace.writeFile(
+      this._debateDecisionPath,
+      this._wrapNote('Debate Decision (Round 4 — Scoring & Vote)', [
+        `Winning direction: ${decision.winningDirection}`,
+        `Weighted score: ${decision.weightedScore}/10`,
+        `Panel agreement: ${decision.agreement} (${decision.judgeCount} judges)`,
+        '',
+        '## Ranked Recommendations',
+        ...decision.rankedRecommendations.map((r, i) => `${i + 1}. (${r.overall}/10, ${r.agentRole}) ${r.recommendation}`),
+        '',
+        `## Rationale\n${decision.rationale}`,
+      ].join('\n'))
+    );
+    this.workspace.appendRollingSummary(
+      `## Debate Decision\nWinning direction (score ${decision.weightedScore}/10, ${decision.agreement} agreement): ${decision.winningDirection}`
+    );
+    this._journal('decision', `Round 4 — Panel verdict: ${decision.weightedScore}/10 (${decision.agreement} agreement)`,
+      [
+        `**Winning direction:** ${decision.winningDirection}`,
+        '',
+        '**Ranked recommendations:**',
+        ...decision.rankedRecommendations.map((r, i) => `${i + 1}. (${r.overall}/10 — ${r.agentRole}) ${r.recommendation}`),
+        '',
+        decision.rationale,
+      ].join('\n'));
+    this._emit('log', `Debate scoring complete: ${decision.weightedScore}/10 (${decision.agreement} agreement).`, 'info');
+  }
+
+  /**
+   * Pure aggregation of the round-4 panel: averages the weighted scores, ranks
+   * each judge's recommendation by its overall score, and selects the highest as
+   * the winning direction. Exposed for unit testing (no model calls).
+   */
+  private _aggregateDebateScores(panel: DebateScore[]): DebateDecision {
+    if (panel.length === 0) {
+      return {
+        winningDirection: 'No panel scores were produced; proceed with the proposer response.',
+        weightedScore: 0,
+        judgeCount: 0,
+        agreement: 'low',
+        rankedRecommendations: [],
+        rationale: 'The scoring panel returned no usable results.',
+      };
+    }
+
+    const ranked = [...panel]
+      .map(p => ({ agentRole: p.agentRole, overall: p.overall, recommendation: p.recommendation }))
+      .sort((a, b) => b.overall - a.overall);
+
+    const overalls = panel.map(p => p.overall);
+    const mean = overalls.reduce((sum, v) => sum + v, 0) / overalls.length;
+    const variance = overalls.reduce((sum, v) => sum + (v - mean) ** 2, 0) / overalls.length;
+    const spread = Math.sqrt(variance);
+    // Tight spread of high-ish scores => the judges agree.
+    const agreement: DebateDecision['agreement'] = spread <= 1.0 ? 'high' : spread <= 2.0 ? 'medium' : 'low';
+
+    const winner = ranked[0];
+    return {
+      winningDirection: winner.recommendation,
+      weightedScore: Math.round(mean * 10) / 10,
+      judgeCount: panel.length,
+      agreement,
+      rankedRecommendations: ranked,
+      rationale: `Selected the highest-scored direction (${winner.overall}/10 from ${winner.agentRole}). `
+        + `Panel mean ${Math.round(mean * 10) / 10}/10 with ${agreement} agreement (score spread ${Math.round(spread * 100) / 100}).`,
+    };
+  }
+
+  private _normalizeDebateScore(role: AgentRole, value: Partial<DebateScore> | null | undefined): DebateScore {
+    const clamp = (n: unknown): number => {
+      const num = Number(n);
+      if (!Number.isFinite(num)) { return 5; }
+      return Math.max(0, Math.min(10, Math.round(num * 10) / 10));
+    };
+    const s = value?.scores ?? {};
+    const scores = {
+      feasibility: clamp((s as Record<string, unknown>).feasibility),
+      completeness: clamp((s as Record<string, unknown>).completeness),
+      risk: clamp((s as Record<string, unknown>).risk),
+      ux: clamp((s as Record<string, unknown>).ux),
+      quality: clamp((s as Record<string, unknown>).quality),
+    };
+    const derived = (scores.feasibility + scores.completeness + scores.risk + scores.ux + scores.quality) / 5;
+    const overall = value?.overall === undefined ? clamp(derived) : clamp(value.overall);
+    return {
+      agentRole: role,
+      scores,
+      overall,
+      recommendation: String(value?.recommendation ?? 'Proceed with the converged direction from the debate.').trim(),
+      topRisk: String(value?.topRisk ?? 'No specific risk reported.').trim(),
+    };
+  }
+
+  private _fallbackDebateScore(role: AgentRole, err: unknown): DebateScore {
+    return this._normalizeDebateScore(role, {
+      agentRole: role,
+      scores: { feasibility: 5, completeness: 5, risk: 5, ux: 5, quality: 5 },
+      overall: 5,
+      recommendation: 'Proceed with the converged direction from the debate response (scoring model unavailable).',
+      topRisk: `Scoring model failed: ${formatError(err)}`,
+    });
   }
 
   private async _phaseToolchainDiscovery(state: ProjectState): Promise<void> {
@@ -739,6 +1081,20 @@ export class AgentOrchestrator {
     };
 
     this.workspace.writeFile(this.workspace.toolchainReportPath, prettyJson(report));
+
+    // Inject hard constraints into assumptions so every downstream agent reads them
+    const swiftCheck = checks.find(c => c.name === 'swift');
+    const xcodebuildCheck = checks.find(c => c.name === 'xcodebuild');
+    if (swiftCheck?.available && !xcodebuildCheck?.available) {
+      this.workspace.appendAssumption(
+        'toolchain',
+        `TOOLCHAIN CONSTRAINT: Swift ${swiftCheck.version ?? ''} is available via Command Line Tools, but xcodebuild is NOT available. ` +
+        `All Apple platform projects MUST use Package.swift (Swift Package Manager) as the project root. ` +
+        `Do NOT generate .xcodeproj files — they are non-functional without full Xcode. ` +
+        `Use "swift build" for compilation and "swift test" for tests.`
+      );
+    }
+
     this.workspace.appendRollingSummary(
       `## Toolchain Discovery\nAvailable: ${checks.filter(c => c.available).map(c => c.name).join(', ') || 'none'}\n` +
       `Missing: ${report.missing.join(', ') || 'none'}\n` +
@@ -862,6 +1218,11 @@ export class AgentOrchestrator {
       detail: (architectPlan?.summary ?? 'Architecture plan is ready for task planning.'),
       status: 'completed',
     });
+    this._journal('architect', 'Architecture decided', [
+      architectPlan?.summary ? `**Summary:** ${architectPlan.summary}` : '',
+      architectPlan?.technology?.length ? `**Technology:** ${architectPlan.technology.join(', ')}` : '',
+      architectPlan?.keyDecisions?.length ? `**Key decisions:**\n${architectPlan.keyDecisions.map(d => `- ${d}`).join('\n')}` : '',
+    ].filter(Boolean).join('\n'));
     this._updateTimeline('architecture', 'completed');
     this._emit('log', 'Architecture complete.', 'info');
   }
@@ -952,6 +1313,8 @@ export class AgentOrchestrator {
       status: 'completed',
     });
     this._emit('log', `Task plan created: ${taskPlan.totalTasks} tasks.`, 'info');
+    this._journal('plan', `Task plan ready — ${taskPlan.totalTasks} task(s), ${taskPlan.estimatedComplexity} complexity`,
+      taskPlan.tasks.map((t, i) => `${i + 1}. **${t.id}** — ${t.title}\n   ${t.description}`).join('\n'));
     this._updateTimeline('task_planning', 'completed');
   }
 
@@ -2129,24 +2492,49 @@ export class AgentOrchestrator {
 
   private async _prefetchWebSearch(): Promise<void> {
     this._ensureCapabilityServices();
-    if (!this.modelConfig.webSearch?.enabled) { return; }
-    const prompt = this.workspace.readUserPrompt();
-    const shouldSearch =
-      /\b(latest|current|docs?|documentation|api reference|version|breaking change|library|framework)\b/i.test(prompt);
-    if (!shouldSearch) { return; }
+    const webOn = this.research.webEnabled;
+    const repoOn = this.research.repoReadsEnabled;
+    if (!webOn && !repoOn) { return; }
 
-    this._emit('log', 'Running policy-controlled web search for current documentation context.', 'info');
-    const report = await this.webSearch.searchAndFetch(prompt);
-    this.workspace.writeFile(this.workspace.webSearchPath, prettyJson(report));
+    const prompt = this.workspace.readUserPrompt();
+    // Research is no longer gated by a narrow keyword whitelist. It runs whenever
+    // it can add value: when the prompt explicitly asks for current/external
+    // knowledge, OR for any new-project build (grounding in current best
+    // practices and existing high-quality code raises final quality). Focused
+    // maintenance edits stay local unless they signal a research need.
+    const explicitlyWantsResearch =
+      /\b(latest|current|docs?|documentation|api reference|version|breaking change|library|framework|best practice|example|how to|research|compare|alternativ)\b/i.test(prompt);
+    const route = this._selectWorkflowRoute(this.workspace.readProjectState());
+    const shouldResearch = explicitlyWantsResearch || route.kind === 'full_project';
+    if (!shouldResearch) { return; }
+
+    const sections: string[] = ['# External Research Context', ''];
+    const citations: string[] = [];
+
+    if (webOn) {
+      this._emit('log', 'Running policy-controlled web research for current, cited context.', 'info');
+      const outcome = await this.research.webResearch(prompt);
+      sections.push(ResearchService.format(outcome), '');
+      citations.push(...outcome.findings.map(f => `${f.source} (retrieved ${f.retrievedAt})`));
+    }
+
+    if (repoOn) {
+      this._emit('log', 'Discovering high-quality public code examples to learn from.', 'info');
+      const outcome = await this.research.findCodeExamples(prompt);
+      sections.push(ResearchService.format(outcome), '');
+      citations.push(...outcome.findings.map(f => `${f.source}${f.updatedAt ? ` (updated ${f.updatedAt})` : ''}`));
+    }
+
+    if (citations.length === 0) { return; }
+
+    this.workspace.writeFile(this.workspace.webSearchPath, sections.join('\n'));
+    this._journal('research', `Gathered ${citations.length} external source(s)`,
+      citations.map(c => `- ${c}`).join('\n'));
     this.workspace.appendMemoryEvent({
       type: 'search',
       phase: 'briefing',
-      summary: `Web search fetched ${report.fetched.filter(item => item.success).length} page(s).`,
-      data: {
-        query: report.query,
-        hits: report.hits.map(hit => hit.url),
-        warnings: report.warnings,
-      },
+      summary: `External research gathered ${citations.length} cited source(s) (web=${webOn}, repos=${repoOn}).`,
+      data: { query: prompt, citations },
     });
   }
 
@@ -2406,6 +2794,7 @@ export class AgentOrchestrator {
     }
 
     this.workspace.writeFile(this.workspace.finalReportPath, this._wrapNote('Final Report', report));
+    this._journal('report', 'Final report — handoff to boss', report);
     this._updateTimeline('final_integration', 'completed');
     this._recordActivity({
       phase: 'final_integration',
@@ -2534,6 +2923,11 @@ export class AgentOrchestrator {
       `Consensus: ${ready ? 'stop' : 'continue'}\n` +
       consensus.map(item => `- ${item.agentRole}: ${item.readyToStop ? 'stop' : 'continue'} (${item.confidence})`).join('\n')
     );
+    this._journal('consensus', `Sprint ${sprint} retrospective — decision: ${ready ? 'STOP (product is complete)' : 'CONTINUE (more work)'}`,
+      consensus.map(item =>
+        `- **${item.agentRole}**: ${item.readyToStop ? '✅ ready to stop' : '🔁 continue'} (${item.confidence}) — ${item.rationale}`
+        + (item.remainingWork.length ? `\n  Remaining: ${item.remainingWork.join('; ')}` : '')
+      ).join('\n'));
     this._updateTimeline('brainstorm', 'completed');
     return consensus;
   }
@@ -2650,19 +3044,17 @@ export class AgentOrchestrator {
     const { model, fallbackModel } = this._agentConfig('reviewer');
     const messages = this._buildMessages('reviewer', context);
 
+    let review: ReviewResult;
     try {
-      const review = await this._callWithFallbackJson<ReviewResult>(
+      review = await this._callWithFallbackJson<ReviewResult>(
         'reviewer', model, fallbackModel, messages, this.workspace.reviewerPath, promptFiles
       );
       this._normalizeReviewResult(task, review);
-
-      // Save review note
       this.workspace.appendFile(this.workspace.reviewerPath, `\n\n---\n\n${prettyJson(review)}`);
-      return review;
     } catch (err) {
       logWarn(`Reviewer failed for task "${task.id}": ${formatError(err)}. Falling back to heuristic review.`);
       const issues = this._heuristicReviewIssues(workerOutput);
-      return {
+      review = {
         taskId: task.id,
         approved: issues.length === 0,
         issues,
@@ -2673,6 +3065,155 @@ export class AgentOrchestrator {
         reviewedAt: new Date().toISOString(),
       };
     }
+
+    // Cross-check: an independent, stronger model audits the change against
+    // overall production-quality standards (not just task acceptance). Its
+    // findings are merged in so the fix loop keeps iterating until BOTH the
+    // task reviewer and the quality auditor are satisfied.
+    const audit = await this._executeQualityAudit(task, workerOutput, context);
+    return this._mergeReviewWithAudit(task, review, audit);
+  }
+
+  /**
+   * Holistic code quality cross-check by a third, independent model (different
+   * from the code writer and the task reviewer). It judges the change against
+   * general engineering standards: correctness, completeness, error handling,
+   * security, and consistency with the architecture — flagging only material,
+   * production-blocking defects (never subjective style preferences).
+   */
+  private async _executeQualityAudit(
+    task: TaskItem,
+    workerOutput: CodeWorkerOutput,
+    reviewContext: string
+  ): Promise<ReviewResult> {
+    const promptFiles = this._promptReferencedFilePaths();
+    // Use the strongest available model (the brainstorm role, e.g. a 30B coder)
+    // so the auditor brings a genuinely independent, capable perspective.
+    const { model, fallbackModel } = this._agentConfig('brainstorm');
+    const auditPath = this.workspace.agentNotePath('quality_audit.jsonl');
+    const messages: OllamaMessage[] = [
+      {
+        role: 'system',
+        content: [
+          'You are a principal engineer performing an INDEPENDENT, holistic code-quality audit.',
+          'Another engineer wrote this code and a reviewer already checked task acceptance.',
+          'Your job is the overall-quality cross-check: judge the change against general production standards.',
+          'Flag ONLY material, production-blocking defects in these categories:',
+          '- Correctness bugs (logic errors, wrong/edge-case handling, broken control flow).',
+          '- Incomplete implementation (stubs, TODOs, unimplemented core behavior, dead paths).',
+          '- Missing or wrong error handling for realistic failures.',
+          '- Security problems (injection, path traversal, secret leakage, unsafe input).',
+          '- Inconsistency with the stated architecture or the original prompt constraints.',
+          'Do NOT flag subjective style, naming, or nice-to-have refactors. If the code is production-ready, approve it.',
+          'Respond only with valid JSON.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          reviewContext,
+          '',
+          'Return exactly this JSON shape:',
+          '{',
+          '  "approved": true,',
+          '  "blockingIssues": ["material defects that must be fixed before continuing; empty if none"],',
+          '  "securityConcerns": ["security defects; empty if none"],',
+          '  "fixInstructions": ["specific, actionable fix instructions for each blocking issue"],',
+          '  "qualityScore": 0,',
+          '  "rationale": "one-sentence overall judgement"',
+          '}',
+        ].join('\n'),
+      },
+    ];
+
+    try {
+      const raw = await this._callWithFallbackJson<{
+        approved?: boolean;
+        blockingIssues?: unknown;
+        securityConcerns?: unknown;
+        fixInstructions?: unknown;
+        qualityScore?: unknown;
+        rationale?: unknown;
+      }>('brainstorm', model, fallbackModel, messages, auditPath, promptFiles);
+
+      const toList = (v: unknown): string[] =>
+        Array.isArray(v) ? v.map(x => String(x).trim()).filter(Boolean).slice(0, 10) : [];
+      const blockingIssues = toList(raw.blockingIssues);
+      const securityConcerns = toList(raw.securityConcerns);
+      const needsFix = !(raw.approved === true) || blockingIssues.length > 0 || securityConcerns.length > 0;
+
+      const result: ReviewResult = {
+        taskId: task.id,
+        approved: !needsFix,
+        issues: blockingIssues,
+        suggestions: typeof raw.rationale === 'string' ? [raw.rationale] : [],
+        securityConcerns,
+        needsFix,
+        fixSuggestions: toList(raw.fixInstructions),
+        reviewedAt: new Date().toISOString(),
+      };
+      this.workspace.appendFile(
+        auditPath,
+        JSON.stringify({ timestamp: result.reviewedAt, taskId: task.id, ...raw }) + '\n'
+      );
+      this._journal(needsFix ? 'warn' : 'audit',
+        `Quality audit for ${task.id}`,
+        needsFix
+          ? `🔁 Found ${blockingIssues.length + securityConcerns.length} blocking issue(s): ${[...blockingIssues, ...securityConcerns].slice(0, 3).join('; ')}`
+          : `✅ Passed holistic quality audit. ${typeof raw.rationale === 'string' ? raw.rationale : ''}`.trim()
+      );
+      return result;
+    } catch (err) {
+      // The auditor model is unavailable even after self-healing retries/alternate
+      // models. We must NOT silently approve — that would let incomplete or unsafe
+      // code pass the "highest possible quality" bar. Instead, degrade to a
+      // deterministic heuristic audit (stubs, TODOs, empty bodies, obvious red
+      // flags) and record an explicit uncertainty so the gap is visible in the
+      // journal and the brief, rather than hidden behind a false approval.
+      const heuristicIssues = this._heuristicReviewIssues(workerOutput);
+      const needsFix = heuristicIssues.length > 0;
+      const note =
+        `Holistic quality auditor was unavailable (${formatError(err)}). ` +
+        `Fell back to a heuristic audit, which found ${heuristicIssues.length} issue(s).`;
+      logWarn(`Quality auditor failed for task "${task.id}": ${note}`);
+      this.workspace.appendAssumption('quality-audit',
+        `${note} Treat the independent quality cross-check for task "${task.id}" as DEGRADED, not fully passed.`);
+      this._journal('warn', `Quality audit DEGRADED for ${task.id}`,
+        needsFix
+          ? `⚠️ Auditor model unavailable; heuristic audit flagged ${heuristicIssues.length} issue(s): ${heuristicIssues.slice(0, 3).join('; ')}`
+          : `⚠️ Auditor model unavailable; heuristic audit found no obvious defects, but the holistic cross-check did NOT run.`);
+      return {
+        taskId: task.id,
+        approved: !needsFix,
+        issues: heuristicIssues,
+        suggestions: [],
+        securityConcerns: [],
+        needsFix,
+        fixSuggestions: needsFix
+          ? ['Resolve the heuristic findings and return complete, production-ready file contents.']
+          : [],
+        uncertainties: [note],
+        reviewedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  /** Merge the task reviewer's verdict with the independent quality audit. */
+  private _mergeReviewWithAudit(task: TaskItem, review: ReviewResult, audit: ReviewResult): ReviewResult {
+    const dedupe = (arr: string[]): string[] => [...new Set(arr.map(s => s.trim()).filter(Boolean))];
+    const needsFix = review.needsFix || audit.needsFix;
+    const merged: ReviewResult = {
+      taskId: task.id,
+      approved: !needsFix,
+      issues: dedupe([...review.issues, ...audit.issues.map(i => `[quality] ${i}`)]),
+      suggestions: dedupe([...review.suggestions, ...audit.suggestions]),
+      securityConcerns: dedupe([...review.securityConcerns, ...audit.securityConcerns]),
+      needsFix,
+      fixSuggestions: dedupe([...review.fixSuggestions, ...audit.fixSuggestions]),
+      uncertainties: dedupe([...(review.uncertainties ?? []), ...(audit.uncertainties ?? [])]),
+      reviewedAt: new Date().toISOString(),
+    };
+    return merged;
   }
 
   private async _executeFixer(
@@ -2770,12 +3311,30 @@ export class AgentOrchestrator {
     const messages = [...baseMessages];
     const { model, fallbackModel } = this._agentConfig(role);
     const maxRounds = this.modelConfig.toolCalling.maxToolRounds;
+    const failedToolRequests = new Map<string, number>();
 
     for (let round = 1; round <= maxRounds; round++) {
       const requests = (result.toolRequests ?? [])
         .filter(request => request && typeof request.name === 'string')
         .slice(0, 6);
       if (requests.length === 0) { break; }
+
+      const repeatFailedRequests = requests.filter(request => {
+        const normalizedRequest = {
+          id: request.id || `${role}-${task.id}-tool-${round}`,
+          name: request.name,
+          args: request.args ?? {},
+        };
+        return (failedToolRequests.get(this._toolRequestFingerprint(normalizedRequest)) ?? 0) > 0;
+      });
+      if (repeatFailedRequests.length === requests.length) {
+        this.workspace.appendAssumption(
+          role,
+          `Task ${task.id} stopped tool-calling after repeated failed tool request(s): ${repeatFailedRequests.map(request => request.name).join(', ')}.`
+        );
+        result.toolRequests = [];
+        break;
+      }
 
       const toolResults: ToolCallResult[] = [];
       for (const request of requests) {
@@ -2785,8 +3344,35 @@ export class AgentOrchestrator {
           name: request.name,
           args: request.args ?? {},
         };
+        const fingerprint = this._toolRequestFingerprint(normalizedRequest);
+        if ((failedToolRequests.get(fingerprint) ?? 0) > 0) {
+          const toolResult: ToolCallResult = {
+            id: normalizedRequest.id,
+            name: normalizedRequest.name,
+            success: false,
+            output: '',
+            error: 'Skipped repeated tool request because the same tool call already failed. Use prior observations and produce final file changes instead.',
+          };
+          toolResults.push(toolResult);
+          this.workspace.appendMemoryEvent({
+            type: 'tool',
+            phase: this.workspace.readProjectState().currentPhase,
+            agentRole: role,
+            taskId: task.id,
+            summary: `${role} tool ${toolResult.name} skipped after repeated failure.`,
+            data: {
+              request: normalizedRequest,
+              error: toolResult.error,
+              outputPreview: '',
+            },
+          });
+          continue;
+        }
         const toolResult = await this.toolRegistry.execute(normalizedRequest);
         toolResults.push(toolResult);
+        if (this._toolResultFailed(toolResult)) {
+          failedToolRequests.set(fingerprint, (failedToolRequests.get(fingerprint) ?? 0) + 1);
+        }
         this.workspace.appendMemoryEvent({
           type: 'tool',
           phase: this.workspace.readProjectState().currentPhase,
@@ -2834,6 +3420,27 @@ export class AgentOrchestrator {
     }
 
     return result;
+  }
+
+  private _toolRequestFingerprint(request: ToolCallRequest): string {
+    return `${request.name}:${this._stableJson(request.args ?? {})}`;
+  }
+
+  private _toolResultFailed(result: ToolCallResult): boolean {
+    if (!result.success || result.error) { return true; }
+    return /"success"\s*:\s*false|"exitCode"\s*:\s*(?:[1-9]|\d{2,})/.test(result.output);
+  }
+
+  private _stableJson(value: unknown): string {
+    if (Array.isArray(value)) {
+      return `[${value.map(item => this._stableJson(item)).join(',')}]`;
+    }
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value as Record<string, unknown>).sort().map(key =>
+        `${JSON.stringify(key)}:${this._stableJson((value as Record<string, unknown>)[key])}`
+      ).join(',')}}`;
+    }
+    return JSON.stringify(value);
   }
 
   // ------------------------------------------------------------------
@@ -3075,7 +3682,7 @@ export class AgentOrchestrator {
           content: this._deterministicArkanoidRenderer(),
         },
         {
-          path: 'src/game.js',
+          path: 'src/app.js',
           action: 'create',
           description: 'Browser game loop, input, pause, and restart controls.',
           content: this._deterministicArkanoidRuntime(),
@@ -3407,8 +4014,8 @@ export class AgentOrchestrator {
       main: 'index.html',
       scripts: {
         test: 'node --test test/*.test.js',
-        demo: 'echo "Open index.html in your browser to play."',
-        start: 'echo "Open index.html in your browser. No build step is required."',
+        demo: 'echo "Open http://127.0.0.1:5173 after running npm start."',
+        start: 'python3 -m http.server 5173',
       },
       keywords: ['game', 'canvas', 'browser'],
       license: 'MIT',
@@ -3442,7 +4049,7 @@ export class AgentOrchestrator {
       '  </main>',
       '  <script src="src/logic.js"></script>',
       '  <script src="src/render.js"></script>',
-      '  <script src="src/game.js"></script>',
+      '  <script src="src/app.js"></script>',
       '</body>',
       '</html>',
       '',
@@ -3688,7 +4295,7 @@ export class AgentOrchestrator {
       '',
       '```sh',
       'npm test',
-      'npm run start',
+      'npm start',
       'npm run demo',
       '```',
       '',
@@ -4563,6 +5170,31 @@ export class AgentOrchestrator {
     });
   }
 
+  /**
+   * Ask the boss to approve a command the safety policy flagged as risky.
+   * Honors the ask-policy: in fully autonomous / never-ask mode there is no human
+   * to answer, so the command is DECLINED with a clearly logged, journaled reason
+   * instead of either hanging forever or silently running. When the ask-policy
+   * permits and a UI handler is wired, the boss gets a real prompt.
+   */
+  private _requestCommandApproval(command: string, reason: string): Promise<boolean> {
+    if (!this._shouldAskUser() || !this.callbacks.onCommandApprovalNeeded) {
+      logWarn(
+        `Command needs approval but ask-policy is "${this.modelConfig.askPolicy}" (autonomous=${this.modelConfig.autonomousMode}); declining: ${command} — ${reason}`
+      );
+      this._journal('warn', 'Command blocked by policy (no approval prompt available)',
+        `\`${command}\`\n\n${reason}\n\nEnable an interactive ask-policy to approve commands like this.`);
+      return Promise.resolve(false);
+    }
+    const commandId = `cmd-${++this._approvalCounter}`;
+    this._journal('waiting', 'Awaiting boss approval for a command',
+      `\`${command}\`\n\n${reason}`);
+    return new Promise((resolve) => {
+      this._pendingCommandResolvers.set(commandId, resolve);
+      this.callbacks.onCommandApprovalNeeded?.(commandId, command, reason);
+    });
+  }
+
   private _shouldAskUser(): boolean {
     return !this.modelConfig.autonomousMode && this.modelConfig.askPolicy !== 'never';
   }
@@ -5155,16 +5787,29 @@ export class AgentOrchestrator {
       this.workspace.logsDir,
       this.modelConfig.commandPolicy
     );
+    this.webSearch = new WebSearchService(this.modelConfig.webSearch);
+    this.research = this._buildResearchService();
     this.toolRegistry = new AutonomousToolRegistry(
       this.fileManager,
       this.searchService,
       this.terminal,
       this.patchService,
-      this.webFetcher
+      this.webFetcher,
+      (command, reason) => this._requestCommandApproval(command, reason),
+      this.research
     );
     this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig.skills);
     this.githubIntegration = new GitHubIntegrationService(this.workspace.rootDir, this.modelConfig.githubIntegration);
-    this.webSearch = new WebSearchService(this.modelConfig.webSearch);
+  }
+
+  private _buildResearchService(): ResearchService {
+    return new ResearchService({
+      webSearch: this.modelConfig.webSearch,
+      github: this.modelConfig.githubIntegration,
+      allowExternalRepoReads:
+        this.modelConfig.githubIntegration?.allowExternalRepoReads === true,
+      maxResults: this.modelConfig.webSearch?.maxResults,
+    });
   }
 
   private _ensureCapabilityServices(): void {
@@ -5181,7 +5826,9 @@ export class AgentOrchestrator {
         this.searchService,
         this.terminal,
         this.patchService,
-        this.webFetcher
+        this.webFetcher,
+        (command, reason) => this._requestCommandApproval(command, reason),
+        this.research ?? (this.research = this._buildResearchService())
       );
     }
     if (!this.skillManager) {
@@ -5197,6 +5844,48 @@ export class AgentOrchestrator {
 
   private _agentConfig(role: AgentRole): { model: string; fallbackModel: string } {
     return this.modelConfig.agents[role];
+  }
+
+  /** Unique pool of every model referenced in the roster (primary + fallback). */
+  private _modelRoster(): string[] {
+    const pool: string[] = [];
+    for (const cfg of Object.values(this.modelConfig.agents)) {
+      if (cfg?.model) { pool.push(cfg.model); }
+      if (cfg?.fallbackModel) { pool.push(cfg.fallbackModel); }
+    }
+    return [...new Set(pool)];
+  }
+
+  /**
+   * Assign a DISTINCT local model to each debate judge so the round-4 panel
+   * genuinely satisfies the "at least 5 agents of different models vote" rule,
+   * even when two roles share a primary model in config (e.g. critic and
+   * reviewer). Each judge keeps its role lens but borrows a still-unused model
+   * — its own primary first, then its fallback, then any other model in the
+   * roster — whenever the natural choice would collide with an earlier judge.
+   * Returns the assignment plus the count of distinct models actually achieved
+   * so the caller can surface a visible warning if the roster is too small.
+   */
+  private _assignDiversePanelModels(
+    panelRoles: AgentRole[]
+  ): { assignments: Map<AgentRole, { model: string; fallbackModel: string }>; distinctCount: number } {
+    const roster = this._modelRoster();
+    const used = new Set<string>();
+    const assignments = new Map<AgentRole, { model: string; fallbackModel: string }>();
+
+    for (const role of panelRoles) {
+      const cfg = this._agentConfig(role);
+      const candidates = [cfg.model, cfg.fallbackModel, ...roster].filter(Boolean) as string[];
+      const chosen = candidates.find(m => !used.has(m)) ?? cfg.model;
+      used.add(chosen);
+      // Prefer a fallback that differs from the chosen primary so a single
+      // unavailable model never collapses two judges onto the same backup.
+      const fallback =
+        [cfg.fallbackModel, cfg.model, ...roster].find(m => m && m !== chosen) ?? cfg.fallbackModel;
+      assignments.set(role, { model: chosen, fallbackModel: fallback });
+    }
+
+    return { assignments, distinctCount: used.size };
   }
 
   private _buildMessages(role: AgentRole, userContent: string): OllamaMessage[] {
@@ -5992,7 +6681,62 @@ export class AgentOrchestrator {
         totalRounds: activity.totalRounds,
       },
     });
+    // Mirror every activity into the human-readable journal so the boss can
+    // follow the entire run chronologically.
+    const statusIcon: Record<string, string> = {
+      running: '▶️', completed: '✅', warn: '⚠️', failed: '❌',
+    };
+    const roundSuffix = activity.round && activity.totalRounds
+      ? ` (round ${activity.round}/${activity.totalRounds})`
+      : '';
+    const detail = [activity.detail, activity.files?.length ? `Files: ${activity.files.join(', ')}` : '']
+      .filter(Boolean).join('\n\n');
+    try {
+      this.workspace.appendJournal(
+        statusIcon[activity.status] ?? '•',
+        activity.agentRole ?? activity.phase,
+        `${activity.title}${roundSuffix}`,
+        detail
+      );
+    } catch { /* journaling must never break the workflow */ }
     this.callbacks.onActivityUpdate?.(this._activities);
+  }
+
+  /**
+   * Append a rich, human-readable entry to the run journal. Used for the
+   * narrative moments (thoughts, opinions, critiques, decisions, reports) that
+   * are not already captured as terse activities. Never throws.
+   */
+  private _journal(kind: string, title: string, body?: string): void {
+    const map: Record<string, { icon: string; author: string }> = {
+      start:      { icon: '🚀', author: 'system' },
+      phase:      { icon: '📍', author: 'system' },
+      brainstorm: { icon: '💡', author: 'brainstorm' },
+      critique:   { icon: '🔍', author: 'critic' },
+      product:    { icon: '🎨', author: 'secondBrainstorm' },
+      response:   { icon: '🗣️', author: 'brainstorm' },
+      decision:   { icon: '⚖️', author: 'debate-panel' },
+      brief:      { icon: '🧠', author: 'briefBuilder' },
+      architect:  { icon: '🏛️', author: 'architect' },
+      plan:       { icon: '📋', author: 'taskManager' },
+      code:       { icon: '⚙️', author: 'codeWorker' },
+      review:     { icon: '🔎', author: 'reviewer' },
+      audit:      { icon: '🕵️', author: 'quality-auditor' },
+      fix:        { icon: '🔧', author: 'fixer' },
+      test:       { icon: '🧪', author: 'tester' },
+      consensus:  { icon: '🤝', author: 'retrospective' },
+      report:     { icon: '📊', author: 'finalIntegrator' },
+      done:       { icon: '✅', author: 'system' },
+      warn:       { icon: '⚠️', author: 'quality-auditor' },
+      error:      { icon: '❌', author: 'system' },
+      waiting:    { icon: '⏳', author: 'system' },
+      research:   { icon: '🌐', author: 'researcher' },
+      github:     { icon: '🐙', author: 'researcher' },
+    };
+    const meta = map[kind] ?? { icon: '📝', author: 'agent' };
+    try {
+      this.workspace.appendJournal(meta.icon, meta.author, title, body);
+    } catch { /* journaling must never break the workflow */ }
   }
 
   private _agentRoleForPhase(phase: WorkflowPhase): AgentRole | undefined {

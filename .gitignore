@@ -28,3 +28,6 @@ generated-apps/
 note.txt
 AGENT_IMPROVEMENT_REPORT.md
 test/run_*.js
+
+# Per-run agent work journal (generated at runtime)
+AGENT_JOURNAL.md

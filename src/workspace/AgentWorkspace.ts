@@ -53,6 +53,7 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
   githubIntegration: {
     enabled: true,
     preferGhCli: true,
+    allowExternalRepoReads: false,
   },
   skills: {
     enabled: true,
@@ -89,12 +90,12 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
       fallbackModel: 'qwen3-coder:30b',
     },
     taskManager: {
-      model: 'devstral-small-2',
-      fallbackModel: 'qwen2.5-coder:14b-instruct',
+      model: 'qwen2.5-coder:14b-instruct',
+      fallbackModel: 'qwen3-coder:30b',
     },
     codeWorker: {
-      model: 'devstral-small-2',
-      fallbackModel: 'qwen2.5-coder:14b-instruct',
+      model: 'qwen2.5-coder:14b-instruct',
+      fallbackModel: 'qwen3-coder:30b',
     },
     reviewer: {
       model: 'deepseek-coder-v2:16b',
@@ -105,8 +106,8 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
       fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
     fixer: {
-      model: 'devstral-small-2',
-      fallbackModel: 'qwen2.5-coder:14b-instruct',
+      model: 'qwen2.5-coder:14b-instruct',
+      fallbackModel: 'qwen3-coder:30b',
     },
     finalIntegrator: {
       model: 'devstral-small-2',
@@ -181,6 +182,14 @@ export class AgentWorkspace {
   get workflowLogPath(): string    { return path.join(this.logsDir, 'workflow.log'); }
 
   agentNotePath(filename: string): string { return path.join(this.agentsDir, filename); }
+
+  /**
+   * Human-readable, chronological journal of the whole run. This is the main
+   * communication channel between the boss and the agents: every thought,
+   * opinion, critique, planned task, and progress report is appended here with a
+   * timestamp and an icon. Lives at the workspace root so it is easy to open.
+   */
+  get journalPath(): string { return path.join(this.rootDir, 'AGENT_JOURNAL.md'); }
 
   // Agent note filenames
   get brainstormPath(): string      { return this.agentNotePath('01_brainstorm.md'); }
@@ -381,6 +390,43 @@ export class AgentWorkspace {
   appendRollingSummary(entry: string): void {
     const line = `\n## ${new Date().toISOString()}\n\n${entry}\n`;
     this.appendFile(this.rollingSummaryPath, line);
+  }
+
+  /**
+   * Append one timestamped, icon-prefixed entry to the run journal (AGENT_JOURNAL.md).
+   * Always appends to the bottom so the file reads top-to-bottom in chronological
+   * order. `icon` should be a short emoji; `author` is the agent/phase speaking;
+   * `body` may be multi-line markdown.
+   */
+  appendJournal(icon: string, author: string, title: string, body?: string): void {
+    const time = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+    let entry = `\n### ${icon} ${title}\n`;
+    entry += `\`${time}\` · **${author}**\n`;
+    if (body && body.trim()) {
+      entry += `\n${body.trim()}\n`;
+    }
+    this.appendFile(this.journalPath, entry);
+  }
+
+  /**
+   * Create the journal header once at the start of a run (idempotent per run is
+   * handled by the caller; this always (re)writes the top banner via append only
+   * when the file does not yet exist).
+   */
+  initializeJournal(goal: string): void {
+    if (fs.existsSync(this.journalPath)) {
+      this.appendJournal('🔄', 'system', 'Workflow resumed / new session', goal ? `Goal: ${goal}` : undefined);
+      return;
+    }
+    const header =
+      `# 🤖 Agent Work Journal\n\n` +
+      `> This file is the live communication channel between the boss and the agents.\n` +
+      `> Every thought, opinion, critique, planned task, and progress report is logged below in\n` +
+      `> chronological order (newest at the bottom). Generated automatically — safe to read anytime.\n\n` +
+      `**Goal:** ${goal || '(not yet defined)'}\n\n` +
+      `**Started:** ${new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC')}\n\n` +
+      `---\n`;
+    this.appendFile(this.journalPath, header);
   }
 
   /**

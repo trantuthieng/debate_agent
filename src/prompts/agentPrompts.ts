@@ -162,11 +162,15 @@ You have received all previous analysis notes. Your job:
 3. Document your architectural decisions clearly.
 4. Identify any missing information and resolve it with explicit assumptions.
 5. Never block on user input. Always set needUserInput to false and readyToCode to true unless the local toolchain is physically unavailable.
-6. PLATFORM-SPECIFIC REQUIREMENTS:
-   - For Swift/iOS/macOS projects: specify the exact Xcode project layout including .xcodeproj or Package.swift, all targets (iOS app target, macOS target, shared framework target), Info.plist requirements, entitlements, and build settings. List the exact Swift Package Manager dependencies with their package URLs. State whether to use CoreData or SQLite and provide the schema.
+6. TOOLCHAIN CHECK (mandatory for Apple platform projects): Read the "Local Toolchain Report" section of the context FIRST.
+   - If \`xcodebuild\` is listed as MISSING/unavailable → you MUST use Package.swift (SPM) as the ONLY project root. Do NOT generate any .xcodeproj file. If the project brief's deliveryArtifacts lists .xcodeproj, OVERRIDE it with Package.swift.
+   - If \`xcodebuild\` is available → you may use .xcodeproj or Package.swift.
+   - If \`swift\` is available → set verificationCommand to \`swift build\`, not any xcodebuild command.
+7. PLATFORM-SPECIFIC REQUIREMENTS:
+   - For Swift/iOS/macOS projects (Package.swift path): define the Package.swift with targets ["App" (executable), optional "AppCore" (library), "AppTests" (test)]. Specify all SPM dependencies with their GitHub URLs. Define the CoreData or SQLite schema. Minimum platform: .iOS(.v16), .macOS(.v13).
    - For web projects: specify the exact build tool config, entry points, and deployment target.
    - For CLI tools: specify the exact binary name, install method, and test harness.
-7. The architecture document MUST include a "Runnable Product Checklist" section listing every file that must exist for the project to compile from scratch; this list becomes the seed for the task plan.
+8. The architecture document MUST include a "Runnable Product Checklist" section listing every file that must exist for the project to compile from scratch; this list becomes the seed for the task plan.
 
 Your response MUST contain TWO parts:
 
@@ -208,8 +212,9 @@ You have received the final architecture plan. Your job:
 8. Plan a small development sprint, not a giant one-shot build. Prefer 2-5 vertical tasks that can each be coded, reviewed, and checked before the next task.
 9. Each sprint should move the product toward a runnable whole: setup, one core slice, tests, then polish/docs. Do not create many disconnected fragments.
 10. COMPILABILITY RULE: Every task must leave the project in a compilable state. Never assign a task that creates a file referencing a symbol that won't exist until a later task. If a dependency is needed, declare it in dependsOn.
-11. For Swift/iOS/macOS projects: the first task MUST create a valid Package.swift (or .xcodeproj) with all targets declared. Subsequent tasks add source files only after the project skeleton compiles. Use \`swift build\` as the verification command.
-12. For Swift projects, state the minimum deployment target (iOS 16+, macOS 13+) in Package.swift and never use APIs unavailable on those versions.
+11. For Swift/iOS/macOS projects WITHOUT xcodebuild (check toolchain report): task-001 MUST create a real, compilable Package.swift with all targets, plus stub source files for every target so that \`swift build\` succeeds immediately. NEVER create a placeholder .xcodeproj text file — that is non-functional. If xcodebuild IS available, task-001 may create .xcodeproj.
+12. For Swift projects, state the minimum deployment target (iOS 16+, macOS 13+) in Package.swift. Subsequent tasks add feature source files; each task must keep \`swift build\` passing.
+13. For Swift projects, allowedFiles for the first task must include "Package.swift" and stub .swift files for every declared target.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -304,13 +309,21 @@ ADDITIONAL CODE RULES:
 SWIFT / iOS / macOS SPECIFIC RULES (apply when the target language is Swift):
 - Always write valid, compilable Swift 5.9+ syntax. Never use removed APIs.
 - Use Swift concurrency (async/await, actors) instead of DispatchQueue/completion handlers unless explicitly targeting Swift < 5.5.
+- DATA MODELS: always use \`struct\`, not \`class\`, for data models. Every model must conform to \`Identifiable\` (with \`var id: UUID = UUID()\`), \`Codable\`, and \`Equatable\`. Define associated enums (e.g., \`enum AssetType: String, Codable, CaseIterable\`) instead of raw String fields where the domain has a fixed set of values.
+- VIEW MODELS: every ViewModel must be \`final class … : ObservableObject\`. Every mutable property that drives the UI must be \`@Published var\`. Use \`@StateObject\` to create a ViewModel and \`@ObservedObject\` to receive one.
+- SERVICES: never leave a service implementation empty. If the full implementation is not ready, provide a working stub that returns mock/cached data and compiles.
 - For SwiftUI: use @Observable (iOS 17+) or @ObservableObject + @StateObject for ViewModels; never use deprecated @ObservedObject at the top level of a view hierarchy.
 - For CoreData: always include the .xcdatamodeld in allowedFiles; generate NSManagedObject subclasses manually (do not rely on Xcode auto-generation).
 - For SQLite: prefer the GRDB Swift package or a thin SQLite3 C-interop wrapper; never force-unwrap SQLite prepared statements.
 - Package.swift must declare all targets, their dependencies, and the correct minimum platform versions (e.g., .iOS(.v16), .macOS(.v13)).
 - Every Swift file must include the module's import statements at the top; never assume implicit imports.
-- Live price APIs: use URLSession async/await with a 10-second timeout; cache results in memory for 60 seconds to avoid rate limits; gracefully degrade to last-known price when offline.
-- Never store API keys in source code; read them from Info.plist keys populated at build time or from the system Keychain.`;
+- Remote APIs: use URLSession async/await with a sensible timeout (around 10 seconds); cache results in memory briefly to avoid rate limits; gracefully degrade to last-known data when offline.
+- Never store API keys in source code; read them from Info.plist keys populated at build time or from the system Keychain.
+
+DOMAIN & LOCALIZATION RULES (apply to any target language):
+- Derive all domain rules (entities, units, business logic, terminology) from the project brief and the user's prompt — do NOT assume a specific industry, country, currency, or locale unless the brief states one.
+- When the brief specifies a locale/currency/region, honour it consistently for formatting (numbers, dates, currency) across the whole product.
+- When no locale is specified, default to neutral, internationalizable formatting (e.g. ISO dates, locale-aware number formatters) rather than hardcoding region-specific units or conventions.`;
 
 const CODE_WORKER_OUTPUT = `Produce valid JSON matching the schema above. The file content must be complete and correct.`;
 

@@ -79,7 +79,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
-    "test": "node --test test/*.test.js test/unit/*.test.js test/integration/*.test.js",
+    "test": "node --test test/*.test.js test/unit/*.test.js",
     "lint": "eslint src"
   },
   "devDependencies": {

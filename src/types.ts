@@ -98,6 +98,12 @@ export interface AppVerificationConfig {
 export interface GitHubIntegrationConfig {
   enabled: boolean;
   preferGhCli: boolean;
+  /**
+   * Allow agents to read code from public GitHub/GitLab repositories on the
+   * network (repo discovery + file reads) to learn from existing high-quality
+   * code. Opt-in; independent from reading the local repository context.
+   */
+  allowExternalRepoReads?: boolean;
 }
 
 export interface SkillConfig {

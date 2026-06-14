@@ -5,11 +5,22 @@
   "autonomousMode": true,
   "askPolicy": "never",
   "debateRounds": 3,
-  "maxFixRetries": 5,
+  "maxFixRetries": 8,
   "autoInstallDependencies": true,
   "artifactDir": "dist",
   "createFinalArchive": true,
   "requireVerificationScripts": true,
+  "webSearch": {
+    "enabled": false,
+    "maxResults": 5,
+    "officialDocsOnly": false,
+    "allowedDomains": []
+  },
+  "githubIntegration": {
+    "enabled": true,
+    "preferGhCli": true,
+    "allowExternalRepoReads": false
+  },
   "selfHealing": {
     "enabled": true,
     "modelCallRetries": 2,
@@ -44,12 +55,12 @@
       "fallbackModel": "qwen3-coder:30b"
     },
     "taskManager": {
-      "model": "devstral-small-2",
-      "fallbackModel": "qwen2.5-coder:14b-instruct"
+      "model": "qwen2.5-coder:14b-instruct",
+      "fallbackModel": "qwen3-coder:30b"
     },
     "codeWorker": {
-      "model": "devstral-small-2",
-      "fallbackModel": "qwen2.5-coder:14b-instruct"
+      "model": "qwen2.5-coder:14b-instruct",
+      "fallbackModel": "qwen3-coder:30b"
     },
     "reviewer": {
       "model": "deepseek-coder-v2:16b",
@@ -60,8 +71,8 @@
       "fallbackModel": "qwen2.5-coder:14b-instruct"
     },
     "fixer": {
-      "model": "devstral-small-2",
-      "fallbackModel": "qwen2.5-coder:14b-instruct"
+      "model": "qwen2.5-coder:14b-instruct",
+      "fallbackModel": "qwen3-coder:30b"
     },
     "finalIntegrator": {
       "model": "devstral-small-2",

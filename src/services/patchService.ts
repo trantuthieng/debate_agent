@@ -34,15 +34,30 @@ export class PatchService {
       };
     }
 
+    // Compute every resulting file in memory first. Only commit to disk if ALL
+    // patches apply cleanly, so a failure mid-way never leaves a half-patched
+    // working tree.
     const errors: string[] = [];
+    const pendingWrites = new Map<string, string>();
     for (const change of patchChanges) {
       try {
         const parsed = this.parse(change.patch!, change.path);
         for (const filePatch of parsed) {
-          this._applyParsedPatch(filePatch);
+          const { fullPath, content } = this._computePatchedContent(filePatch, pendingWrites);
+          pendingWrites.set(fullPath, content);
         }
       } catch (err) {
         errors.push(`${change.path}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    if (errors.length === 0) {
+      for (const [fullPath, content] of pendingWrites) {
+        const dir = path.dirname(fullPath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(fullPath, content, 'utf8');
       }
     }
 
@@ -115,9 +130,15 @@ export class PatchService {
     ].join('\n');
   }
 
-  private _applyParsedPatch(filePatch: ParsedPatchFile): void {
+  private _computePatchedContent(
+    filePatch: ParsedPatchFile,
+    pendingWrites: Map<string, string>
+  ): { fullPath: string; content: string } {
     const fullPath = this._resolve(filePatch.path);
-    const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf8') : '';
+    // Honour earlier hunks staged for the same file in this batch.
+    const existing = pendingWrites.has(fullPath)
+      ? pendingWrites.get(fullPath)!
+      : fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf8') : '';
     let lines = existing.split('\n');
     let offset = 0;
 
@@ -150,12 +171,7 @@ export class PatchService {
       offset += newLines.length - oldLines.length;
     }
 
-    const content = lines.join('\n');
-    const dir = path.dirname(fullPath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(fullPath, content, 'utf8');
+    return { fullPath, content: lines.join('\n') };
   }
 
   private _resolve(relativePath: string): string {

@@ -105,8 +105,17 @@ export class CommandPolicy {
       };
     }
 
-    const safePrefix = this.safePrefixes.find(prefix => lower.startsWith(prefix.toLowerCase()));
-    if (safePrefix) {
+    // An external-write redirection must always require approval, even when the
+    // command otherwise matches a safe prefix (e.g. `node app.js 2>/etc/passwd`).
+    if (workspaceRoot && this.config.requireApprovalForExternalWrites && this._looksLikeExternalWrite(trimmed, workspaceRoot)) {
+      return {
+        risk: 'needs_approval',
+        reason: 'Command appears to write outside the workspace.',
+      };
+    }
+
+    const safePrefix = this.safePrefixes.find(prefix => this._matchesSafePrefix(lower, prefix));
+    if (safePrefix && !this._hasShellControlOperator(trimmed)) {
       return { risk: 'safe', reason: 'Command matches an approved safe prefix.', matchedRule: safePrefix };
     }
 
@@ -121,13 +130,6 @@ export class CommandPolicy {
       }
     }
 
-    if (workspaceRoot && this.config.requireApprovalForExternalWrites && this._looksLikeExternalWrite(trimmed, workspaceRoot)) {
-      return {
-        risk: 'needs_approval',
-        reason: 'Command appears to write outside the workspace.',
-      };
-    }
-
     return {
       risk: 'safe',
       reason: 'Command does not match known dangerous, network, or external-write patterns.',
@@ -135,11 +137,27 @@ export class CommandPolicy {
   }
 
   private _looksLikeExternalWrite(command: string, workspaceRoot: string): boolean {
-    const redirection = /(?:^|\s)(?:>|>>)\s*([^\s]+)/.exec(command);
-    if (!redirection) { return false; }
-    const target = redirection[1].replace(/^['"]|['"]$/g, '');
-    if (!path.isAbsolute(target)) { return false; }
-    const relative = path.relative(workspaceRoot, target);
-    return relative.startsWith('..') || path.isAbsolute(relative);
+    // Catch stdout/stderr/combined redirections: `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`.
+    const redirectionPattern = /(?:^|\s)(?:\d*&?>|>>|\d+>>)\s*([^\s]+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = redirectionPattern.exec(command)) !== null) {
+      const target = match[1].replace(/^['"]|['"]$/g, '');
+      if (!path.isAbsolute(target)) { continue; }
+      const relative = path.relative(workspaceRoot, target);
+      if (relative.startsWith('..') || path.isAbsolute(relative)) { return true; }
+    }
+    return false;
+  }
+
+  private _matchesSafePrefix(lowerCommand: string, prefix: string): boolean {
+    const lowerPrefix = prefix.toLowerCase();
+    if (!lowerCommand.startsWith(lowerPrefix)) { return false; }
+    if (lowerPrefix.endsWith(' ')) { return true; }
+    const next = lowerCommand[lowerPrefix.length];
+    return next === undefined || /\s/.test(next);
+  }
+
+  private _hasShellControlOperator(command: string): boolean {
+    return /(?:&&|\|\||[;|`]|[$]\(|\r|\n)/.test(command);
   }
 }

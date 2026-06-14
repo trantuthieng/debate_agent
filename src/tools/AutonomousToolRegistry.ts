@@ -4,6 +4,7 @@ import { SearchService } from '../services/searchService';
 import { TerminalRunner } from '../terminal/TerminalRunner';
 import { PatchService } from '../services/patchService';
 import { WebFetcherService } from '../services/webFetcherService';
+import { ResearchService } from '../services/researchService';
 
 export class AutonomousToolRegistry {
   constructor(
@@ -11,7 +12,15 @@ export class AutonomousToolRegistry {
     private readonly search: SearchService,
     private readonly terminal: TerminalRunner,
     private readonly patchService: PatchService,
-    private readonly webFetcher: WebFetcherService
+    private readonly webFetcher: WebFetcherService,
+    /**
+     * Asks the boss (or the configured ask-policy) to approve a command that the
+     * safety policy flagged as risky. Resolves true to run it as an approved
+     * command, false to decline. When omitted, risky commands are declined.
+     */
+    private readonly approveCommand?: (command: string, reason: string) => Promise<boolean>,
+    /** Optional governed network research capability (web + public repos). */
+    private readonly research?: ResearchService
   ) {}
 
   definitions(): ToolDefinition[] {
@@ -46,6 +55,30 @@ export class AutonomousToolRegistry {
         safe: false,
         inputSchema: { url: 'string' },
       },
+      ...(this.research?.webEnabled
+        ? [{
+            name: 'web_search',
+            description: 'Search the web and return cited, freshness-stamped findings for grounding decisions in current sources.',
+            safe: false,
+            inputSchema: { query: 'string' },
+          } as ToolDefinition]
+        : []),
+      ...(this.research?.repoReadsEnabled
+        ? [
+            {
+              name: 'find_code_examples',
+              description: 'Discover relevant public GitHub repositories (ranked by stars) and pull their READMEs to learn from existing high-quality code. Returns cited findings.',
+              safe: false,
+              inputSchema: { query: 'string' },
+            } as ToolDefinition,
+            {
+              name: 'read_repo_file',
+              description: 'Read a specific source file from a public GitHub/GitLab repo (blob or raw URL). Returns the cited file contents.',
+              safe: false,
+              inputSchema: { url: 'string' },
+            } as ToolDefinition,
+          ]
+        : []),
     ];
   }
 
@@ -73,10 +106,25 @@ export class AutonomousToolRegistry {
           return this._ok(request, JSON.stringify(results, null, 2));
         }
         case 'run_command': {
-          const result = await this.terminal.runSafeCommand(
-            String(request.args.command ?? ''),
-            Number(request.args.timeoutMs ?? 120_000)
-          );
+          const command = String(request.args.command ?? '');
+          const timeoutMs = Number(request.args.timeoutMs ?? 120_000);
+          const decision = this.terminal.evaluateCommand(command);
+          if (decision.risk === 'safe') {
+            const result = await this.terminal.runSafeCommand(command, timeoutMs);
+            return this._ok(request, JSON.stringify(result, null, 2));
+          }
+          // Risky command: ask the boss instead of silently failing. If no
+          // approval handler is wired (or it declines), report a clear reason.
+          const approved = this.approveCommand
+            ? await this.approveCommand(command, decision.reason)
+            : false;
+          if (!approved) {
+            return this._fail(
+              request,
+              `Command requires approval and was not approved (${decision.reason}): ${command}`
+            );
+          }
+          const result = await this.terminal.runApprovedCommand(command, timeoutMs);
           return this._ok(request, JSON.stringify(result, null, 2));
         }
         case 'apply_patch': {
@@ -91,6 +139,23 @@ export class AutonomousToolRegistry {
         case 'fetch_url': {
           const result = await this.webFetcher.fetchUrl(String(request.args.url ?? ''));
           return result.success ? this._ok(request, result.text) : this._fail(request, result.error ?? 'Fetch failed.');
+        }
+        case 'web_search': {
+          if (!this.research?.webEnabled) { return this._fail(request, 'Web research is disabled in config.'); }
+          const outcome = await this.research.webResearch(String(request.args.query ?? ''));
+          return this._ok(request, ResearchService.format(outcome));
+        }
+        case 'find_code_examples': {
+          if (!this.research?.repoReadsEnabled) { return this._fail(request, 'External repo research is disabled in config.'); }
+          const outcome = await this.research.findCodeExamples(String(request.args.query ?? ''));
+          return this._ok(request, ResearchService.format(outcome));
+        }
+        case 'read_repo_file': {
+          if (!this.research?.repoReadsEnabled) { return this._fail(request, 'External repo reads are disabled in config.'); }
+          const finding = await this.research.readRepoFile(String(request.args.url ?? ''));
+          return 'error' in finding
+            ? this._fail(request, finding.error)
+            : this._ok(request, `Source: ${finding.source} (retrieved ${finding.retrievedAt})\n\n${finding.snippet}`);
         }
         default:
           return this._fail(request, `Unknown tool: ${request.name}`);
