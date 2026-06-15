@@ -38,7 +38,7 @@ import { GitRepositoryReader } from '../git/GitRepositoryReader';
 import { getAgentPrompt, buildUserMessage } from '../prompts/agentPrompts';
 import { parseJsonResponse, prettyJson } from '../utils/json';
 import { logInfo, logWarn, logError } from '../utils/logging';
-import { UserAbortError, WorkflowError, formatError } from '../utils/errors';
+import { UserAbortError, WorkflowError, MissingCapabilityError, formatError } from '../utils/errors';
 import { WebFetcherService } from '../services/webFetcherService';
 import { SearchService } from '../services/searchService';
 import { PatchService } from '../services/patchService';
@@ -212,6 +212,7 @@ export class AgentOrchestrator {
       this._buildTimeline();
       this._emitTimeline();
 
+      await this._preflightCapabilities(prompt);
       await this._runWorkflow(state);
     } catch (err) {
       this._handleTopLevelError(err);
@@ -286,6 +287,10 @@ export class AgentOrchestrator {
       this._buildTimeline();
       this._emitTimeline();
       this._journal('start', 'Autonomous goal requested', `**Goal:** ${goal}\n\nThe meta-agent will staff a team, debate, then build the product.`);
+
+      // Pre-flight: enable required safe capabilities (web/repo reads) and stop
+      // early if the goal needs input only the boss can provide.
+      await this._preflightCapabilities(goal);
 
       // Phase A — dynamic team designs + debates the approach.
       const { plan, decision, transcript } = await this._designAndRunTeamInternal(goal);
@@ -1546,21 +1551,23 @@ export class AgentOrchestrator {
           continue;
         }
 
-        if (failedDeps.length > 0 && this._selfHealingConfig().enabled) {
-          this._emit('log', `Task "${task.id}" continuing despite failed dependencies [${failedDeps.join(', ')}] via self-healing.`, 'warn');
-          this.workspace.appendAssumption(
-            'codeWorker',
-            `Task ${task.id} continued although dependencies failed: ${failedDeps.join(', ')}. Assumption: downstream tasks should recreate any missing setup they need.`
-          );
-          wave.push(task);
-        } else {
-          this._emit('log', `Task "${task.id}" skipped: unmet dependencies [${unmetDeps.join(', ')}]`, 'warn');
-          task.status = 'skipped';
-          state.activeTasks = state.activeTasks.filter(id => id !== task.id);
-          this.workspace.writeProjectState(state);
-          this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
-          this.callbacks.onTaskUpdate?.(taskPlan.tasks);
-        }
+        // A prerequisite hard-failed (failed or skipped). Running this task now
+        // would build on missing foundations (e.g. importing modules a failed
+        // task never created), producing a broken shell that wastes the rest of
+        // the run. Skip it and cascade the skip to its own dependents.
+        this._emit('log', `Task "${task.id}" skipped: prerequisite(s) failed [${failedDeps.join(', ')}]`, 'warn');
+        this.workspace.appendAssumption(
+          'codeWorker',
+          `Task ${task.id} skipped because prerequisite task(s) failed: ${failedDeps.join(', ')}. Downstream work must not rely on foundations that were never built.`
+        );
+        task.status = 'skipped';
+        skippedIds.add(task.id);
+        terminalIds.add(task.id);
+        state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+        this.workspace.writeProjectState(state);
+        this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+        this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+        this._journal('warn', `Task ${task.id} skipped (failed prerequisite)`, `Prerequisite(s) failed: ${failedDeps.join(', ')}. Its dependents will also be skipped.`);
       }
 
       if (wave.length === 0) { break; }
@@ -1697,6 +1704,12 @@ export class AgentOrchestrator {
           // Try to fix
           const maxRetries = this.modelConfig.maxFixRetries;
           let fixed = false;
+          // Escalation guard: if the fixer keeps hitting the SAME issues, it is
+          // stuck in a loop and burning retries with no strategy change. Bail out
+          // early so the run can stop/skip cleanly instead of spinning.
+          let lastIssueSignature = this._issueSignature(review);
+          let noProgressStreak = 0;
+          const maxNoProgress = 2;
           for (let attempt = 1; attempt <= maxRetries; attempt++) {
             this._checkAborted();
             this._emit('log', `Fix attempt ${attempt}/${maxRetries} for task "${task.id}"`, 'warn');
@@ -1751,6 +1764,21 @@ export class AgentOrchestrator {
               break;
             }
             Object.assign(review, reReview);
+
+            // Detect a stuck loop: same issues recurring across attempts.
+            const signature = this._issueSignature(reReview);
+            if (signature && signature === lastIssueSignature) {
+              noProgressStreak += 1;
+              if (noProgressStreak >= maxNoProgress) {
+                this._emit('log', `Fixer for task "${task.id}" made no progress over ${noProgressStreak + 1} attempts (identical issues); stopping retries to avoid a stuck loop.`, 'warn');
+                this._journal('warn', `Fixer escalation on ${task.id}`,
+                  `The same issues recurred ${noProgressStreak + 1}×, so retries were stopped early instead of spinning to the limit: ${reReview.issues.slice(0, 3).join('; ')}`);
+                break;
+              }
+            } else {
+              noProgressStreak = 0;
+              lastIssueSignature = signature;
+            }
           }
 
           if (!fixed) {
@@ -1825,6 +1853,28 @@ export class AgentOrchestrator {
 
     state.currentTaskId = null;
     this.workspace.writeProjectState(state);
+
+    // Viability gate: if the coding phase produced nothing usable (every task
+    // failed or was skipped), do NOT march on to deliver a final report over a
+    // broken/empty project. Stop with an honest status instead.
+    const planned = taskPlan.tasks.length;
+    const completed = state.completedTasks.length;
+    const failed = state.failedTasks.length;
+    const skipped = taskPlan.tasks.filter(t => t.status === 'skipped').length;
+    if (planned > 0 && completed === 0) {
+      const msg =
+        `Build is not viable: 0/${planned} tasks completed (${failed} failed, ${skipped} skipped). ` +
+        `A core task failed and its dependents were skipped, so there is no working product to deliver. ` +
+        `The goal likely needs a smaller scope, a missing capability, or clearer input.`;
+      this._journal('error', 'Build not viable — stopping', msg);
+      this._updateTimeline('coding', 'failed');
+      throw new WorkflowError(msg);
+    }
+    if (planned > 0 && completed < Math.ceil(planned / 2)) {
+      this._journal('warn', 'Partial build',
+        `Only ${completed}/${planned} tasks completed (${failed} failed, ${skipped} skipped). Delivering the verified subset; the product may be incomplete.`);
+    }
+
     this._updateTimeline('coding', 'completed');
   }
 
@@ -2925,6 +2975,79 @@ export class AgentOrchestrator {
     return [...files];
   }
 
+  /**
+   * Verify the project against what it CLAIMS to deliver, so the final report is
+   * honest instead of describing files that do not exist. Pure + unit-testable.
+   * - `missingDeliverables`: artifacts the brief promised but that are absent.
+   * - `phantomReferences`: concrete file paths the README references (in backticks)
+   *   that do not exist on disk (e.g. a "tests/" or blueprint file never created).
+   */
+  _verifyArtifactsAgainstClaims(
+    readme: string,
+    declaredDeliverables: string[],
+    existingFiles: string[]
+  ): { missingDeliverables: string[]; phantomReferences: string[] } {
+    const norm = (p: string): string => p.replace(/^\.\//, '').replace(/\/+$/, '').trim();
+    const files = existingFiles.map(norm).filter(Boolean);
+    const present = (p: string): boolean => {
+      const n = norm(p);
+      if (!n) { return true; }
+      return files.some(f => f === n || f.startsWith(`${n}/`) || f.endsWith(`/${n}`) || f.split('/').includes(n));
+    };
+
+    const missingDeliverables = [...new Set(declaredDeliverables.map(norm).filter(Boolean))].filter(d => !present(d));
+
+    // Only flag backticked tokens that clearly denote a file/dir path with a
+    // recognized code extension or an explicit directory — keeps false positives
+    // (e.g. `npm install`, `node`) out.
+    const codeExt = /\.(py|js|mjs|cjs|ts|tsx|jsx|json|html|css|scss|md|txt|ya?ml|toml|cfg|ini|swift|go|rs|java|kt|rb|php|sh|sql)$/i;
+    const phantom = new Set<string>();
+    const backtick = /`([^`\n]{2,80})`/g;
+    let m: RegExpExecArray | null;
+    while ((m = backtick.exec(readme || '')) !== null) {
+      const tok = m[1].trim();
+      if (/\s/.test(tok)) { continue; }                      // skip commands like "npm install"
+      const looksLikePath = tok.endsWith('/') || codeExt.test(tok) || (tok.includes('/') && !tok.includes('://'));
+      if (!looksLikePath) { continue; }
+      if (!present(tok)) { phantom.add(tok.replace(/\/+$/, '')); }
+      if (phantom.size >= 15) { break; }
+    }
+
+    return { missingDeliverables, phantomReferences: [...phantom] };
+  }
+
+  /** Read README + brief deliverables, run the pure checker, journal the result. */
+  private _runArtifactVerification(projectBriefRaw: string): { summary: string; ok: boolean } {
+    const existingFiles = this.fileManager.listWorkspaceFiles('');
+    const readme = this.fileManager.fileExists('README.md')
+      ? (this.fileManager.readWorkspaceFile('README.md') ?? '')
+      : '';
+    let deliverables: string[] = [];
+    try {
+      const brief = JSON.parse(projectBriefRaw) as { deliveryArtifacts?: unknown };
+      if (Array.isArray(brief.deliveryArtifacts)) {
+        deliverables = brief.deliveryArtifacts.map(d => String(d));
+      }
+    } catch { /* brief may be markdown; deliverables stay empty */ }
+
+    const { missingDeliverables, phantomReferences } = this._verifyArtifactsAgainstClaims(readme, deliverables, existingFiles);
+    const ok = missingDeliverables.length === 0 && phantomReferences.length === 0;
+    const summary = ok
+      ? 'All declared deliverables exist and the README references resolve to real files.'
+      : [
+          missingDeliverables.length ? `Missing declared deliverables: ${missingDeliverables.join(', ')}` : '',
+          phantomReferences.length ? `README references files that do not exist: ${phantomReferences.join(', ')}` : '',
+        ].filter(Boolean).join('\n');
+
+    if (!ok) {
+      this._journal('warn', 'Artifact verification found gaps', summary);
+      this.workspace.appendAssumption('finalIntegrator', `Artifact verification gaps: ${summary}`);
+    } else {
+      this._journal('audit', 'Artifact verification passed', summary);
+    }
+    return { summary, ok };
+  }
+
   private async _phaseFinalIntegration(state: ProjectState): Promise<void> {
     this._checkAborted();
     this._setPhase(state, 'final_integration', 'Final Integrator: Writing report...');
@@ -2941,11 +3064,15 @@ export class AgentOrchestrator {
     // Gather changed files summary
     const changedFiles = this._collectChangedFiles();
 
+    // Honesty check: verify the project against what it claims to deliver.
+    const verification = this._runArtifactVerification(projectBrief);
+
     const context = this._assembleContext([
       this._sec('# Original User Prompt', prompt, 1),
       this._sec('# Autonomous Project Brief', projectBrief, 2),
       this._sec('# Task Results', taskResults, 2),
       this._sec('# Test Results', testerNote, 3),
+      this._sec('# Artifact Verification (be honest about these gaps in the report)', verification.summary, 2),
       this._sec('# Delivery Manifest', deliveryManifest, 3),
       this._sec('# Architecture', architectMd, 4),
       this._sec('# Changed Files', changedFiles.join('\n'), 4),
@@ -3369,6 +3496,18 @@ export class AgentOrchestrator {
         reviewedAt: new Date().toISOString(),
       };
     }
+  }
+
+  /**
+   * Stable signature of a review's blocking issues, used to detect a fixer stuck
+   * in a loop (the same problems recurring attempt after attempt).
+   */
+  private _issueSignature(review: ReviewResult): string {
+    return [...(review.issues ?? []), ...(review.securityConcerns ?? [])]
+      .map(s => s.toLowerCase().replace(/[0-9]+/g, '#').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .sort()
+      .join(' | ');
   }
 
   /** Merge the task reviewer's verdict with the independent quality audit. */
@@ -5917,6 +6056,100 @@ export class AgentOrchestrator {
     return lines.join('\n');
   }
 
+  /**
+   * Detect, from the goal text alone, which capabilities the task genuinely
+   * needs: live web access, public-repo reading, a user-supplied file (e.g. a
+   * CV), or external credentials. Pure and deterministic so it is unit-testable
+   * and runs before any expensive work. Bilingual (EN/VI) keyword heuristics.
+   */
+  _assessGoalCapabilities(goal: string): {
+    needsWeb: boolean;
+    needsRepoReads: boolean;
+    needsUserFiles: string[];
+    needsCredentials: string[];
+  } {
+    const g = (goal || '').toLowerCase();
+    const needsWeb = /\b(scan|scrape|crawl|browse|web|internet|online|website|web ?site|search the web|find .*(job|jobs|vacanc|product|price|listing)|tuy[eể]n d[uụ]ng|qu[eé]t|trang web|tr[eê]n m[aạ]ng|tr[uự]c tuy[eế]n|t[iì]m .*(vi[eệ]c|s[aả]n ph[aẩ]m))\b/i.test(g);
+    const needsRepoReads = /\b(github|gitlab|open ?source|public repo|repositor|library code|example code|m[aã] ngu[oồ]n)\b/i.test(g);
+
+    const needsUserFiles: string[] = [];
+    if (/\b(cv|resume|r[eé]sum[eé]|h[oồ] s[oơ]|s[oơ] y[eế]u|c[aá] nh[aâ]n)\b/i.test(g)) {
+      needsUserFiles.push('your CV/resume file (provide its path in the prompt)');
+    } else if (/\b(read|[dđ][oọ]c|parse|analy[sz]e|ph[aâ]n t[ií]ch) .{0,30}\b(file|document|t[aà]i li[eệ]u|pdf|docx?)\b/i.test(g)) {
+      needsUserFiles.push('the input document/file to process (provide its path in the prompt)');
+    }
+
+    const needsCredentials: string[] = [];
+    if (/\b(api key|api-key|apikey|oauth|access token|client secret|client id|credential|secret key|youtube api|đăng nh[aậ]p|token)\b/i.test(g)) {
+      needsCredentials.push('the required API key / credentials');
+    }
+
+    return { needsWeb, needsRepoReads, needsUserFiles, needsCredentials };
+  }
+
+  /**
+   * Capability pre-flight: before building, make the agent honest about what the
+   * goal needs. Safe capabilities (web research, public-repo reads) are
+   * auto-enabled for the run; inputs only the boss can supply (a CV file, API
+   * credentials) are surfaced — and if they are missing and cannot be asked, the
+   * run STOPS with a precise message instead of wasting hours building a
+   * placeholder that can never actually complete the task.
+   */
+  private async _preflightCapabilities(goal: string): Promise<void> {
+    const a = this._assessGoalCapabilities(goal);
+    const enabled: string[] = [];
+
+    if (a.needsWeb && this.modelConfig.webSearch?.enabled !== true) {
+      this.modelConfig.webSearch = {
+        ...this.modelConfig.webSearch,
+        enabled: true,
+        officialDocsOnly: false,
+        allowedDomains: [],
+      };
+      enabled.push('web research');
+    }
+    if (a.needsRepoReads && this.modelConfig.githubIntegration?.allowExternalRepoReads !== true) {
+      this.modelConfig.githubIntegration = {
+        ...this.modelConfig.githubIntegration,
+        allowExternalRepoReads: true,
+      };
+      enabled.push('public repository reading');
+    }
+    if (enabled.length > 0) {
+      this._rebuildResearchAndTools();
+      this._emit('log', `Auto-enabled ${enabled.join(' and ')} because the goal requires it.`, 'info');
+      this._journal('research', 'Auto-enabled capabilities for this goal',
+        `The goal requires: ${enabled.join(', ')}. Enabled for this run (local, opt-in). Disable in model_config.json to forbid.`);
+    }
+
+    // Inputs only the boss can provide cannot be auto-supplied.
+    const providedFiles = this._promptReferencedFilePaths();
+    const missingFiles = providedFiles.length > 0 ? [] : a.needsUserFiles;
+    const missing = [...missingFiles, ...a.needsCredentials];
+    if (missing.length > 0) {
+      const msg =
+        `This goal needs input only you can provide: ${missing.join('; ')}. ` +
+        `Add it and re-run (e.g. include the file path in your prompt, or set the API key). ` +
+        `Stopping now instead of building a placeholder that cannot truly complete the task.`;
+      this._journal('waiting', 'Missing required input from boss', msg);
+      this.workspace.appendFile(
+        this.workspace.openQuestionsPath,
+        `\n## Required input (run blocked)\n\n${missing.map(n => `- ${n}`).join('\n')}\n\n_Raised at: ${new Date().toISOString()}_\n`
+      );
+      if (this._shouldAskUser()) {
+        missing.forEach((need, i) =>
+          this.callbacks.onQuestionNeeded?.({
+            id: `capability-${i}`,
+            agentRole: 'briefBuilder',
+            phase: 'briefing',
+            question: `Please provide: ${need}`,
+          }));
+      }
+      this._emit('error', msg);
+      throw new MissingCapabilityError(msg, missing);
+    }
+  }
+
   private _selectWorkflowRoute(state: ProjectState): WorkflowRoute {
     // An autonomous-goal run already debated via the dynamic team; skip the
     // fixed 4-round debate and go straight to building the agreed direction.
@@ -5972,15 +6205,7 @@ export class AgentOrchestrator {
     );
     this.webSearch = new WebSearchService(this.modelConfig.webSearch);
     this.research = this._buildResearchService();
-    this.toolRegistry = new AutonomousToolRegistry(
-      this.fileManager,
-      this.searchService,
-      this.terminal,
-      this.patchService,
-      this.webFetcher,
-      (command, reason) => this._requestCommandApproval(command, reason),
-      this.research
-    );
+    this.toolRegistry = this._buildToolRegistry();
     this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig.skills);
     this.githubIntegration = new GitHubIntegrationService(this.workspace.rootDir, this.modelConfig.githubIntegration);
   }
@@ -5995,6 +6220,24 @@ export class AgentOrchestrator {
     });
   }
 
+  private _buildToolRegistry(): AutonomousToolRegistry {
+    return new AutonomousToolRegistry(
+      this.fileManager,
+      this.searchService,
+      this.terminal,
+      this.patchService,
+      this.webFetcher,
+      (command, reason) => this._requestCommandApproval(command, reason),
+      this.research ?? (this.research = this._buildResearchService())
+    );
+  }
+
+  /** Rebuild research + tools after a capability flag changed at runtime. */
+  private _rebuildResearchAndTools(): void {
+    this.research = this._buildResearchService();
+    this.toolRegistry = this._buildToolRegistry();
+  }
+
   private _ensureCapabilityServices(): void {
     if (!this.terminalSessions) {
       this.terminalSessions = new TerminalSessionRunner(
@@ -6004,15 +6247,7 @@ export class AgentOrchestrator {
       );
     }
     if (!this.toolRegistry) {
-      this.toolRegistry = new AutonomousToolRegistry(
-        this.fileManager,
-        this.searchService,
-        this.terminal,
-        this.patchService,
-        this.webFetcher,
-        (command, reason) => this._requestCommandApproval(command, reason),
-        this.research ?? (this.research = this._buildResearchService())
-      );
+      this.toolRegistry = this._buildToolRegistry();
     }
     if (!this.skillManager) {
       this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig?.skills);
@@ -6796,6 +7031,17 @@ export class AgentOrchestrator {
     if (err instanceof UserAbortError) {
       this._emit('log', 'Workflow stopped by user.', 'warn');
       this._updateTimeline('stopped', 'skipped');
+      return;
+    }
+    if (err instanceof MissingCapabilityError) {
+      // Not a crash — an honest stop because the boss must supply something.
+      this._emit('error', err.message);
+      const s = this.workspace.readProjectState();
+      s.status = 'failed';
+      s.currentPhase = 'failed';
+      this.workspace.writeProjectState(s);
+      this.callbacks.onStateUpdate?.(s);
+      this._updateTimeline('failed', 'failed');
       return;
     }
     const msg = formatError(err);

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Capability pre-flight gate** (from a real black-box run that failed end-to-end): before building, the orchestrator inspects the goal and (a) auto-enables the safe capabilities it needs — web research and public-repo reading — for that run, and (b) STOPS early with a precise, journaled message when the goal needs input only the boss can provide (a CV/document file, API credentials) instead of spending hours building a placeholder that can never complete. Bilingual (EN/VI) detection; pure and unit-tested.
+
+### Changed
+- **Dependency gating fixed**: when a prerequisite task hard-fails, its dependents are now SKIPPED (and the skip cascades) instead of running on top of missing foundations — which previously produced broken shells (e.g. importing modules a failed task never created).
+- **Self-heal escalation**: the fixer now detects when the same issues recur across attempts and stops retrying early (no more spinning to the retry limit with no strategy change).
+- **Build viability gate**: if the coding phase completes 0 tasks (all failed/skipped), the run stops honestly instead of delivering a final report over an empty/broken project; partial builds are flagged.
+- **Artifact verification**: the final report is now grounded against reality — missing declared deliverables and README references to files that do not exist are detected, journaled, and surfaced so the report can be honest about gaps. Pure and unit-tested.
+- **Scope discipline**: the brief-builder and architect prompts now forbid unrequested features (no auth/DB/UI/scheduling/"future-proofing" unless the goal asks), since over-scoping was the top failure mode observed.
+
+### Added (continued)
 - **Agent-that-creates-agents (dynamic agent spawning)**: a new meta-agent layer that, from a single boss goal, designs a bespoke team of specialist agents and runs them through the debate protocol — domain-agnostic, no hardcoded use case.
   - `AgentFactory` (the meta-agent) reads the goal and emits a validated roster of `AgentSpec`s — each with its own name, specialty, tailored system prompt, bound model and granted tools. It guarantees ≥5 distinct-model agents, filters tools to the real registry, de-duplicates ids, and falls back to a deterministic generic team (research → strategy → architecture → build → critique → integrate) if the designer model is unavailable.
   - `DynamicAgent` executes one spec with a bounded tool loop (it may only call the tools it was granted).

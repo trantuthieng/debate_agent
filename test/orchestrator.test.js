@@ -829,6 +829,55 @@ test('debate panel guard guarantees five distinct judge models even when roles s
   assert.notEqual(assignments.get('reviewer').model, assignments.get('critic').model);
 });
 
+test('issue signature normalizes numbers so recurring failures are detected as no-progress', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  const a = orchestrator._issueSignature({ issues: ['Failed at line 12'], securityConcerns: [] });
+  const b = orchestrator._issueSignature({ issues: ['Failed at line 99'], securityConcerns: [] });
+  const c = orchestrator._issueSignature({ issues: ['A totally different problem'], securityConcerns: [] });
+
+  assert.equal(a, b, 'same issue with different line numbers must share a signature');
+  assert.notEqual(a, c, 'different issues must have different signatures');
+});
+
+test('capability assessment detects web, file, and credential needs (EN + VI)', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  // The exact failing prompt from the black-box run.
+  const job = orchestrator._assessGoalCapabilities(
+    'tạo 1 agent xin việc. đọc cv người dùng và quét toàn bộ các trang web để chọn các công việc phù hợp với cv nhất và đường link để apply'
+  );
+  assert.equal(job.needsWeb, true, 'should detect web scanning need');
+  assert.ok(job.needsUserFiles.length > 0, 'should detect the CV file need');
+
+  const creds = orchestrator._assessGoalCapabilities('upload videos using the YouTube API key');
+  assert.ok(creds.needsCredentials.length > 0);
+
+  const plain = orchestrator._assessGoalCapabilities('build a calculator that adds two numbers');
+  assert.equal(plain.needsWeb, false);
+  assert.equal(plain.needsUserFiles.length, 0);
+  assert.equal(plain.needsCredentials.length, 0);
+});
+
+test('artifact verification flags missing deliverables and phantom README references', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  const existing = ['src/index.js', 'package.json', 'README.md'];
+  const readme = 'Run `npm install`. See `src/index.js` and the `tests/` folder and `app/server.py`.';
+  const result = orchestrator._verifyArtifactsAgainstClaims(readme, ['src/index.js', 'dist/bundle.js'], existing);
+
+  // dist/bundle.js was promised but not built.
+  assert.ok(result.missingDeliverables.includes('dist/bundle.js'));
+  assert.ok(!result.missingDeliverables.includes('src/index.js'));
+  // README mentions tests/ and app/server.py which do not exist; `npm install` is not a path.
+  assert.ok(result.phantomReferences.includes('tests'));
+  assert.ok(result.phantomReferences.includes('app/server.py'));
+  assert.ok(!result.phantomReferences.some(r => r.includes('npm')));
+});
+
 test('autonomous goal seeds the build pipeline with the dynamic team verdict and skips the fixed debate', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);

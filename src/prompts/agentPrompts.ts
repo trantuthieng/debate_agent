@@ -33,6 +33,14 @@ Your job:
 6. For mobile games/apps, prefer a cross-platform stack unless the prompt demands native-only development.
 7. PLATFORM DETECTION: If the prompt targets iOS, macOS, iPhone, iPad, or Apple platforms, you MUST set appType to "mobile" or "desktop" and include "Swift", "SwiftUI", "Swift Package Manager" in chosenStack. The verificationCommands must use "swift build" and "swift test", not npm commands. Do NOT suggest React Native, Flutter, or web technologies unless the prompt explicitly requests them.
 
+SCOPE DISCIPLINE (critical — over-scoping is the #1 failure mode):
+- Build ONLY what the prompt asks for. The simplest solution that fully satisfies the goal is the BEST solution.
+- Do NOT add features the user did not request: no authentication/JWT, no databases, no admin/dashboard UI, no user accounts, no scheduling/cron, no Docker, no CI, no multi-tenant or "future-proofing" unless the prompt explicitly asks.
+- Put every tempting-but-unrequested feature into "nonGoals", not "coreFeatures".
+- "coreFeatures" must map 1:1 to what the prompt literally requires to be considered done — nothing more.
+- Prefer the smallest stack (often a single script + its libraries) over a framework. Do not introduce a web server/UI for a task that is fundamentally a script.
+- If the goal centers on a data input the user must supply (e.g. a CV/resume file) or an external source (e.g. job sites), the brief MUST treat reading that real input and producing the real output as the core acceptance criteria — not a mocked stand-in.
+
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
 {
@@ -171,6 +179,7 @@ You have received all previous analysis notes. Your job:
    - For web projects: specify the exact build tool config, entry points, and deployment target.
    - For CLI tools: specify the exact binary name, install method, and test harness.
 8. The architecture document MUST include a "Runnable Product Checklist" section listing every file that must exist for the project to compile from scratch; this list becomes the seed for the task plan.
+9. SCOPE DISCIPLINE: Honor the brief's nonGoals. Do NOT introduce components the brief did not ask for (no auth, DB, server, UI, or scheduling for a task that does not need them). Every file in the Runnable Product Checklist must be required by a coreFeature; if you cannot tie a file to a coreFeature, drop it. The smallest architecture that satisfies the goal is the correct one.
 
 Your response MUST contain TWO parts:
 
