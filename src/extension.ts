@@ -61,6 +61,7 @@ function registerCommands(context: vscode.ExtensionContext, panelProvider: Panel
   const commands: Array<[string, () => void | Promise<void>]> = [
     ['localMultiAgentCoder.openPanel', () => panelProvider.openPanel()],
     ['localMultiAgentCoder.startNewProject', () => panelProvider.startNewProject()],
+    ['localMultiAgentCoder.designAgentTeam', () => panelProvider.designAgentTeam()],
     ['localMultiAgentCoder.resumeWorkflow', () => panelProvider.resumeWorkflow()],
     ['localMultiAgentCoder.stopWorkflow', () => panelProvider.stopWorkflow()],
     ['localMultiAgentCoder.showAgentNotes', () => panelProvider.showAgentNotes()],

@@ -355,6 +355,8 @@ export interface StructuredMemoryEvent {
     | 'plan'
     | 'search'
     | 'skill'
+    | 'spawn'
+    | 'team'
     | 'tool'
     | 'verification';
   phase?: WorkflowPhase;
@@ -557,6 +559,55 @@ export interface ToolDefinition {
   description: string;
   inputSchema: Record<string, unknown>;
   safe: boolean;
+}
+
+// ----- Dynamic agents (the "agent that creates agents") -----
+
+/**
+ * A runtime-defined agent invented by the meta-agent (AgentFactory) for a
+ * specific goal. Unlike the eleven fixed workflow roles, these are generated on
+ * demand — name, specialty, system prompt, bound model and allowed tools are
+ * all decided per goal so the system can staff itself for ANY domain (research,
+ * strategy, content, ops, …), not just coding.
+ */
+export interface AgentSpec {
+  id: string;            // kebab-case slug, unique within a team
+  name: string;          // human-facing name, e.g. "Market Analyst"
+  specialty: string;     // one-line domain/role description
+  mission: string;       // what this agent is accountable for
+  systemPrompt: string;  // full system prompt tailored to the specialty
+  model: string;         // bound local model
+  fallbackModel: string; // backup model if the primary fails
+  tools: string[];       // allowed tool names (subset of the tool registry)
+  temperature: number;   // 0..1 sampling temperature
+}
+
+/** A complete team the meta-agent designed for a goal. */
+export interface AgentTeamPlan {
+  goal: string;
+  rationale: string;     // why this composition was chosen
+  agents: AgentSpec[];
+  generatedAt: string;
+}
+
+/** One spawned agent's score of a proposal during a dynamic team debate. */
+export interface DynamicAgentScore {
+  judgeId: string;
+  proposalId: string;
+  score: number;         // 0..10
+  reason: string;
+}
+
+/** Outcome of running a dynamic team debate to a decision. */
+export interface DynamicTeamDecision {
+  goal: string;
+  winningAgentId: string;
+  winningProposal: string;
+  weightedScore: number;
+  agreement: 'high' | 'medium' | 'low';
+  ranked: Array<{ agentId: string; proposal: string; score: number }>;
+  rationale: string;
+  generatedAt: string;
 }
 
 export interface SkillDescriptor {

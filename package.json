@@ -35,6 +35,11 @@
         "category": "Local Multi-Agent Coder"
       },
       {
+        "command": "localMultiAgentCoder.designAgentTeam",
+        "title": "Local Multi-Agent Coder: Design Agent Team (Agent-Creates-Agents)",
+        "category": "Local Multi-Agent Coder"
+      },
+      {
         "command": "localMultiAgentCoder.resumeWorkflow",
         "title": "Local Multi-Agent Coder: Resume Workflow",
         "category": "Local Multi-Agent Coder"

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Agent-that-creates-agents (dynamic agent spawning)**: a new meta-agent layer that, from a single boss goal, designs a bespoke team of specialist agents and runs them through the debate protocol — domain-agnostic, no hardcoded use case.
+  - `AgentFactory` (the meta-agent) reads the goal and emits a validated roster of `AgentSpec`s — each with its own name, specialty, tailored system prompt, bound model and granted tools. It guarantees ≥5 distinct-model agents, filters tools to the real registry, de-duplicates ids, and falls back to a deterministic generic team (research → strategy → architecture → build → critique → integrate) if the designer model is unavailable.
+  - `DynamicAgent` executes one spec with a bounded tool loop (it may only call the tools it was granted).
+  - `DynamicTeam` runs the spawned agents through propose → cross-critique → refine → score & vote, producing a ranked decision plus a full markdown transcript persisted to the workspace.
+  - New command **“Design Agent Team (Agent-Creates-Agents)”** and orchestrator entry `designAndRunTeam(goal)`; the whole run is journaled (🧬 spawn, 👥 team) into `AGENT_JOURNAL.md`.
+  - Unit tests for spec normalization/diversity/fallback/top-up, team score aggregation, and the dynamic-agent tool loop (including the security property that ungranted tools never run).
+
 - **Guaranteed multi-model debate panel**: a runtime guard now assigns a *distinct* local model to each of the five round-4 judges even when two roles share a primary model in config (e.g. critic and reviewer). Each judge keeps its role lens but borrows a still-unused model from the roster; if the roster is too small to reach five, the shortfall is logged, journaled, and recorded as an assumption instead of silently passing.
 - **On-demand research capability** (`ResearchService`): agents can call `web_search` (cited, freshness-stamped findings) and — when enabled — `find_code_examples` / `read_repo_file` to discover and read code from public GitHub/GitLab repositories and learn from existing high-quality implementations. Web research is no longer gated by a narrow keyword whitelist: it runs whenever it can add value (explicit research intent or any new-project build) and is opt-in/policy-governed via `webSearch.enabled` and `githubIntegration.allowExternalRepoReads`. All findings carry source URLs + retrieval timestamps and are journaled as citations.
 - Unit tests for the debate-panel diversity guard, the opt-in research service (citations/format), and the command-approval tool flow.

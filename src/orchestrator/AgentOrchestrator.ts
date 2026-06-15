@@ -48,6 +48,9 @@ import { PlanController } from '../services/planController';
 import { SkillManager } from '../services/skillManager';
 import { WebSearchService } from '../services/webSearchService';
 import { ResearchService } from '../services/researchService';
+import { AgentFactory } from '../dynamic/AgentFactory';
+import { DynamicTeam } from '../dynamic/DynamicTeam';
+import type { DynamicTeamDecision } from '../types';
 import { TerminalSessionRunner } from '../terminal/TerminalSessionRunner';
 import { AutonomousToolRegistry } from '../tools/AutonomousToolRegistry';
 import { ContextCache } from '../context/ContextCache';
@@ -210,6 +213,81 @@ export class AgentOrchestrator {
       await this._runWorkflow(state);
     } catch (err) {
       this._handleTopLevelError(err);
+    } finally {
+      this._running = false;
+    }
+  }
+
+  /**
+   * The "agent that creates agents". Given a single boss goal, a meta-agent
+   * designs a bespoke team of specialist agents (each with its own model, system
+   * prompt and tools), then runs them through the debate protocol
+   * (propose → critique → refine → score) to converge on the best direction.
+   *
+   * This is domain-agnostic — the meta-agent staffs whatever specialties the
+   * goal needs (research, strategy, engineering, content, ops, …), realizing the
+   * "one command from the boss, agents self-organize" vision without hardcoding
+   * any specific use case.
+   */
+  async designAndRunTeam(goal: string): Promise<DynamicTeamDecision> {
+    if (this._running) {
+      this._emit('info', 'A workflow is already running.');
+      throw new Error('A workflow is already running.');
+    }
+    this._running = true;
+    this._aborted = false;
+    try {
+      await this.workspace.initialize();
+      this._loadConfig();
+      this.workspace.writeUserPrompt(goal);
+      this.workspace.initializeJournal(goal);
+      this._journal('start', 'Dynamic team requested', `**Goal:** ${goal}`);
+
+      const factory = new AgentFactory(this.ollama, {
+        roster: this._modelRoster(),
+        toolNames: this.toolRegistry.definitions().map(d => d.name),
+        designerModel: this._agentConfig('brainstorm').model,
+        designerFallback: this._agentConfig('brainstorm').fallbackModel,
+      });
+
+      this._emit('log', 'Meta-agent designing a bespoke team for the goal...', 'info');
+      const plan = await factory.designTeam(goal, '', this.workspace.agentNotePath('dynamic_team_plan.json'));
+      this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_plan.json'), prettyJson(plan));
+      this._journal('spawn', `Meta-agent spawned ${plan.agents.length} agents`, [
+        `**Rationale:** ${plan.rationale}`,
+        '',
+        ...plan.agents.map(a => `- **${a.name}** (\`${a.model}\`) — ${a.specialty}${a.tools.length ? ` · tools: ${a.tools.join(', ')}` : ''}`),
+      ].join('\n'));
+      plan.agents.forEach(a => this._recordActivity({
+        phase: 'brainstorm',
+        agentRole: 'brainstorm',
+        title: `Spawned agent: ${a.name}`,
+        detail: `${a.specialty} on ${a.model}`,
+        status: 'completed',
+      }));
+
+      const team = new DynamicTeam(this.ollama, this.toolRegistry);
+      const { decision, transcript } = await team.run(plan, {
+        onRound: (round, label) => this._journal('team', `Debate round ${round} — ${label}`),
+        onAgent: (round, agentId, summary) => this._emit('log', `[R${round}] ${agentId}: ${summary}`, 'info'),
+      });
+
+      this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_debate.md'), transcript);
+      this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_decision.json'), prettyJson(decision));
+      const winnerName = plan.agents.find(a => a.id === decision.winningAgentId)?.name ?? decision.winningAgentId;
+      this._journal('team', `Team verdict: ${winnerName} wins (${decision.weightedScore}/10, ${decision.agreement} agreement)`,
+        decision.winningProposal);
+      this.workspace.appendMemoryEvent({
+        type: 'team',
+        phase: 'brainstorm',
+        summary: `Dynamic team converged: ${winnerName} (${decision.weightedScore}/10).`,
+        data: { goal, winningAgentId: decision.winningAgentId, agreement: decision.agreement },
+      });
+      this._emit('log', `Dynamic team complete: ${winnerName} wins (${decision.weightedScore}/10).`, 'info');
+      return decision;
+    } catch (err) {
+      this._journal('error', 'Dynamic team failed', formatError(err));
+      throw err;
     } finally {
       this._running = false;
     }
@@ -6732,6 +6810,8 @@ export class AgentOrchestrator {
       waiting:    { icon: '⏳', author: 'system' },
       research:   { icon: '🌐', author: 'researcher' },
       github:     { icon: '🐙', author: 'researcher' },
+      spawn:      { icon: '🧬', author: 'meta-agent' },
+      team:       { icon: '👥', author: 'dynamic-team' },
     };
     const meta = map[kind] ?? { icon: '📝', author: 'agent' };
     try {
