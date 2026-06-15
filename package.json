@@ -40,6 +40,11 @@
         "category": "Local Multi-Agent Coder"
       },
       {
+        "command": "localMultiAgentCoder.runAutonomousGoal",
+        "title": "Local Multi-Agent Coder: Autonomous Goal (Design → Debate → Build)",
+        "category": "Local Multi-Agent Coder"
+      },
+      {
         "command": "localMultiAgentCoder.resumeWorkflow",
         "title": "Local Multi-Agent Coder: Resume Workflow",
         "category": "Local Multi-Agent Coder"

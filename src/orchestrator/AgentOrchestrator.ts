@@ -50,7 +50,7 @@ import { WebSearchService } from '../services/webSearchService';
 import { ResearchService } from '../services/researchService';
 import { AgentFactory } from '../dynamic/AgentFactory';
 import { DynamicTeam } from '../dynamic/DynamicTeam';
-import type { DynamicTeamDecision } from '../types';
+import type { DynamicTeamDecision, AgentTeamPlan } from '../types';
 import { TerminalSessionRunner } from '../terminal/TerminalSessionRunner';
 import { AutonomousToolRegistry } from '../tools/AutonomousToolRegistry';
 import { ContextCache } from '../context/ContextCache';
@@ -161,6 +161,8 @@ export class AgentOrchestrator {
   private _pendingPatchResolvers = new Map<string, (approved: boolean) => void>();
   private _pendingCommandResolvers = new Map<string, (approved: boolean) => void>();
   private _approvalCounter = 0;
+  /** When true, the fixed 4-round debate is skipped (a dynamic team replaced it). */
+  private _skipFixedDebate = false;
 
   constructor(workspaceRoot: string) {
     this.workspace = new AgentWorkspace(workspaceRoot);
@@ -242,48 +244,7 @@ export class AgentOrchestrator {
       this.workspace.writeUserPrompt(goal);
       this.workspace.initializeJournal(goal);
       this._journal('start', 'Dynamic team requested', `**Goal:** ${goal}`);
-
-      const factory = new AgentFactory(this.ollama, {
-        roster: this._modelRoster(),
-        toolNames: this.toolRegistry.definitions().map(d => d.name),
-        designerModel: this._agentConfig('brainstorm').model,
-        designerFallback: this._agentConfig('brainstorm').fallbackModel,
-      });
-
-      this._emit('log', 'Meta-agent designing a bespoke team for the goal...', 'info');
-      const plan = await factory.designTeam(goal, '', this.workspace.agentNotePath('dynamic_team_plan.json'));
-      this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_plan.json'), prettyJson(plan));
-      this._journal('spawn', `Meta-agent spawned ${plan.agents.length} agents`, [
-        `**Rationale:** ${plan.rationale}`,
-        '',
-        ...plan.agents.map(a => `- **${a.name}** (\`${a.model}\`) — ${a.specialty}${a.tools.length ? ` · tools: ${a.tools.join(', ')}` : ''}`),
-      ].join('\n'));
-      plan.agents.forEach(a => this._recordActivity({
-        phase: 'brainstorm',
-        agentRole: 'brainstorm',
-        title: `Spawned agent: ${a.name}`,
-        detail: `${a.specialty} on ${a.model}`,
-        status: 'completed',
-      }));
-
-      const team = new DynamicTeam(this.ollama, this.toolRegistry);
-      const { decision, transcript } = await team.run(plan, {
-        onRound: (round, label) => this._journal('team', `Debate round ${round} — ${label}`),
-        onAgent: (round, agentId, summary) => this._emit('log', `[R${round}] ${agentId}: ${summary}`, 'info'),
-      });
-
-      this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_debate.md'), transcript);
-      this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_decision.json'), prettyJson(decision));
-      const winnerName = plan.agents.find(a => a.id === decision.winningAgentId)?.name ?? decision.winningAgentId;
-      this._journal('team', `Team verdict: ${winnerName} wins (${decision.weightedScore}/10, ${decision.agreement} agreement)`,
-        decision.winningProposal);
-      this.workspace.appendMemoryEvent({
-        type: 'team',
-        phase: 'brainstorm',
-        summary: `Dynamic team converged: ${winnerName} (${decision.weightedScore}/10).`,
-        data: { goal, winningAgentId: decision.winningAgentId, agreement: decision.agreement },
-      });
-      this._emit('log', `Dynamic team complete: ${winnerName} wins (${decision.weightedScore}/10).`, 'info');
+      const { decision } = await this._designAndRunTeamInternal(goal);
       return decision;
     } catch (err) {
       this._journal('error', 'Dynamic team failed', formatError(err));
@@ -291,6 +252,140 @@ export class AgentOrchestrator {
     } finally {
       this._running = false;
     }
+  }
+
+  /**
+   * Closes the "one command → finished product" loop: a meta-agent designs and
+   * debates a bespoke team, the winning direction seeds the build pipeline, and
+   * the proven sprint workflow (architect → task plan → code → review → quality
+   * audit → test → fix → deliver) turns it into a verified product. The dynamic
+   * team REPLACES the fixed 4-round debate, so it is not run twice.
+   */
+  async runAutonomousGoal(goal: string): Promise<void> {
+    if (this._running) {
+      this._emit('info', 'A workflow is already running.');
+      return;
+    }
+    this._running = true;
+    this._aborted = false;
+    try {
+      await this.workspace.initialize();
+      this._loadConfig();
+
+      this._activities = [];
+      this._activityCounter = 0;
+      this._promptFileContextCache = null;
+      this._webContextCache = null;
+      this._contextCache.clear();
+      this._lastMicroCheckSummary = '';
+      this._taskPlanComplexity = 'medium';
+      const state = this._newState(goal);
+      this.workspace.writeProjectState(state);
+      this.workspace.writeUserPrompt(goal);
+      this.workspace.initializeJournal(goal);
+      this._buildTimeline();
+      this._emitTimeline();
+      this._journal('start', 'Autonomous goal requested', `**Goal:** ${goal}\n\nThe meta-agent will staff a team, debate, then build the product.`);
+
+      // Phase A — dynamic team designs + debates the approach.
+      const { plan, decision, transcript } = await this._designAndRunTeamInternal(goal);
+
+      // Phase B — seed the build pipeline with the team's authoritative direction
+      // and run the proven sprint workflow to produce the actual product.
+      this._seedBuildFromTeam(plan, decision, transcript);
+      this._skipFixedDebate = true;
+      await this._runWorkflow(state);
+    } catch (err) {
+      this._handleTopLevelError(err);
+    } finally {
+      this._running = false;
+      this._skipFixedDebate = false;
+    }
+  }
+
+  /**
+   * Core of the dynamic team run (no lifecycle/_running management): design the
+   * team, run the debate, persist artifacts and journal everything. Reused by
+   * both {@link designAndRunTeam} and {@link runAutonomousGoal}.
+   */
+  private async _designAndRunTeamInternal(
+    goal: string
+  ): Promise<{ plan: AgentTeamPlan; decision: DynamicTeamDecision; transcript: string }> {
+    const factory = new AgentFactory(this.ollama, {
+      roster: this._modelRoster(),
+      toolNames: this.toolRegistry.definitions().map(d => d.name),
+      designerModel: this._agentConfig('brainstorm').model,
+      designerFallback: this._agentConfig('brainstorm').fallbackModel,
+    });
+
+    this._emit('log', 'Meta-agent designing a bespoke team for the goal...', 'info');
+    const plan = await factory.designTeam(goal, '', this.workspace.agentNotePath('dynamic_team_plan.json'));
+    this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_plan.json'), prettyJson(plan));
+    this._journal('spawn', `Meta-agent spawned ${plan.agents.length} agents`, [
+      `**Rationale:** ${plan.rationale}`,
+      '',
+      ...plan.agents.map(a => `- **${a.name}** (\`${a.model}\`) — ${a.specialty}${a.tools.length ? ` · tools: ${a.tools.join(', ')}` : ''}`),
+    ].join('\n'));
+    plan.agents.forEach(a => this._recordActivity({
+      phase: 'brainstorm',
+      agentRole: 'brainstorm',
+      title: `Spawned agent: ${a.name}`,
+      detail: `${a.specialty} on ${a.model}`,
+      status: 'completed',
+    }));
+
+    const team = new DynamicTeam(this.ollama, this.toolRegistry);
+    const { decision, transcript } = await team.run(plan, {
+      onRound: (round, label) => this._journal('team', `Debate round ${round} — ${label}`),
+      onAgent: (round, agentId, summary) => this._emit('log', `[R${round}] ${agentId}: ${summary}`, 'info'),
+    });
+
+    this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_debate.md'), transcript);
+    this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_decision.json'), prettyJson(decision));
+    const winnerName = plan.agents.find(a => a.id === decision.winningAgentId)?.name ?? decision.winningAgentId;
+    this._journal('team', `Team verdict: ${winnerName} wins (${decision.weightedScore}/10, ${decision.agreement} agreement)`,
+      decision.winningProposal);
+    this.workspace.appendMemoryEvent({
+      type: 'team',
+      phase: 'brainstorm',
+      summary: `Dynamic team converged: ${winnerName} (${decision.weightedScore}/10).`,
+      data: { goal, winningAgentId: decision.winningAgentId, agreement: decision.agreement },
+    });
+    this._emit('log', `Dynamic team complete: ${winnerName} wins (${decision.weightedScore}/10).`, 'info');
+    return { plan, decision, transcript };
+  }
+
+  /**
+   * Bridge the dynamic team's outcome into the build pipeline: the winning
+   * direction is written to the file the briefing phase reads as the
+   * authoritative decision, and the full debate is left as brainstorm context.
+   */
+  private _seedBuildFromTeam(plan: AgentTeamPlan, decision: DynamicTeamDecision, transcript: string): void {
+    const winnerName = plan.agents.find(a => a.id === decision.winningAgentId)?.name ?? decision.winningAgentId;
+    const decisionDoc = this._wrapNote('Debate Decision (from autonomous agent team)', [
+      `Winning direction (by ${winnerName}, ${decision.weightedScore}/10, ${decision.agreement} agreement):`,
+      '',
+      decision.winningProposal,
+      '',
+      '## Ranked alternatives',
+      ...decision.ranked.map((r, i) => `${i + 1}. (${r.score}/10) ${this._clipText(r.proposal, 400)}`),
+      '',
+      `## Rationale\n${decision.rationale}`,
+    ].join('\n'));
+
+    this.workspace.writeFile(this._debateDecisionPath, decisionDoc);
+    // Give the brief builder the team's reasoning as brainstorm/consensus context.
+    this.workspace.writeFile(this.workspace.brainstormPath, this._wrapNote('Brainstorm (autonomous agent team)', transcript));
+    this.workspace.appendRollingSummary(
+      `## Autonomous Team Decision\nWinning direction (${decision.weightedScore}/10, ${decision.agreement} agreement) by ${winnerName}: ${this._clipText(decision.winningProposal, 600)}`
+    );
+    this._journal('decision', 'Seeded build pipeline with the team verdict',
+      `The winning direction is now the authoritative brief input. Build sprints will implement it.`);
+  }
+
+  private _clipText(text: string, max: number): string {
+    const t = (text ?? '').replace(/\s+/g, ' ').trim();
+    return t.length > max ? `${t.slice(0, max)}…` : t;
   }
 
   /**
@@ -5823,6 +5918,16 @@ export class AgentOrchestrator {
   }
 
   private _selectWorkflowRoute(state: ProjectState): WorkflowRoute {
+    // An autonomous-goal run already debated via the dynamic team; skip the
+    // fixed 4-round debate and go straight to building the agreed direction.
+    if (this._skipFixedDebate) {
+      return {
+        kind: 'full_project',
+        skipDebate: true,
+        reason: 'A dynamic agent team already debated and chose the direction, so the fixed debate is skipped and the build implements the team verdict.',
+      };
+    }
+
     const prompt = (state.projectGoal || this.workspace.readUserPrompt()).toLowerCase();
     const looksLikeMaintenance =
       /(fix|bug|failing|failure|error|lint|compile|test|review|refactor|update|change|patch|sửa|lỗi|kiểm tra|cải tiến)/i.test(prompt);

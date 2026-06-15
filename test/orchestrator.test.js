@@ -829,6 +829,45 @@ test('debate panel guard guarantees five distinct judge models even when roles s
   assert.notEqual(assignments.get('reviewer').model, assignments.get('critic').model);
 });
 
+test('autonomous goal seeds the build pipeline with the dynamic team verdict and skips the fixed debate', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  const plan = {
+    goal: 'Build a thing',
+    rationale: 'team rationale',
+    agents: [
+      { id: 'builder', name: 'Builder', specialty: 'build', mission: 'm', systemPrompt: 'p', model: 'm1', fallbackModel: 'm2', tools: [], temperature: 0.4 },
+    ],
+    generatedAt: new Date().toISOString(),
+  };
+  const decision = {
+    goal: 'Build a thing',
+    winningAgentId: 'builder',
+    winningProposal: 'Implement the thing with approach X.',
+    weightedScore: 8.5,
+    agreement: 'high',
+    ranked: [{ agentId: 'builder', proposal: 'Implement the thing with approach X.', score: 8.5 }],
+    rationale: 'highest mean score',
+    generatedAt: new Date().toISOString(),
+  };
+
+  orchestrator._seedBuildFromTeam(plan, decision, '# Debate transcript\n...');
+
+  // The winning direction is written where the briefing phase reads it as authoritative.
+  const decisionDoc = orchestrator.workspace.readFile(orchestrator._debateDecisionPath);
+  assert.match(decisionDoc, /Implement the thing with approach X\./);
+  assert.match(decisionDoc, /autonomous agent team/i);
+  // The transcript becomes brainstorm context for the brief builder.
+  assert.match(orchestrator.workspace.readFile(orchestrator.workspace.brainstormPath), /Debate transcript/);
+
+  // With the dynamic team having debated, the fixed 4-round debate is skipped.
+  orchestrator._skipFixedDebate = true;
+  const route = orchestrator._selectWorkflowRoute(makeState());
+  assert.equal(route.skipDebate, true);
+  assert.equal(route.kind, 'full_project');
+});
+
 test('fallback improvement consensus requires more than one clean sprint before stopping', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);

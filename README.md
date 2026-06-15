@@ -9,7 +9,7 @@
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85-blue?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Ollama](https://img.shields.io/badge/Ollama-local%20LLM-black?logo=ollama)](https://ollama.com/)
-[![Tests](https://img.shields.io/badge/tests-56%20passing-brightgreen)](#-running-tests)
+[![Tests](https://img.shields.io/badge/tests-57%20passing-brightgreen)](#-running-tests)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
@@ -96,7 +96,7 @@ Then the build begins — in small, verifiable sprints:
 | Feature | Description |
 |---|---|
 | 🔒 **100% Local** | Every model runs via Ollama — your code never leaves your machine |
-| 🧬 **Agent-Creates-Agents** | From one goal, a **meta-agent designs a bespoke specialist team** (each with its own model, prompt and tools) and runs them through the debate — generic to any domain, not just coding |
+| 🧬 **Agent-Creates-Agents** | From one goal, a **meta-agent designs a bespoke specialist team** (each with its own model, prompt and tools), debates it to a verdict, then **hands the winning direction to the build pipeline** — one command → finished product, generic to any domain |
 | 🌐 **Governed Research** | Opt-in web search + public GitHub/GitLab repo reading, with cited, freshness-stamped findings, available on demand to any agent |
 | ⚖️ **4-Round Scored Debate** | Propose → cross-critique → respond → a **5-model panel scores and votes** on the best direction before any code is written |
 | 🕵️ **3-Model Code Cross-Check** | One model writes, a second reviews task acceptance, a third (independent, stronger) audits overall quality — the fix loop repeats **until all are satisfied** |
@@ -165,6 +165,7 @@ Then the build begins — in small, verifiable sprints:
 | `Local Multi-Agent Coder: Open Panel` | Open the main UI |
 | `Local Multi-Agent Coder: Start New Project` | Start a fresh generation |
 | `Local Multi-Agent Coder: Design Agent Team (Agent-Creates-Agents)` | From one goal, a meta-agent designs a specialist team and debates it to a verdict |
+| `Local Multi-Agent Coder: Autonomous Goal (Design → Debate → Build)` | One command → finished product: the team self-organizes, debates, then builds & verifies it |
 | `Local Multi-Agent Coder: Resume Workflow` | Continue an interrupted run |
 | `Local Multi-Agent Coder: Stop Workflow` | Abort the current run |
 | `Local Multi-Agent Coder: Show Agent Notes` | View agent reasoning & decisions |

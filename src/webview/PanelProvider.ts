@@ -135,6 +135,45 @@ export class PanelProvider implements vscode.WebviewViewProvider {
       });
   }
 
+  /**
+   * The full "one command → finished product" loop: a meta-agent designs and
+   * debates a specialist team, then the proven build pipeline implements the
+   * winning direction into a verified product.
+   */
+  async runAutonomousGoal(): Promise<void> {
+    const goal = await vscode.window.showInputBox({
+      prompt: 'Describe the goal — agents will self-organize, debate, and build it end-to-end',
+      placeHolder: 'Build a CLI tool that summarizes Markdown files...',
+      ignoreFocusOut: true,
+    });
+    if (!goal) { return; }
+
+    const root = this._getWorkspaceRoot();
+    if (!root) {
+      vscode.window.showErrorMessage('No workspace folder open. Please open a folder first.');
+      return;
+    }
+
+    this._orchestrator = this._createOrchestrator(root);
+
+    const { OllamaClient } = await import('../ollama/OllamaClient');
+    const { AgentWorkspace } = await import('../workspace/AgentWorkspace');
+    const ws = new AgentWorkspace(root);
+    await ws.initialize();
+    const config = ws.readModelConfig();
+    const client = new OllamaClient(config.ollamaBaseUrl, undefined, config.requestTimeoutMs);
+    if (!(await client.checkConnection())) {
+      vscode.window.showErrorMessage(`Cannot connect to Ollama at ${config.ollamaBaseUrl}. Please start Ollama and try again.`);
+      return;
+    }
+
+    this._post({ type: 'appendLog', log: 'Autonomous goal: meta-agent staffing a team, then building...', level: 'info' });
+    this._orchestrator.runAutonomousGoal(goal).catch(err => {
+      const msg = err instanceof Error ? err.message : String(err);
+      this._post({ type: 'error', message: msg });
+    });
+  }
+
   stopWorkflow(): void {
     this._orchestrator?.stop();
     this._post({ type: 'info', message: 'Stop requested.' });

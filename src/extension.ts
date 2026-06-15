@@ -62,6 +62,7 @@ function registerCommands(context: vscode.ExtensionContext, panelProvider: Panel
     ['localMultiAgentCoder.openPanel', () => panelProvider.openPanel()],
     ['localMultiAgentCoder.startNewProject', () => panelProvider.startNewProject()],
     ['localMultiAgentCoder.designAgentTeam', () => panelProvider.designAgentTeam()],
+    ['localMultiAgentCoder.runAutonomousGoal', () => panelProvider.runAutonomousGoal()],
     ['localMultiAgentCoder.resumeWorkflow', () => panelProvider.resumeWorkflow()],
     ['localMultiAgentCoder.stopWorkflow', () => panelProvider.stopWorkflow()],
     ['localMultiAgentCoder.showAgentNotes', () => panelProvider.showAgentNotes()],
