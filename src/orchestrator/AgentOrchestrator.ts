@@ -65,6 +65,28 @@ interface ImprovementConsensus {
   rationale: string;
 }
 
+// A small, realistic sample CV used as a development/test fixture when a goal
+// asks to BUILD a tool that processes a user's CV at runtime — so the tool can
+// be developed and verified end-to-end without the boss's real document.
+const SAMPLE_RESUME_FIXTURE = `Jane Doe
+Email: jane.doe@example.com | Location: Remote
+
+SUMMARY
+Senior software engineer with 6 years of experience in backend and data systems.
+
+SKILLS
+Python, TypeScript, Node.js, PostgreSQL, Docker, AWS, REST APIs, web scraping
+
+EXPERIENCE
+Senior Backend Engineer — Acme Corp (2021-present)
+- Built data pipelines and REST APIs serving 1M+ requests/day.
+Software Engineer — Globex (2018-2021)
+- Developed internal tooling and automated reporting.
+
+EDUCATION
+B.Sc. Computer Science, State University (2018)
+`;
+
 // One judge's scorecard in the round-4 debate scoring panel. Each judge runs on
 // a different local model and rates the consolidated approach across weighted
 // criteria, then recommends the single best direction to proceed with.
@@ -6122,32 +6144,108 @@ export class AgentOrchestrator {
         `The goal requires: ${enabled.join(', ')}. Enabled for this run (local, opt-in). Disable in model_config.json to forbid.`);
     }
 
-    // Inputs only the boss can provide cannot be auto-supplied.
+    // Distinguish BUILD-time inputs from the finished product's RUNTIME inputs.
     const providedFiles = this._promptReferencedFilePaths();
     const missingFiles = providedFiles.length > 0 ? [] : a.needsUserFiles;
-    const missing = [...missingFiles, ...a.needsCredentials];
-    if (missing.length > 0) {
-      const msg =
-        `This goal needs input only you can provide: ${missing.join('; ')}. ` +
-        `Add it and re-run (e.g. include the file path in your prompt, or set the API key). ` +
-        `Stopping now instead of building a placeholder that cannot truly complete the task.`;
-      this._journal('waiting', 'Missing required input from boss', msg);
-      this.workspace.appendFile(
-        this.workspace.openQuestionsPath,
-        `\n## Required input (run blocked)\n\n${missing.map(n => `- ${n}`).join('\n')}\n\n_Raised at: ${new Date().toISOString()}_\n`
-      );
-      if (this._shouldAskUser()) {
-        missing.forEach((need, i) =>
-          this.callbacks.onQuestionNeeded?.({
-            id: `capability-${i}`,
-            agentRole: 'briefBuilder',
-            phase: 'briefing',
-            question: `Please provide: ${need}`,
-          }));
-      }
-      this._emit('error', msg);
-      throw new MissingCapabilityError(msg, missing);
+    const runtimeInputs = [...missingFiles, ...a.needsCredentials];
+    if (runtimeInputs.length === 0) { return; }
+
+    if (this._goalHasBuildIntent(goal)) {
+      // The goal is to BUILD a reusable tool/agent. A CV/resume or API key is a
+      // RUNTIME input the END USER will supply when they run the product — NOT
+      // something needed to build it. So build the complete tool now: make it
+      // accept these inputs at runtime, generate sample fixtures so it can be
+      // developed and tested, and document the real-input contract. Do NOT block.
+      this._deferRuntimeInputs(goal, runtimeInputs);
+      return;
     }
+
+    // A one-shot task that operates directly on data we do not have and cannot
+    // build a reusable tool around: honestly stop and ask the boss for it.
+    const msg =
+      `This goal needs input only you can provide: ${runtimeInputs.join('; ')}. ` +
+      `Add it and re-run (e.g. include the file path in your prompt, or set the API key). ` +
+      `Stopping now instead of building a placeholder that cannot truly complete the task.`;
+    this._journal('waiting', 'Missing required input from boss', msg);
+    this.workspace.appendFile(
+      this.workspace.openQuestionsPath,
+      `\n## Required input (run blocked)\n\n${runtimeInputs.map(n => `- ${n}`).join('\n')}\n\n_Raised at: ${new Date().toISOString()}_\n`
+    );
+    if (this._shouldAskUser()) {
+      runtimeInputs.forEach((need, i) =>
+        this.callbacks.onQuestionNeeded?.({
+          id: `capability-${i}`,
+          agentRole: 'briefBuilder',
+          phase: 'briefing',
+          question: `Please provide: ${need}`,
+        }));
+    }
+    this._emit('error', msg);
+    throw new MissingCapabilityError(msg, runtimeInputs);
+  }
+
+  /** True when the goal asks to BUILD a reusable artifact (vs. a one-shot task). */
+  _goalHasBuildIntent(goal: string): boolean {
+    return /\b(t[aạ]o|x[aâ]y|build|create|generate|develop|l[aà]m|vi[eế]t|scaffold|implement|agent|tool|app|application|script|system|service|api|cli|bot|website|web ?app|ph[aầ]n m[eề]m|[uứ]ng d[uụ]ng|c[oô]ng c[uụ]|h[eệ] th[oố]ng|trang web|chương tr[iì]nh)\b/i.test(goal || '');
+  }
+
+  /**
+   * Treat boss-only inputs as the finished product's RUNTIME parameters instead
+   * of blocking the build: create sample fixtures for development/testing, write
+   * a clear runtime-input contract, and inject it so the brief/architect build a
+   * tool that accepts the real inputs later and documents how to provide them.
+   */
+  private _deferRuntimeInputs(goal: string, runtimeInputs: string[]): void {
+    const fixtures = this._writeRuntimeFixtures(runtimeInputs);
+    const contract = [
+      '## BUILD DIRECTIVE — runtime inputs (do NOT block the build on these)',
+      'This goal is to BUILD a reusable tool/agent. The items below are RUNTIME inputs the END USER supplies when they RUN the product — they are NOT needed to build it. Build the complete, runnable tool now.',
+      ...runtimeInputs.map(i => `- ${i} → the product MUST accept this at runtime (CLI argument, config file, or environment variable). NEVER hardcode it.`),
+      fixtures.length
+        ? `For development and tests, use the sample fixture(s): ${fixtures.join(', ')}. The tool must run end-to-end against these.`
+        : 'Create a small sample fixture so the tool can be developed and tested end-to-end.',
+      'Document in the README exactly how the user provides the real input at runtime.',
+      'Acceptance: the tool runs end-to-end on the sample fixture(s) and clearly documents the real-input contract.',
+    ].join('\n');
+
+    // Propagate the directive through the user prompt (read by brief + architect).
+    const original = this.workspace.readUserPrompt();
+    if (!original.includes('BUILD DIRECTIVE — runtime inputs')) {
+      this.workspace.writeUserPrompt(`${original}\n\n---\n${contract}`);
+    }
+    this.workspace.appendRollingSummary(`## Runtime Input Contract\n${contract}`);
+    this.workspace.appendAssumption('briefBuilder',
+      `Runtime inputs deferred (built as parameters, not blockers): ${runtimeInputs.join('; ')}. Sample fixtures: ${fixtures.join(', ') || 'none'}.`);
+    this._journal('research', 'Deferred boss inputs to runtime (built complete tool instead of blocking)',
+      contract);
+    this._emit('log', `Building the tool to accept these at runtime instead of blocking: ${runtimeInputs.join('; ')}.`, 'info');
+  }
+
+  /** Create small sample fixtures so a tool needing a CV / credentials is testable. */
+  private _writeRuntimeFixtures(runtimeInputs: string[]): string[] {
+    const created: string[] = [];
+    const joined = runtimeInputs.join(' ').toLowerCase();
+    try {
+      if (/cv|resume|r[eé]sum[eé]|document|file|t[aà]i li[eệ]u|h[oồ] s[oơ]/.test(joined)) {
+        const rel = 'examples/sample_resume.txt';
+        const full = path.join(this.workspace.rootDir, rel);
+        if (!this.fileManager.fileExists(rel)) {
+          this.workspace.writeFile(full, SAMPLE_RESUME_FIXTURE);
+        }
+        created.push(rel);
+      }
+      if (/key|credential|token|secret|oauth|api/.test(joined)) {
+        const rel = '.env.example';
+        const full = path.join(this.workspace.rootDir, rel);
+        if (!this.fileManager.fileExists(rel)) {
+          this.workspace.writeFile(full, '# Fill in real values at runtime. Never commit real secrets.\nAPI_KEY=your-api-key-here\n');
+        }
+        created.push(rel);
+      }
+    } catch (err) {
+      logWarn(`Could not write runtime fixtures: ${formatError(err)}`);
+    }
+    return created;
   }
 
   private _selectWorkflowRoute(state: ProjectState): WorkflowRoute {

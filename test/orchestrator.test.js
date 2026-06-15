@@ -861,6 +861,37 @@ test('capability assessment detects web, file, and credential needs (EN + VI)', 
   assert.equal(plain.needsCredentials.length, 0);
 });
 
+test('build-intent goals defer runtime inputs (build the tool) instead of blocking', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const jobPrompt = 'tạo 1 agent xin việc. đọc cv người dùng và quét toàn bộ các trang web để chọn công việc phù hợp và đường link apply';
+  orchestrator.workspace.writeUserPrompt(jobPrompt);
+
+  // Must NOT throw — the CV is a runtime input, not a build-time blocker.
+  await orchestrator._preflightCapabilities(jobPrompt);
+
+  assert.equal(orchestrator._goalHasBuildIntent(jobPrompt), true);
+  // Web research was auto-enabled for the run.
+  assert.equal(orchestrator.modelConfig.webSearch.enabled, true);
+  // A sample CV fixture was created so the tool can be developed/tested.
+  assert.ok(orchestrator.fileManager.fileExists('examples/sample_resume.txt'));
+  // The build directive was injected into the prompt for the brief/architect.
+  assert.match(orchestrator.workspace.readUserPrompt(), /BUILD DIRECTIVE/);
+});
+
+test('one-shot goals on missing personal data still stop honestly', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const oneShot = 'summarize the cv document and tell me the candidate strengths';
+  orchestrator.workspace.writeUserPrompt(oneShot);
+
+  assert.equal(orchestrator._goalHasBuildIntent(oneShot), false);
+  await assert.rejects(
+    () => orchestrator._preflightCapabilities(oneShot),
+    /needs input only you can provide/
+  );
+});
+
 test('artifact verification flags missing deliverables and phantom README references', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);

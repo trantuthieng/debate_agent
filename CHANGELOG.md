@@ -5,7 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-- **Capability pre-flight gate** (from a real black-box run that failed end-to-end): before building, the orchestrator inspects the goal and (a) auto-enables the safe capabilities it needs — web research and public-repo reading — for that run, and (b) STOPS early with a precise, journaled message when the goal needs input only the boss can provide (a CV/document file, API credentials) instead of spending hours building a placeholder that can never complete. Bilingual (EN/VI) detection; pure and unit-tested.
+- **Capability pre-flight gate** (from real black-box runs): before building, the orchestrator inspects the goal and auto-enables the safe capabilities it needs — web research and public-repo reading — for that run. Bilingual (EN/VI) detection; pure and unit-tested.
+- **Build-time vs runtime inputs**: when the goal is to BUILD a reusable tool/agent (e.g. "create a job-application agent that reads a CV"), a CV/document or API key is treated as the finished product's RUNTIME input, not a build-time blocker. The agent now builds the complete tool to accept those inputs at runtime (CLI arg/config/env), generates sample fixtures (e.g. `examples/sample_resume.txt`) so it can be developed and verified end-to-end, and documents the real-input contract — instead of stopping to demand the real file up front. A genuine one-shot task on missing personal data still stops honestly and asks.
 
 ### Changed
 - **Dependency gating fixed**: when a prerequisite task hard-fails, its dependents are now SKIPPED (and the skip cascades) instead of running on top of missing foundations — which previously produced broken shells (e.g. importing modules a failed task never created).
