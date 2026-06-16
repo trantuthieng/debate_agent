@@ -143,7 +143,7 @@ export class PatchService {
     let offset = 0;
 
     for (const hunk of filePatch.hunks) {
-      const targetIndex = Math.max(0, hunk.oldStart - 1 + offset);
+      let targetIndex = Math.max(0, hunk.oldStart - 1 + offset);
       const oldLines: string[] = [];
       const newLines: string[] = [];
 
@@ -158,9 +158,24 @@ export class PatchService {
         }
       }
 
-      const currentSlice = lines.slice(targetIndex, targetIndex + oldLines.length);
-      if (currentSlice.join('\n') !== oldLines.join('\n')) {
-        throw new Error(`Hunk context mismatch at line ${hunk.oldStart}.`);
+      const expected = oldLines.join('\n');
+      const matchesAt = (idx: number): boolean =>
+        lines.slice(idx, idx + oldLines.length).join('\n') === expected;
+
+      // Local models routinely emit unified diffs whose @@ line numbers have
+      // drifted from the real file (stale context, edits elsewhere). Rather
+      // than fail the whole patch on an off-by-N, locate the context block
+      // anywhere in the file and apply there. Pure insertions (no old lines)
+      // keep the declared position. Only a genuinely absent context throws.
+      if (oldLines.length > 0 && !matchesAt(targetIndex)) {
+        let found = -1;
+        for (let i = 0; i + oldLines.length <= lines.length; i++) {
+          if (matchesAt(i)) { found = i; break; }
+        }
+        if (found === -1) {
+          throw new Error(`Hunk context mismatch at line ${hunk.oldStart}.`);
+        }
+        targetIndex = found;
       }
 
       lines = [

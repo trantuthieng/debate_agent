@@ -3847,22 +3847,55 @@ export class AgentOrchestrator {
       return false;
     }
 
-    const result = this.patchService.hasUnifiedPatch(workerOutput.files)
-      ? this.patchService.applyFileChanges(workerOutput.files)
-      : this.fileManager.applyApprovedChanges(workerOutput.files);
-    if (!result.applied) {
-      this._emit('error', `Failed to apply changes: ${result.error}`);
-      return false;
-    } else {
-      this.workspace.appendMemoryEvent({
-        type: 'patch',
-        phase: this.workspace.readProjectState().currentPhase,
-        summary: `Applied patch ${patchId}.`,
-        data: { patchId, targetFiles, changeCount: workerOutput.files.length },
-      });
-      this._emit('log', `Applied ${workerOutput.files.length} file change(s).`, 'info');
-      return true;
+    // A worker batch routinely mixes full-content CREATE/rewrite files (the
+    // substantive new product code) with one or two unified-diff edits to
+    // existing files (e.g. a README badge). These are INDEPENDENT: a fragile
+    // diff whose context no longer matches must never discard the good new
+    // files. So apply them separately —
+    //   1) full-content writes as one transactional group, and
+    //   2) each unified-diff edit on its own; a diff that still fails after
+    //      fuzzy relocation is skipped with a logged warning, not fatal.
+    const contentFiles = workerOutput.files.filter(f => !(typeof f.patch === 'string' && f.patch.trim()));
+    const patchFiles = workerOutput.files.filter(f => typeof f.patch === 'string' && f.patch.trim());
+
+    let appliedCount = 0;
+    const failures: string[] = [];
+
+    if (contentFiles.length > 0) {
+      const r = this.fileManager.applyApprovedChanges(contentFiles);
+      if (r.applied) {
+        appliedCount += contentFiles.length;
+      } else {
+        failures.push(`content files (${contentFiles.map(f => f.path).join(', ')}): ${r.error}`);
+      }
     }
+
+    for (const pf of patchFiles) {
+      const r = this.patchService.applyFileChanges([pf]);
+      if (r.applied) {
+        appliedCount += 1;
+      } else {
+        failures.push(`${pf.path}: ${r.error}`);
+        this._emit('log', `Skipped fragile diff for "${pf.path}" (${r.error}); continuing with the other changes.`, 'warn');
+        this._journal('warn', `Diff edit skipped: ${pf.path}`,
+          `A unified-diff edit could not be applied (${r.error}) even after fuzzy relocation; it was skipped so the substantive new files still land. The reviewer/fixer can redo this edit with full content if it matters.`);
+      }
+    }
+
+    // The patch is "applied" if anything substantive landed. Only a total
+    // wipe-out (nothing applied at all) is a real failure for the task.
+    if (appliedCount === 0) {
+      this._emit('error', `Failed to apply changes: ${failures.join('; ')}`);
+      return false;
+    }
+    this.workspace.appendMemoryEvent({
+      type: 'patch',
+      phase: this.workspace.readProjectState().currentPhase,
+      summary: `Applied patch ${patchId} (${appliedCount}/${workerOutput.files.length} change(s)).`,
+      data: { patchId, targetFiles, changeCount: appliedCount, skipped: failures },
+    });
+    this._emit('log', `Applied ${appliedCount}/${workerOutput.files.length} file change(s).`, 'info');
+    return true;
   }
 
   private async _tryDeterministicTaskRecovery(

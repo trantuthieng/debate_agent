@@ -164,3 +164,29 @@ test('patch service applies focused unified diff hunks', () => {
   assert.equal(result.applied, true);
   assert.equal(fs.readFileSync(path.join(root, 'src/demo.ts'), 'utf8'), 'const mode = "new";\n');
 });
+
+test('patch service fuzzily relocates a hunk whose @@ line number has drifted', () => {
+  const root = makeTempWorkspace();
+  // The real black-box failure: the model's diff targeted line 10, but the
+  // matching context actually lives further down. Exact-line matching threw
+  // "Hunk context mismatch at line 10" and killed the whole task. Fuzzy
+  // relocation must find the context block and apply there.
+  fs.writeFileSync(
+    path.join(root, 'README.md'),
+    ['line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'BADGE_ANCHOR', 'after'].join('\n') + '\n'
+  );
+  const patch = [
+    '--- a/README.md',
+    '+++ b/README.md',
+    '@@ -10,1 +10,2 @@', // wrong line number; context is actually at line 6
+    ' BADGE_ANCHOR',
+    '+NEW_BADGE',
+  ].join('\n');
+
+  const result = new PatchService(root).applyFileChanges([
+    { path: 'README.md', action: 'modify', patch },
+  ]);
+
+  assert.equal(result.applied, true, 'a drifted-but-present context must still apply');
+  assert.match(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), /BADGE_ANCHOR\nNEW_BADGE/);
+});

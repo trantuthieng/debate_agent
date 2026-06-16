@@ -873,6 +873,43 @@ test('review normalization coerces non-string arrays so the fix loop never crash
   assert.ok(merged.issues.every(x => typeof x === 'string'));
 });
 
+test('a fragile diff edit does not discard the good new files in the same batch', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  // The real black-box batch: 5 substantive CREATE files + one MODIFY README
+  // diff whose context no longer matches. The whole task previously failed and
+  // git stayed clean. Now the CREATE files must land; the bad diff is skipped.
+  fs.writeFileSync(path.join(root, 'README.md'), '# Existing readme\n\nNothing here matches.\n');
+  const workerOutput = {
+    files: [
+      { path: 'main.py', action: 'create', content: 'print("hello")\n' },
+      { path: 'requirements.txt', action: 'create', content: 'requests==2.31.0\n' },
+      {
+        path: 'README.md',
+        action: 'modify',
+        patch: '--- a/README.md\n+++ b/README.md\n@@ -10,1 +10,2 @@\n CONTEXT_THAT_DOES_NOT_EXIST\n+new line',
+      },
+    ],
+    reasoning: 'scaffold',
+  };
+
+  // The worker read README before editing it (real runs always do), so attach
+  // a baseline; otherwise the "modified a file it never read" guard fires first.
+  orchestrator._attachChangeBaseline(
+    workerOutput,
+    orchestrator._captureFileBaselines(['README.md'], 'task-001-test', 'codeWorker')
+  );
+
+  const state = orchestrator.workspace.readProjectState();
+  const applied = await orchestrator._applyCodeChanges('task-001-test', workerOutput, state);
+
+  assert.equal(applied, true, 'batch must succeed because the substantive files landed');
+  assert.equal(fs.readFileSync(path.join(root, 'main.py'), 'utf8'), 'print("hello")\n');
+  assert.equal(fs.readFileSync(path.join(root, 'requirements.txt'), 'utf8'), 'requests==2.31.0\n');
+  // The unmatchable README diff was skipped, leaving the file untouched.
+  assert.match(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), /Nothing here matches/);
+});
+
 test('capability assessment detects web, file, and credential needs (EN + VI)', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);
