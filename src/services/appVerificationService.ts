@@ -35,13 +35,18 @@ export class AppVerificationService {
     }
 
     const previewCommand = this._previewCommand(packageJson.scripts);
-    if (!previewCommand || !cfg.startServer) {
-      return this._result(checks, smokeUrls, warnings, false, 'No start/dev/preview script available for smoke verification.');
+    if (!cfg.startServer) {
+      return this._result(checks, smokeUrls, warnings, false, 'App smoke server startup disabled.');
+    }
+
+    const staticCommand = this._staticServerCommand();
+    if (!previewCommand && !staticCommand) {
+      return this._result(checks, smokeUrls, warnings, false, 'No start/dev/preview script or static index.html available for smoke verification.');
     }
 
     let sessionId: string | null = null;
     try {
-      sessionId = this.sessions.start(previewCommand);
+      sessionId = this.sessions.start(previewCommand ?? staticCommand!);
       await this._delay(4_000);
       const logs = this.sessions.read(sessionId);
       const url = this._extractLocalUrl(logs) ?? 'http://127.0.0.1:5173';
@@ -50,6 +55,16 @@ export class AppVerificationService {
       if (cfg.httpSmokeTest) {
         const check = await this._httpGet(url);
         checks.push(check);
+
+        if (!check.success && previewCommand && staticCommand && this._isProbablyStaticInstructionScript(previewCommand, logs)) {
+          this.sessions.stop(sessionId);
+          sessionId = this.sessions.start(staticCommand);
+          await this._delay(1_000);
+          const fallbackUrl = 'http://127.0.0.1:5173';
+          smokeUrls.push(fallbackUrl);
+          warnings.push(`Preview script did not appear to start a server; retried with static server: ${staticCommand}`);
+          checks.push(await this._httpGet(fallbackUrl));
+        }
       }
     } catch (err) {
       warnings.push(`Smoke verification failed to start: ${err instanceof Error ? err.message : String(err)}`);
@@ -76,6 +91,18 @@ export class AppVerificationService {
     return null;
   }
 
+  private _staticServerCommand(): string | null {
+    return fs.existsSync(path.join(this.workspaceRoot, 'index.html'))
+      ? 'python3 -m http.server 5173'
+      : null;
+  }
+
+  private _isProbablyStaticInstructionScript(command: string, logs: string): boolean {
+    return command === 'npm start'
+      && /open\s+index\.html|no\s+build\s+step|browser\s+to\s+play/i.test(logs)
+      && !this._extractLocalUrl(logs);
+  }
+
   private _readPackageJson(): { scripts?: Record<string, string> } | null {
     const packageJsonPath = path.join(this.workspaceRoot, 'package.json');
     if (!fs.existsSync(packageJsonPath)) { return null; }
@@ -99,7 +126,7 @@ export class AppVerificationService {
         res.on('data', chunk => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))));
         res.on('end', () => {
           const body = Buffer.concat(chunks).toString('utf8').slice(0, 2000);
-          const success = Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 500);
+          const success = Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 400);
           resolve({
             command: `HTTP GET ${url}`,
             exitCode: success ? 0 : 1,

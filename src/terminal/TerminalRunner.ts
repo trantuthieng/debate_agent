@@ -2,67 +2,9 @@ import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { CommandPolicyConfig, TerminalRunResult } from '../types';
-import { CommandPolicy } from './CommandPolicy';
+import { CommandPolicy, type CommandPolicyDecision } from './CommandPolicy';
 import { DangerousCommandError, UserAbortError } from '../utils/errors';
 import { logInfo, logWarn, logError } from '../utils/logging';
-
-// -----------------------------------------------------------------------
-// Dangerous command patterns – always require user approval
-// -----------------------------------------------------------------------
-const DANGEROUS_PATTERNS: RegExp[] = [
-  /\brm\s+-[rRf]/i,
-  /\bdel\s+\/[sS]/i,
-  /\bformat\b/i,
-  /\bshutdown\b/i,
-  /\breboot\b/i,
-  /\bgit\s+reset\s+--hard/i,
-  /\bgit\s+clean\s+-[fFdD]/i,
-  /\bgit\s+push/i,
-  /\bcurl[^|]*\|\s*(bash|sh|zsh)/i,
-  /\bwget[^|]*\|\s*(bash|sh|zsh)/i,
-  /\bsudo\b/i,
-  /\bchmod\s+-R\s+777/i,
-  /\bDROP\s+DATABASE/i,
-  /\bDROP\s+TABLE/i,
-  /\btruncate\s+table/i,
-  /\b(npm|pnpm|yarn)\s+publish\b/i,
-  /\bnpx\s+.*--yes\b.*install/i,
-];
-
-// -----------------------------------------------------------------------
-// Safe-listed command prefixes (no approval needed)
-// -----------------------------------------------------------------------
-const SAFE_PREFIXES: string[] = [
-  'npm install',
-  'npm run compile',
-  'npm run build',
-  'npm test',
-  'npm run test',
-  'npm run lint',
-  'pnpm install',
-  'pnpm run compile',
-  'pnpm run build',
-  'pnpm test',
-  'pnpm run test',
-  'yarn install',
-  'yarn test',
-  'yarn build',
-  'node ',
-  'python ',
-  'python3 ',
-  'pip install',
-  'pip3 install',
-  'go build',
-  'go test',
-  'cargo build',
-  'cargo test',
-  'mvn compile',
-  'mvn test',
-  'gradle build',
-  'gradle test',
-  'dotnet build',
-  'dotnet test',
-];
 
 export class TerminalRunner {
   private readonly workspaceRoot: string;
@@ -93,6 +35,15 @@ export class TerminalRunner {
    */
   isSafe(command: string): boolean {
     return this.commandPolicy.isSafe(command);
+  }
+
+  /**
+   * Classify a command (safe / needs_approval / blocked) against the policy,
+   * taking the workspace root into account for external-write detection. Lets
+   * callers route risky commands through an approval prompt instead of failing.
+   */
+  evaluateCommand(command: string): CommandPolicyDecision {
+    return this.commandPolicy.evaluate(command, this.workspaceRoot);
   }
 
   /**

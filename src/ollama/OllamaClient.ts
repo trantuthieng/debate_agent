@@ -13,18 +13,29 @@ import { logInfo, logWarn, logError } from '../utils/logging';
 
 // Default request timeout in milliseconds
 const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
+// How long a text-model stays warm in VRAM after a call. Kept modest because
+// consecutive debate phases usually switch models, so a long keep-alive just
+// pins idle weights and risks OOM on constrained hardware (e.g. 24 GB Macs).
+const DEFAULT_TEXT_KEEP_ALIVE_SECONDS = 30;
 
 export class OllamaClient {
   private readonly baseUrl: string;
   private readonly requestTimeoutMs: number;
+  private readonly textKeepAliveSeconds: number;
   private logFilePath: string | null = null;
   private readonly activeControllers = new Set<AbortController>();
   private cancellationRequested = false;
 
-  constructor(baseUrl: string, logFilePath?: string, requestTimeoutMs: number = DEFAULT_TIMEOUT_MS) {
+  constructor(
+    baseUrl: string,
+    logFilePath?: string,
+    requestTimeoutMs: number = DEFAULT_TIMEOUT_MS,
+    textKeepAliveSeconds: number = DEFAULT_TEXT_KEEP_ALIVE_SECONDS
+  ) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.logFilePath = logFilePath ?? null;
     this.requestTimeoutMs = Math.max(30_000, requestTimeoutMs);
+    this.textKeepAliveSeconds = Math.max(0, textKeepAliveSeconds);
   }
 
   setLogFilePath(filePath: string): void {
@@ -56,7 +67,6 @@ export class OllamaClient {
     let success = false;
     let errorMsg: string | undefined;
     let content = '';
-    let aborted = false;
 
     try {
       const response = await this._sendChatRequest(model, messages, false, options);
@@ -65,7 +75,6 @@ export class OllamaClient {
       return content;
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
-      aborted = err instanceof UserAbortError;
       throw err;
     } finally {
       const duration = Date.now() - startTime;
@@ -100,7 +109,6 @@ export class OllamaClient {
     const startTime = Date.now();
     let success = false;
     let errorMsg: string | undefined;
-    let aborted = false;
 
     try {
       const response = await this._sendChatRequest(model, messages, true, options);
@@ -111,7 +119,6 @@ export class OllamaClient {
       return parsed;
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
-      aborted = err instanceof UserAbortError;
       throw err;
     } finally {
       const duration = Date.now() - startTime;
@@ -301,10 +308,10 @@ export class OllamaClient {
       throw new ModelNotFoundError(model);
     }
 
-    // Keep the model warm in VRAM for 60 s when it is expected to be called
-    // again soon (all non-JSON text calls, e.g. brainstorm → critic → brief).
-    // JSON calls unload immediately because they are typically one-shot per task.
-    const keepAliveSeconds = jsonFormat ? 0 : 60;
+    // Keep the model warm in VRAM for a short window when it is likely to be
+    // called again soon (non-JSON text calls). JSON calls unload immediately
+    // because they are typically one-shot per task.
+    const keepAliveSeconds = jsonFormat ? 0 : this.textKeepAliveSeconds;
     const body: OllamaChatRequest = {
       model,
       messages,

@@ -83,6 +83,18 @@ export class MaxRetriesExceededError extends Error {
   }
 }
 
+/**
+ * Raised by the capability pre-flight when a goal needs input only the boss can
+ * provide (a file like a CV, or API credentials) and the run cannot proceed
+ * without it. Stopping early beats building a placeholder that cannot finish.
+ */
+export class MissingCapabilityError extends Error {
+  constructor(message: string, public readonly missing: string[] = []) {
+    super(message);
+    this.name = 'MissingCapabilityError';
+  }
+}
+
 export function isUserAbort(err: unknown): boolean {
   return err instanceof UserAbortError;
 }

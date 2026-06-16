@@ -88,6 +88,92 @@ export class PanelProvider implements vscode.WebviewViewProvider {
     await this._resumeWorkflow();
   }
 
+  /**
+   * "Agent that creates agents": ask for a single goal, then let a meta-agent
+   * design a bespoke specialist team and run them through a debate to a verdict.
+   */
+  async designAgentTeam(): Promise<void> {
+    const goal = await vscode.window.showInputBox({
+      prompt: 'Describe the goal — a meta-agent will design a specialist team and debate it',
+      placeHolder: 'Research and plan a relaxing-music YouTube channel...',
+      ignoreFocusOut: true,
+    });
+    if (!goal) { return; }
+
+    const root = this._getWorkspaceRoot();
+    if (!root) {
+      vscode.window.showErrorMessage('No workspace folder open. Please open a folder first.');
+      return;
+    }
+
+    this._orchestrator = this._createOrchestrator(root);
+
+    const { OllamaClient } = await import('../ollama/OllamaClient');
+    const { AgentWorkspace } = await import('../workspace/AgentWorkspace');
+    const ws = new AgentWorkspace(root);
+    await ws.initialize();
+    const config = ws.readModelConfig();
+    const client = new OllamaClient(config.ollamaBaseUrl, undefined, config.requestTimeoutMs);
+    if (!(await client.checkConnection())) {
+      vscode.window.showErrorMessage(`Cannot connect to Ollama at ${config.ollamaBaseUrl}. Please start Ollama and try again.`);
+      return;
+    }
+
+    this._post({ type: 'appendLog', log: 'Meta-agent designing a specialist team...', level: 'info' });
+    this._orchestrator.designAndRunTeam(goal)
+      .then(decision => {
+        const winner = decision.ranked.find(r => r.agentId === decision.winningAgentId);
+        this._post({ type: 'appendLog', log: `Team verdict: ${decision.winningAgentId} (${decision.weightedScore}/10).`, level: 'info' });
+        vscode.window.showInformationMessage(
+          `Dynamic team converged (${decision.agreement} agreement, ${decision.weightedScore}/10). Winner: ${winner?.agentId ?? decision.winningAgentId}. See agents/dynamic_team_debate.md.`
+        );
+      })
+      .catch(err => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this._post({ type: 'error', message: msg });
+        vscode.window.showErrorMessage(`Dynamic team failed: ${msg}`);
+      });
+  }
+
+  /**
+   * The full "one command → finished product" loop: a meta-agent designs and
+   * debates a specialist team, then the proven build pipeline implements the
+   * winning direction into a verified product.
+   */
+  async runAutonomousGoal(): Promise<void> {
+    const goal = await vscode.window.showInputBox({
+      prompt: 'Describe the goal — agents will self-organize, debate, and build it end-to-end',
+      placeHolder: 'Build a CLI tool that summarizes Markdown files...',
+      ignoreFocusOut: true,
+    });
+    if (!goal) { return; }
+
+    const root = this._getWorkspaceRoot();
+    if (!root) {
+      vscode.window.showErrorMessage('No workspace folder open. Please open a folder first.');
+      return;
+    }
+
+    this._orchestrator = this._createOrchestrator(root);
+
+    const { OllamaClient } = await import('../ollama/OllamaClient');
+    const { AgentWorkspace } = await import('../workspace/AgentWorkspace');
+    const ws = new AgentWorkspace(root);
+    await ws.initialize();
+    const config = ws.readModelConfig();
+    const client = new OllamaClient(config.ollamaBaseUrl, undefined, config.requestTimeoutMs);
+    if (!(await client.checkConnection())) {
+      vscode.window.showErrorMessage(`Cannot connect to Ollama at ${config.ollamaBaseUrl}. Please start Ollama and try again.`);
+      return;
+    }
+
+    this._post({ type: 'appendLog', log: 'Autonomous goal: meta-agent staffing a team, then building...', level: 'info' });
+    this._orchestrator.runAutonomousGoal(goal).catch(err => {
+      const msg = err instanceof Error ? err.message : String(err);
+      this._post({ type: 'error', message: msg });
+    });
+  }
+
   stopWorkflow(): void {
     this._orchestrator?.stop();
     this._post({ type: 'info', message: 'Stop requested.' });

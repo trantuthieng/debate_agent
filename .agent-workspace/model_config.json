@@ -5,7 +5,7 @@
   "autonomousMode": true,
   "askPolicy": "never",
   "debateRounds": 3,
-  "maxFixRetries": 5,
+  "maxFixRetries": 8,
   "autoInstallDependencies": true,
   "artifactDir": "dist",
   "createFinalArchive": true,
@@ -16,6 +16,40 @@
     "retryDelayMs": 5000,
     "alternateModelLimit": 3,
     "compactContextChars": 12000
+  },
+  "commandPolicy": {
+    "approvedPrefixes": [],
+    "requireApprovalForNetwork": true,
+    "requireApprovalForExternalWrites": true,
+    "allowLongRunningSessions": true
+  },
+  "webSearch": {
+    "enabled": false,
+    "maxResults": 5,
+    "officialDocsOnly": false,
+    "allowedDomains": []
+  },
+  "appVerification": {
+    "enabled": true,
+    "startServer": true,
+    "httpSmokeTest": true,
+    "browserSmokeTest": false
+  },
+  "githubIntegration": {
+    "enabled": true,
+    "preferGhCli": true,
+    "allowExternalRepoReads": false
+  },
+  "skills": {
+    "enabled": true,
+    "skillDirs": [
+      ".agent-workspace/skills",
+      "skills"
+    ]
+  },
+  "toolCalling": {
+    "enabled": true,
+    "maxToolRounds": 6
   },
   "defaultOptions": {
     "temperature": 0.1,
@@ -44,12 +78,12 @@
       "fallbackModel": "qwen3-coder:30b"
     },
     "taskManager": {
-      "model": "devstral-small-2",
-      "fallbackModel": "qwen2.5-coder:14b-instruct"
+      "model": "qwen2.5-coder:14b-instruct",
+      "fallbackModel": "qwen3-coder:30b"
     },
     "codeWorker": {
-      "model": "devstral-small-2",
-      "fallbackModel": "qwen2.5-coder:14b-instruct"
+      "model": "qwen2.5-coder:14b-instruct",
+      "fallbackModel": "qwen3-coder:30b"
     },
     "reviewer": {
       "model": "deepseek-coder-v2:16b",
@@ -60,8 +94,8 @@
       "fallbackModel": "qwen2.5-coder:14b-instruct"
     },
     "fixer": {
-      "model": "devstral-small-2",
-      "fallbackModel": "qwen2.5-coder:14b-instruct"
+      "model": "qwen2.5-coder:14b-instruct",
+      "fallbackModel": "qwen3-coder:30b"
     },
     "finalIntegrator": {
       "model": "devstral-small-2",

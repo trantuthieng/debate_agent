@@ -381,6 +381,11 @@ test('testing uses xcode project verification when no package scripts exist', as
       needsFix: false,
     },
   });
+  orchestrator.workspace.writeFile(orchestrator.workspace.toolchainReportPath, JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    platform: process.platform,
+    checks: [{ name: 'xcodebuild', command: 'xcodebuild -version', available: true }],
+  }));
 
   await orchestrator._phaseTesting(makeState());
 
@@ -755,6 +760,261 @@ test('improvement consensus stops only when all brainstorm agents agree no work 
 
   assert.equal(orchestrator._consensusReadyToStop(stopConsensus), true);
   assert.equal(orchestrator._consensusReadyToStop(continueConsensus), false);
+});
+
+test('debate scoring aggregates the panel and selects the highest-scored direction', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const panel = [
+    { agentRole: 'brainstorm', scores: { feasibility: 8, completeness: 8, risk: 8, ux: 8, quality: 8 }, overall: 8, recommendation: 'Direction A', topRisk: 'r' },
+    { agentRole: 'critic', scores: { feasibility: 9, completeness: 9, risk: 9, ux: 9, quality: 9 }, overall: 9, recommendation: 'Direction B (best)', topRisk: 'r' },
+    { agentRole: 'secondBrainstorm', scores: { feasibility: 7, completeness: 7, risk: 7, ux: 7, quality: 7 }, overall: 7, recommendation: 'Direction C', topRisk: 'r' },
+    { agentRole: 'architect', scores: { feasibility: 8, completeness: 8, risk: 8, ux: 8, quality: 8 }, overall: 8, recommendation: 'Direction D', topRisk: 'r' },
+    { agentRole: 'reviewer', scores: { feasibility: 8, completeness: 8, risk: 8, ux: 8, quality: 8 }, overall: 8, recommendation: 'Direction E', topRisk: 'r' },
+  ];
+
+  const decision = orchestrator._aggregateDebateScores(panel);
+
+  assert.equal(decision.judgeCount, 5);
+  assert.equal(decision.winningDirection, 'Direction B (best)');
+  assert.equal(decision.weightedScore, 8); // mean of 8,9,7,8,8
+  assert.equal(decision.agreement, 'high'); // tight spread
+  assert.equal(decision.rankedRecommendations[0].agentRole, 'critic');
+});
+
+test('debate scoring reports low agreement when the panel disagrees and handles an empty panel', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const split = [
+    { agentRole: 'brainstorm', scores: { feasibility: 1, completeness: 1, risk: 1, ux: 1, quality: 1 }, overall: 1, recommendation: 'Low' },
+    { agentRole: 'critic', scores: { feasibility: 10, completeness: 10, risk: 10, ux: 10, quality: 10 }, overall: 10, recommendation: 'High (winner)' },
+  ];
+  const decision = orchestrator._aggregateDebateScores(split);
+  assert.equal(decision.agreement, 'low');
+  assert.equal(decision.winningDirection, 'High (winner)');
+
+  const empty = orchestrator._aggregateDebateScores([]);
+  assert.equal(empty.judgeCount, 0);
+  assert.equal(empty.weightedScore, 0);
+});
+
+test('debate score normalization clamps out-of-range values and derives a missing overall', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const normalized = orchestrator._normalizeDebateScore('architect', {
+    scores: { feasibility: 99, completeness: -4, risk: 'bad', ux: 6, quality: 6 },
+  });
+  assert.equal(normalized.scores.feasibility, 10);
+  assert.equal(normalized.scores.completeness, 0);
+  assert.equal(normalized.scores.risk, 5); // non-numeric falls back to 5
+  // overall derived from mean of (10,0,5,6,6) = 5.4
+  assert.equal(normalized.overall, 5.4);
+  assert.equal(normalized.agentRole, 'architect');
+});
+
+test('debate panel guard guarantees five distinct judge models even when roles share one', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  // Force a collision: critic and reviewer share the same primary model.
+  orchestrator.modelConfig.agents.reviewer.model = 'critic';
+  orchestrator.modelConfig.agents.reviewer.fallbackModel = 'critic';
+
+  const panelRoles = ['brainstorm', 'critic', 'secondBrainstorm', 'architect', 'reviewer'];
+  const { assignments, distinctCount } = orchestrator._assignDiversePanelModels(panelRoles);
+
+  const models = panelRoles.map(r => assignments.get(r).model);
+  assert.equal(distinctCount, 5, `expected 5 distinct models, got ${models.join(', ')}`);
+  assert.equal(new Set(models).size, 5);
+  // The colliding reviewer judge borrowed a different, still-unused model.
+  assert.notEqual(assignments.get('reviewer').model, assignments.get('critic').model);
+});
+
+test('issue signature normalizes numbers so recurring failures are detected as no-progress', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  const a = orchestrator._issueSignature({ issues: ['Failed at line 12'], securityConcerns: [] });
+  const b = orchestrator._issueSignature({ issues: ['Failed at line 99'], securityConcerns: [] });
+  const c = orchestrator._issueSignature({ issues: ['A totally different problem'], securityConcerns: [] });
+
+  assert.equal(a, b, 'same issue with different line numbers must share a signature');
+  assert.notEqual(a, c, 'different issues must have different signatures');
+});
+
+test('review normalization coerces non-string arrays so the fix loop never crashes on bad model output', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  // Reproduce the real black-box crash: a local model returned `uncertainties`
+  // (and other fields) as arrays of OBJECTS, not strings. Before the fix this
+  // killed the entire 65-minute run with "s.trim is not a function".
+  const review = {
+    issues: [{ detail: 'logic bug' }, 'a string issue'],
+    securityConcerns: [{ kind: 'injection' }],
+    suggestions: [{ note: 'rename x' }],
+    fixSuggestions: [{ step: 'do y' }],
+    uncertainties: [{ q: 'is the API stable?' }, 42],
+    approved: false,
+  };
+  // Must not throw, and every array must become strings.
+  orchestrator._normalizeReviewResult({ id: 'task-001' }, review);
+  for (const field of ['issues', 'securityConcerns', 'suggestions', 'fixSuggestions', 'uncertainties']) {
+    assert.ok(review[field].every(x => typeof x === 'string'), `${field} must be all strings`);
+  }
+  // _issueSignature and _mergeReviewWithAudit must survive raw, un-normalized objects too.
+  assert.doesNotThrow(() =>
+    orchestrator._issueSignature({ issues: [{ x: 1 }], securityConcerns: [{ y: 2 }] }));
+  const merged = orchestrator._mergeReviewWithAudit(
+    { id: 'task-001' },
+    review,
+    { issues: [{ bad: 1 }], suggestions: [{ bad: 2 }], securityConcerns: [{ bad: 3 }], fixSuggestions: [{ bad: 4 }], uncertainties: [{ bad: 5 }] }
+  );
+  assert.ok(merged.uncertainties.every(x => typeof x === 'string'));
+  assert.ok(merged.issues.every(x => typeof x === 'string'));
+});
+
+test('a fragile diff edit does not discard the good new files in the same batch', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  // The real black-box batch: 5 substantive CREATE files + one MODIFY README
+  // diff whose context no longer matches. The whole task previously failed and
+  // git stayed clean. Now the CREATE files must land; the bad diff is skipped.
+  fs.writeFileSync(path.join(root, 'README.md'), '# Existing readme\n\nNothing here matches.\n');
+  const workerOutput = {
+    files: [
+      { path: 'main.py', action: 'create', content: 'print("hello")\n' },
+      { path: 'requirements.txt', action: 'create', content: 'requests==2.31.0\n' },
+      {
+        path: 'README.md',
+        action: 'modify',
+        patch: '--- a/README.md\n+++ b/README.md\n@@ -10,1 +10,2 @@\n CONTEXT_THAT_DOES_NOT_EXIST\n+new line',
+      },
+    ],
+    reasoning: 'scaffold',
+  };
+
+  // The worker read README before editing it (real runs always do), so attach
+  // a baseline; otherwise the "modified a file it never read" guard fires first.
+  orchestrator._attachChangeBaseline(
+    workerOutput,
+    orchestrator._captureFileBaselines(['README.md'], 'task-001-test', 'codeWorker')
+  );
+
+  const state = orchestrator.workspace.readProjectState();
+  const applied = await orchestrator._applyCodeChanges('task-001-test', workerOutput, state);
+
+  assert.equal(applied, true, 'batch must succeed because the substantive files landed');
+  assert.equal(fs.readFileSync(path.join(root, 'main.py'), 'utf8'), 'print("hello")\n');
+  assert.equal(fs.readFileSync(path.join(root, 'requirements.txt'), 'utf8'), 'requests==2.31.0\n');
+  // The unmatchable README diff was skipped, leaving the file untouched.
+  assert.match(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), /Nothing here matches/);
+});
+
+test('capability assessment detects web, file, and credential needs (EN + VI)', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  // The exact failing prompt from the black-box run.
+  const job = orchestrator._assessGoalCapabilities(
+    'tạo 1 agent xin việc. đọc cv người dùng và quét toàn bộ các trang web để chọn các công việc phù hợp với cv nhất và đường link để apply'
+  );
+  assert.equal(job.needsWeb, true, 'should detect web scanning need');
+  assert.ok(job.needsUserFiles.length > 0, 'should detect the CV file need');
+
+  const creds = orchestrator._assessGoalCapabilities('upload videos using the YouTube API key');
+  assert.ok(creds.needsCredentials.length > 0);
+
+  const plain = orchestrator._assessGoalCapabilities('build a calculator that adds two numbers');
+  assert.equal(plain.needsWeb, false);
+  assert.equal(plain.needsUserFiles.length, 0);
+  assert.equal(plain.needsCredentials.length, 0);
+});
+
+test('build-intent goals defer runtime inputs (build the tool) instead of blocking', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const jobPrompt = 'tạo 1 agent xin việc. đọc cv người dùng và quét toàn bộ các trang web để chọn công việc phù hợp và đường link apply';
+  orchestrator.workspace.writeUserPrompt(jobPrompt);
+
+  // Must NOT throw — the CV is a runtime input, not a build-time blocker.
+  await orchestrator._preflightCapabilities(jobPrompt);
+
+  assert.equal(orchestrator._goalHasBuildIntent(jobPrompt), true);
+  // Web research was auto-enabled for the run.
+  assert.equal(orchestrator.modelConfig.webSearch.enabled, true);
+  // A sample CV fixture was created so the tool can be developed/tested.
+  assert.ok(orchestrator.fileManager.fileExists('examples/sample_resume.txt'));
+  // The build directive was injected into the prompt for the brief/architect.
+  assert.match(orchestrator.workspace.readUserPrompt(), /BUILD DIRECTIVE/);
+});
+
+test('one-shot goals on missing personal data still stop honestly', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const oneShot = 'summarize the cv document and tell me the candidate strengths';
+  orchestrator.workspace.writeUserPrompt(oneShot);
+
+  assert.equal(orchestrator._goalHasBuildIntent(oneShot), false);
+  await assert.rejects(
+    () => orchestrator._preflightCapabilities(oneShot),
+    /needs input only you can provide/
+  );
+});
+
+test('artifact verification flags missing deliverables and phantom README references', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  const existing = ['src/index.js', 'package.json', 'README.md'];
+  const readme = 'Run `npm install`. See `src/index.js` and the `tests/` folder and `app/server.py`.';
+  const result = orchestrator._verifyArtifactsAgainstClaims(readme, ['src/index.js', 'dist/bundle.js'], existing);
+
+  // dist/bundle.js was promised but not built.
+  assert.ok(result.missingDeliverables.includes('dist/bundle.js'));
+  assert.ok(!result.missingDeliverables.includes('src/index.js'));
+  // README mentions tests/ and app/server.py which do not exist; `npm install` is not a path.
+  assert.ok(result.phantomReferences.includes('tests'));
+  assert.ok(result.phantomReferences.includes('app/server.py'));
+  assert.ok(!result.phantomReferences.some(r => r.includes('npm')));
+});
+
+test('autonomous goal seeds the build pipeline with the dynamic team verdict and skips the fixed debate', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  const plan = {
+    goal: 'Build a thing',
+    rationale: 'team rationale',
+    agents: [
+      { id: 'builder', name: 'Builder', specialty: 'build', mission: 'm', systemPrompt: 'p', model: 'm1', fallbackModel: 'm2', tools: [], temperature: 0.4 },
+    ],
+    generatedAt: new Date().toISOString(),
+  };
+  const decision = {
+    goal: 'Build a thing',
+    winningAgentId: 'builder',
+    winningProposal: 'Implement the thing with approach X.',
+    weightedScore: 8.5,
+    agreement: 'high',
+    ranked: [{ agentId: 'builder', proposal: 'Implement the thing with approach X.', score: 8.5 }],
+    rationale: 'highest mean score',
+    generatedAt: new Date().toISOString(),
+  };
+
+  orchestrator._seedBuildFromTeam(plan, decision, '# Debate transcript\n...');
+
+  // The winning direction is written where the briefing phase reads it as authoritative.
+  const decisionDoc = orchestrator.workspace.readFile(orchestrator._debateDecisionPath);
+  assert.match(decisionDoc, /Implement the thing with approach X\./);
+  assert.match(decisionDoc, /autonomous agent team/i);
+  // The transcript becomes brainstorm context for the brief builder.
+  assert.match(orchestrator.workspace.readFile(orchestrator.workspace.brainstormPath), /Debate transcript/);
+
+  // With the dynamic team having debated, the fixed 4-round debate is skipped.
+  orchestrator._skipFixedDebate = true;
+  const route = orchestrator._selectWorkflowRoute(makeState());
+  assert.equal(route.skipDebate, true);
+  assert.equal(route.kind, 'full_project');
 });
 
 test('fallback improvement consensus requires more than one clean sprint before stopping', async () => {

@@ -2,6 +2,60 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Capability pre-flight gate** (from real black-box runs): before building, the orchestrator inspects the goal and auto-enables the safe capabilities it needs — web research and public-repo reading — for that run. Bilingual (EN/VI) detection; pure and unit-tested.
+- **Build-time vs runtime inputs**: when the goal is to BUILD a reusable tool/agent (e.g. "create a job-application agent that reads a CV"), a CV/document or API key is treated as the finished product's RUNTIME input, not a build-time blocker. The agent now builds the complete tool to accept those inputs at runtime (CLI arg/config/env), generates sample fixtures (e.g. `examples/sample_resume.txt`) so it can be developed and verified end-to-end, and documents the real-input contract — instead of stopping to demand the real file up front. A genuine one-shot task on missing personal data still stops honestly and asks.
+
+### Fixed
+- **A fragile diff no longer throws away the whole task's work** (from a real black-box run that produced 5 good new files + one README diff, then delivered *nothing* — git stayed clean — because the README hunk's context had drifted): three compounding bugs in the apply layer were fixed. (1) A mixed batch (full-content CREATE files + a unified-diff edit) was routed entirely through the diff applier, which **silently dropped every full-content file** — so the substantive new code was never written even when the diff succeeded. Content writes and diff edits are now applied via their correct paths. (2) Each unified-diff edit is now applied independently; one that still fails is **skipped with a logged warning** instead of discarding the good new files alongside it. (3) The hunk matcher now **fuzzily relocates** a hunk whose `@@` line numbers have drifted (the common local-model failure) by locating its context block anywhere in the file, instead of failing on an off-by-N. Regression-tested at both the patch-service and orchestrator levels.
+- **One bad model response no longer kills the whole run** (from a real 65-min black-box run that crashed right after fixing task 1 with `s.trim is not a function`): the review-result normalizer now also coerces `uncertainties` to strings (it was the one array left un-normalized), and the review merge/signature helpers coerce defensively — so a local model emitting an array of objects instead of strings can't throw. Beyond that one field, each task is now processed inside a guard: any *unexpected* error degrades that single task to "failed" (its dependents cascade-skip) and the autonomous run continues to deliver the verified subset, instead of aborting the entire multi-hour build. Control-flow signals (pause-for-user, abort) still propagate.
+
+### Changed
+- **Dependency gating fixed**: when a prerequisite task hard-fails, its dependents are now SKIPPED (and the skip cascades) instead of running on top of missing foundations — which previously produced broken shells (e.g. importing modules a failed task never created).
+- **Self-heal escalation**: the fixer now detects when the same issues recur across attempts and stops retrying early (no more spinning to the retry limit with no strategy change).
+- **Build viability gate**: if the coding phase completes 0 tasks (all failed/skipped), the run stops honestly instead of delivering a final report over an empty/broken project; partial builds are flagged.
+- **Artifact verification**: the final report is now grounded against reality — missing declared deliverables and README references to files that do not exist are detected, journaled, and surfaced so the report can be honest about gaps. Pure and unit-tested.
+- **Scope discipline**: the brief-builder and architect prompts now forbid unrequested features (no auth/DB/UI/scheduling/"future-proofing" unless the goal asks), since over-scoping was the top failure mode observed.
+
+### Added (continued)
+- **Agent-that-creates-agents (dynamic agent spawning)**: a new meta-agent layer that, from a single boss goal, designs a bespoke team of specialist agents and runs them through the debate protocol — domain-agnostic, no hardcoded use case.
+  - `AgentFactory` (the meta-agent) reads the goal and emits a validated roster of `AgentSpec`s — each with its own name, specialty, tailored system prompt, bound model and granted tools. It guarantees ≥5 distinct-model agents, filters tools to the real registry, de-duplicates ids, and falls back to a deterministic generic team (research → strategy → architecture → build → critique → integrate) if the designer model is unavailable.
+  - `DynamicAgent` executes one spec with a bounded tool loop (it may only call the tools it was granted).
+  - `DynamicTeam` runs the spawned agents through propose → cross-critique → refine → score & vote, producing a ranked decision plus a full markdown transcript persisted to the workspace.
+  - New command **“Design Agent Team (Agent-Creates-Agents)”** and orchestrator entry `designAndRunTeam(goal)`; the whole run is journaled (🧬 spawn, 👥 team) into `AGENT_JOURNAL.md`.
+  - **Closed the “one command → finished product” loop**: `runAutonomousGoal(goal)` (command **“Autonomous Goal (Design → Debate → Build)”**) lets the spawned team debate the approach, seeds the winning direction into the build pipeline as the authoritative brief, then runs the proven sprint workflow (architect → task plan → code → review → quality audit → test → fix → deliver) to produce a verified product. The dynamic team replaces the fixed 4-round debate so it never runs twice.
+  - Unit tests for spec normalization/diversity/fallback/top-up, team score aggregation, and the dynamic-agent tool loop (including the security property that ungranted tools never run).
+
+- **Guaranteed multi-model debate panel**: a runtime guard now assigns a *distinct* local model to each of the five round-4 judges even when two roles share a primary model in config (e.g. critic and reviewer). Each judge keeps its role lens but borrows a still-unused model from the roster; if the roster is too small to reach five, the shortfall is logged, journaled, and recorded as an assumption instead of silently passing.
+- **On-demand research capability** (`ResearchService`): agents can call `web_search` (cited, freshness-stamped findings) and — when enabled — `find_code_examples` / `read_repo_file` to discover and read code from public GitHub/GitLab repositories and learn from existing high-quality implementations. Web research is no longer gated by a narrow keyword whitelist: it runs whenever it can add value (explicit research intent or any new-project build) and is opt-in/policy-governed via `webSearch.enabled` and `githubIntegration.allowExternalRepoReads`. All findings carry source URLs + retrieval timestamps and are journaled as citations.
+- Unit tests for the debate-panel diversity guard, the opt-in research service (citations/format), and the command-approval tool flow.
+
+### Changed
+- **Quality audit no longer silently passes on failure**: if the independent auditor model is unavailable even after self-healing retries, the cross-check now degrades to a deterministic heuristic audit (stubs/TODOs/empty bodies) and records an explicit "DEGRADED" uncertainty in the journal and brief, instead of returning a false approval.
+- **Command approval is now wired end-to-end**: a risky command requested via the `run_command` tool asks the boss for approval (honoring the ask-policy) and runs only if approved; in fully autonomous / never-ask mode it is declined with a clearly logged, journaled reason instead of failing opaquely or hanging.
+
+- **4-round debate engine**: the pre-build debate now runs Round 1 (proposal) → Round 2 (critic + product cross-critique) → Round 3 (proposer responds to every critique and converges) → Round 4 (a 5-model judging panel scores the approach across weighted criteria and votes on the winning direction). The decision is fed into the project brief.
+- **Code quality cross-check**: after the task reviewer passes, an independent, stronger model audits the change against overall production standards (correctness, completeness, error handling, security, architecture consistency). Its findings feed the existing fix loop, which now iterates until both the reviewer and the auditor are satisfied.
+- **Live work journal** (`AGENT_JOURNAL.md`): a human-readable, timestamped, icon-tagged log written at the workspace root throughout the run — every proposal, critique, debate verdict, task, review/audit result, retrospective, and final report, appended chronologically (newest at the bottom).
+- Unit tests for the debate score aggregation/normalization, the journal, the transactional patch apply, and stderr-redirect command policy.
+
+### Changed
+- Generalized the Code Worker prompt: domain/locale rules are now derived from the project brief instead of being hardcoded to a single industry/locale.
+- `OllamaClient` text keep-alive is now configurable and defaults to 30s (was 60s) to reduce VRAM pressure on constrained hardware (e.g. 24 GB Macs).
+- Raised the default `maxFixRetries` from 5 to 8 to favour final-product quality over speed.
+- Command policy now evaluates external-write redirections even for otherwise safe-prefixed commands (previously a safe prefix could bypass the check).
+
+### Fixed
+- `CommandPolicy` now also detects external-write redirections via `2>`, `&>`, and numbered file descriptors (previously only `>`/`>>`).
+- App smoke verification no longer treats HTTP 4xx responses as success (now requires `< 400`).
+- Multi-file patches are applied transactionally — nothing is written to disk unless every file patches cleanly.
+
+### Removed
+- Deleted the dead, unwired legacy template generator subsystem (`generateAppCommand`, `appGeneratorService`, `codeGenerationService`, `templateMatcherService`, `dependencyResolverService`, the `models/` directory, and their tests). It was fully superseded by the `AgentOrchestrator` multi-agent workflow and was reachable from nothing. This also removed the last hardcoded single-domain (VN finance/gold) code templates.
+- Cleaned local scratch/generated artifacts from the repo working tree (improvement reports, ad-hoc `test/run_*.js` scripts, `generated-apps/`, runtime logs).
+
 ## [1.0.1] - 2026-05-30
 
 ### Added
