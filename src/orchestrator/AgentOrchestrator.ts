@@ -1627,6 +1627,12 @@ export class AgentOrchestrator {
       for (let wi = 0; wi < wave.length; wi++) {
         this._checkAborted();
         const task = wave[wi];
+        // Resilience: any UNEXPECTED throw while processing one task (e.g. a
+        // malformed model response that slips past normalization) must degrade
+        // that single task to "failed" and let the run continue — never kill a
+        // multi-hour autonomous build over one task. Control-flow signals
+        // (pause-for-user, abort) are re-thrown untouched.
+        try {
         const outcome = workerOutcomes[wi];
 
         let workerResult: CodeWorkerOutput | null = null;
@@ -1861,6 +1867,21 @@ export class AgentOrchestrator {
           taskId: task.id,
           files: workerResult.files.map(file => file.path),
         });
+
+        } catch (err) {
+          if (err instanceof WaitForUserError || err instanceof UserAbortError) { throw err; }
+          task.status = 'failed';
+          task.error = `Unexpected error while processing task: ${formatError(err)}`;
+          this._recordFailedTask(state, task.id);
+          state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+          this.workspace.writeProjectState(state);
+          this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+          this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+          this._emit('error', `Task "${task.id}" crashed unexpectedly and was marked failed so the run can continue: ${formatError(err)}`);
+          this._journal('error', `Task ${task.id} crashed`,
+            `An unexpected error occurred while processing this task; it was marked failed (its dependents will cascade-skip) so the autonomous run can continue and still deliver the verified subset. ${formatError(err)}`);
+          continue;
+        }
 
       }
       // Run micro-sprint checks once per wave (not per task) to avoid redundant
@@ -3526,7 +3547,7 @@ export class AgentOrchestrator {
    */
   private _issueSignature(review: ReviewResult): string {
     return [...(review.issues ?? []), ...(review.securityConcerns ?? [])]
-      .map(s => s.toLowerCase().replace(/[0-9]+/g, '#').replace(/\s+/g, ' ').trim())
+      .map(s => String(s).toLowerCase().replace(/[0-9]+/g, '#').replace(/\s+/g, ' ').trim())
       .filter(Boolean)
       .sort()
       .join(' | ');
@@ -3534,7 +3555,7 @@ export class AgentOrchestrator {
 
   /** Merge the task reviewer's verdict with the independent quality audit. */
   private _mergeReviewWithAudit(task: TaskItem, review: ReviewResult, audit: ReviewResult): ReviewResult {
-    const dedupe = (arr: string[]): string[] => [...new Set(arr.map(s => s.trim()).filter(Boolean))];
+    const dedupe = (arr: unknown[]): string[] => [...new Set(arr.map(s => String(s).trim()).filter(Boolean))];
     const needsFix = review.needsFix || audit.needsFix;
     const merged: ReviewResult = {
       taskId: task.id,
@@ -5901,6 +5922,10 @@ export class AgentOrchestrator {
     review.suggestions = Array.isArray(review.suggestions) ? review.suggestions.map(String) : [];
     review.securityConcerns = Array.isArray(review.securityConcerns) ? review.securityConcerns.map(String) : [];
     review.fixSuggestions = Array.isArray(review.fixSuggestions) ? review.fixSuggestions.map(String) : [];
+    // Local models occasionally emit `uncertainties` as an array of objects
+    // instead of strings; coerce so downstream string ops (dedupe/join/trim)
+    // can never throw "x.trim is not a function" and kill the whole run.
+    review.uncertainties = Array.isArray(review.uncertainties) ? review.uncertainties.map(String) : [];
     review.needsFix = review.needsFix === true || review.approved === false || review.issues.length > 0 || review.securityConcerns.length > 0;
     review.approved = review.needsFix ? false : review.approved === true;
     review.reviewedAt = review.reviewedAt || new Date().toISOString();

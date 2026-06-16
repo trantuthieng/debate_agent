@@ -10,23 +10,46 @@
   "artifactDir": "dist",
   "createFinalArchive": true,
   "requireVerificationScripts": true,
-  "webSearch": {
-    "enabled": false,
-    "maxResults": 5,
-    "officialDocsOnly": false,
-    "allowedDomains": []
-  },
-  "githubIntegration": {
-    "enabled": true,
-    "preferGhCli": true,
-    "allowExternalRepoReads": false
-  },
   "selfHealing": {
     "enabled": true,
     "modelCallRetries": 2,
     "retryDelayMs": 5000,
     "alternateModelLimit": 3,
     "compactContextChars": 12000
+  },
+  "commandPolicy": {
+    "approvedPrefixes": [],
+    "requireApprovalForNetwork": true,
+    "requireApprovalForExternalWrites": true,
+    "allowLongRunningSessions": true
+  },
+  "webSearch": {
+    "enabled": false,
+    "maxResults": 5,
+    "officialDocsOnly": false,
+    "allowedDomains": []
+  },
+  "appVerification": {
+    "enabled": true,
+    "startServer": true,
+    "httpSmokeTest": true,
+    "browserSmokeTest": false
+  },
+  "githubIntegration": {
+    "enabled": true,
+    "preferGhCli": true,
+    "allowExternalRepoReads": false
+  },
+  "skills": {
+    "enabled": true,
+    "skillDirs": [
+      ".agent-workspace/skills",
+      "skills"
+    ]
+  },
+  "toolCalling": {
+    "enabled": true,
+    "maxToolRounds": 6
   },
   "defaultOptions": {
     "temperature": 0.1,

@@ -841,6 +841,38 @@ test('issue signature normalizes numbers so recurring failures are detected as n
   assert.notEqual(a, c, 'different issues must have different signatures');
 });
 
+test('review normalization coerces non-string arrays so the fix loop never crashes on bad model output', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  // Reproduce the real black-box crash: a local model returned `uncertainties`
+  // (and other fields) as arrays of OBJECTS, not strings. Before the fix this
+  // killed the entire 65-minute run with "s.trim is not a function".
+  const review = {
+    issues: [{ detail: 'logic bug' }, 'a string issue'],
+    securityConcerns: [{ kind: 'injection' }],
+    suggestions: [{ note: 'rename x' }],
+    fixSuggestions: [{ step: 'do y' }],
+    uncertainties: [{ q: 'is the API stable?' }, 42],
+    approved: false,
+  };
+  // Must not throw, and every array must become strings.
+  orchestrator._normalizeReviewResult({ id: 'task-001' }, review);
+  for (const field of ['issues', 'securityConcerns', 'suggestions', 'fixSuggestions', 'uncertainties']) {
+    assert.ok(review[field].every(x => typeof x === 'string'), `${field} must be all strings`);
+  }
+  // _issueSignature and _mergeReviewWithAudit must survive raw, un-normalized objects too.
+  assert.doesNotThrow(() =>
+    orchestrator._issueSignature({ issues: [{ x: 1 }], securityConcerns: [{ y: 2 }] }));
+  const merged = orchestrator._mergeReviewWithAudit(
+    { id: 'task-001' },
+    review,
+    { issues: [{ bad: 1 }], suggestions: [{ bad: 2 }], securityConcerns: [{ bad: 3 }], fixSuggestions: [{ bad: 4 }], uncertainties: [{ bad: 5 }] }
+  );
+  assert.ok(merged.uncertainties.every(x => typeof x === 'string'));
+  assert.ok(merged.issues.every(x => typeof x === 'string'));
+});
+
 test('capability assessment detects web, file, and credential needs (EN + VI)', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);
