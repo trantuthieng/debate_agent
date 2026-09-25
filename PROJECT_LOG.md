@@ -460,3 +460,22 @@ Boss yêu cầu "làm hết". Đã commit toàn bộ việc tồn đọng từ 1
 **Mục 5.1 cũ (dependency install không retry):** thực tế đã được làm trước đó (`_phaseDependencyInstall` có vòng fix, `test/dependencyInstall.test.js`) — mục 5 chưa cập nhật.
 
 **Bằng chứng:** compile + lint sạch; `npm test` **363/363 pass** (355 + 8 test mới: 2 unit moduleContracts, 3 off-stack manifest, 3 escalation).
+
+### 2026-09-26 (tiếp) — Benchmark lần 4 chết sau ~2 phút vì OneDrive/ổ đĩa, KHÔNG phải lỗi code agent
+
+Chạy `node test/brick_breaker_e2e.js` nền (`nohup ... & disown`, PID 43873), workspace `demo/brick-breaker-20-2026-09-25T19-54-45-843Z`, log `/private/tmp/debate-brick20-20260926-025445.log`. Mục đích: xác nhận 2 fix ở mục trên (`815ff86`).
+
+**Diễn biến:** preflight OK (`5 distinct local models are responsive`), vào `brainstorm` (meta-agent thiết kế team) lúc `19:56:35Z` rồi chết ngay: `Error: EACCES: permission denied, mkdir '.../26 Debate_agent/dist/benchmarks'` (tại `test/brick_breaker_e2e.js:61`, hàm `report`, khi ghi báo cáo lỗi). Workspace chỉ kịp tạo `AGENT_JOURNAL.md`. Ngay sau đó toàn bộ thư mục dự án **biến mất tạm thời** — shell báo "working directory no longer exists", Read tool báo "File does not exist". Một lúc sau thư mục quay lại nguyên vẹn (2 commit `4863be8`, `815ff86` còn đủ), nhưng 108 file hiện "modified" trong git **chỉ do đổi mode** (`git -c core.fileMode=false status` sạch) — dấu hiệu OneDrive đã gỡ/tải lại (re-materialize) thư mục.
+
+**Kết luận:** fail do môi trường — OneDrive tạm thời thu hồi quyền truy cập thư mục dự án giữa run. Không có bằng chứng nào về 2 fix mới (run chết trước khi có task plan). Lỗi gốc có thể đã xảy ra sớm hơn ở pipeline (lỗi ghi file của meta-agent), còn `EACCES` là lỗi ở bước ghi báo cáo — log không đủ để phân biệt vì chính thư mục bị mất.
+
+**Các lỗi môi trường do OneDrive gây ra (tổng hợp):**
+1. `node_modules/.bin/*` bị biến từ symlink thành file text 21 byte → `npm run compile`, `npm run test:e2e:*` hỏng (`../typescript/bin/tsc: No such file or directory`). Tạm thời gọi trực tiếp `node node_modules/typescript/bin/tsc -p ./`.
+2. Mode file bị đổi hàng loạt (644 → 755/700) → git báo hàng trăm file "modified" giả. Tạm thời dùng `git -c core.fileMode=false ...` khi add/commit.
+3. Thư mục dự án mất quyền truy cập/biến mất giữa run dài → giết benchmark lần 4 (EACCES).
+4. OneDrive chiếm ~2.9GB RAM trong lúc benchmark (cùng VM ~2.2GB) → app báo chỉ 2.7% RAM free lúc khởi động (dù OS memory pressure "normal").
+
+**Việc cần làm (chưa làm):**
+- Chuyển dự án (hoặc ít nhất `node_modules/`, `demo/`, `dist/`) ra khỏi thư mục OneDrive, ví dụ `~/Projects/debate-agent`, hoặc tạm dừng đồng bộ OneDrive khi chạy benchmark. Sau đó `npm ci` để tạo lại `node_modules/.bin`.
+- Cân nhắc `git config core.fileMode false` cho repo này nếu vẫn để trong OneDrive.
+- Chạy lại benchmark lần 4 sau khi xử lý môi trường — 2 fix `815ff86` vẫn CHƯA được xác nhận trên model thật.
