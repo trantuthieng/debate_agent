@@ -2485,3 +2485,119 @@ test('deterministic static web recovery creates a verifiable web product', async
   const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
+
+// Reproduces a real failed run (2026-09-19): in a pure JS/Phaser brick-breaker
+// game, the test-fixer invented a Package.swift. Its mere existence made the
+// verification planner demand `swift test`, and every remaining fix attempt
+// was burned on a check the project could never pass. A NEW toolchain manifest
+// that the brief never asked for must be dropped before it reaches disk.
+function writeJsGameBrief(orchestrator) {
+  orchestrator.workspace.writeFile(orchestrator.workspace.projectBriefPath, JSON.stringify({
+    chosenStack: ['JavaScript', 'Phaser 3', 'HTML5 Canvas'],
+    targetPlatforms: ['Web browser'],
+  }));
+}
+
+test('fixer output that invents an off-stack Package.swift is dropped before validation', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  writeJsGameBrief(orchestrator);
+  const task = {
+    id: 'test-fix-1', title: 'Fix failing tests', description: '', assignedAgent: 'fixer',
+    dependsOn: [], allowedFiles: ['src/game.js', 'package.json'], forbiddenActions: [],
+    acceptanceCriteria: [], status: 'in_progress', createdAt: new Date().toISOString(),
+  };
+  const output = {
+    reasoning: 'Fix tests.',
+    files: [
+      { path: 'src/game.js', action: 'modify', content: 'module.exports = {};' },
+      { path: 'Package.swift', action: 'create', content: '// swift-tools-version:5.7' },
+    ],
+    needUserInput: false, questions: [],
+  };
+
+  const added = orchestrator._selfHealAllowedFiles(task, output, 'fixer');
+  const errors = orchestrator._validateTaskFileChanges(task, output);
+
+  assert.deepEqual(added, []);
+  assert.deepEqual(errors, []);
+  assert.deepEqual(output.files.map(f => f.path), ['src/game.js']);
+  assert.ok(!task.allowedFiles.includes('Package.swift'));
+  const assumptions = orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '';
+  assert.match(assumptions, /off-stack toolchain manifest.*Package\.swift/);
+});
+
+test('task normalization strips planned off-stack toolchain manifests but keeps on-stack ones', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  writeJsGameBrief(orchestrator);
+  const task = {
+    id: 'sprint-01-task-001', title: 'Setup', description: '', assignedAgent: 'codeWorker',
+    dependsOn: [], allowedFiles: ['package.json', 'index.html', 'Package.swift', 'Cargo.toml'],
+    forbiddenActions: [], acceptanceCriteria: ['Project builds'], status: 'pending', createdAt: '',
+  };
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString());
+  assert.deepEqual(normalized.allowedFiles, ['package.json', 'index.html']);
+
+  orchestrator.workspace.writeFile(orchestrator.workspace.projectBriefPath, JSON.stringify({
+    chosenStack: ['Swift', 'SwiftUI', 'Swift Package Manager'],
+    targetPlatforms: ['macOS'],
+  }));
+  const swiftTask = { ...task, allowedFiles: ['Package.swift', 'Sources/App/main.swift'] };
+  const swiftNormalized = orchestrator._normalizeTaskItem(swiftTask, 0, new Date().toISOString());
+  assert.deepEqual(swiftNormalized.allowedFiles, ['Package.swift', 'Sources/App/main.swift']);
+});
+
+test('an existing toolchain manifest (user repo) is never treated as off-stack', async () => {
+  const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'Package.swift'), '// swift-tools-version:5.7');
+  const orchestrator = await makeOrchestrator(root);
+  writeJsGameBrief(orchestrator);
+  assert.equal(orchestrator._isOffStackToolchainMarker('Package.swift'), false);
+});
+
+// Reproduces a real failed run (2026-09-19): a specialist-owned task was fixed
+// 8/8 times by the specialist's 14B model, which never corrected a one-token
+// typo (b.sta → b.status) the reviewer had named. From the 3rd attempt on,
+// repairs must escalate to the fixer's stronger model even for specialist tasks.
+async function captureFixerModels({ fixRetryCount, stuck = false }) {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.modelConfig.agents.fixer = { model: 'fixer-small', fallbackModel: 'fixer-strong' };
+  const state = makeState({ currentPhase: 'fixing', fixRetryCount, createdAt: new Date(Date.now() - 5000).toISOString() });
+  orchestrator.workspace.writeFile(orchestrator.workspace.agentNotePath('dynamic_team_plan.json'), JSON.stringify(makeTeamPlan(state.projectGoal)));
+  orchestrator.toolRegistry = { manifestForPrompt: () => '' };
+  const captured = {};
+  orchestrator.ollama = {
+    callWithFallbackJson: async (model, fallback, messages) => {
+      Object.assign(captured, { model, fallback, systemPrompt: messages[0].content });
+      return { reasoning: 'fixed', files: [{ path: 'src/ui.js', action: 'modify', content: 'x' }], needUserInput: false, questions: [] };
+    },
+  };
+  const task = {
+    id: 'task-008', title: 'Score tracking', description: 'd', assignedAgent: 'codeWorker',
+    specialistId: 'builder', dependsOn: [], allowedFiles: ['src/ui.js'], forbiddenActions: [],
+    acceptanceCriteria: ['works'], status: 'in_progress', createdAt: new Date().toISOString(),
+  };
+  if (stuck) { orchestrator.escalatedFixTasks.add(task.id); }
+  const review = { taskId: task.id, approved: false, issues: ['b.sta should be b.status'], suggestions: [], securityConcerns: [], needsFix: true, fixSuggestions: [], reviewedAt: new Date().toISOString() };
+  await orchestrator._executeFixer(task, review, state, false);
+  return captured;
+}
+
+test('early specialist fix attempts stay on the specialist model', async () => {
+  const captured = await captureFixerModels({ fixRetryCount: 2 });
+  assert.equal(captured.model, 'model-builder');
+});
+
+test('specialist task repairs escalate to the stronger fixer model from attempt 3, keeping the specialist persona', async () => {
+  const captured = await captureFixerModels({ fixRetryCount: 3 });
+  assert.equal(captured.model, 'fixer-strong');
+  assert.equal(captured.fallback, 'model-builder');
+  assert.match(captured.systemPrompt, /SPECIALIST ASSIGNMENT/);
+});
+
+test('a fixer stuck on identical issues escalates before the scheduled attempt', async () => {
+  const captured = await captureFixerModels({ fixRetryCount: 1, stuck: true });
+  assert.equal(captured.model, 'fixer-strong');
+});

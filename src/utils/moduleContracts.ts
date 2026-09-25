@@ -195,7 +195,44 @@ export function isBinaryAssetPath(filePath: string): boolean {
   return BINARY_ASSET_EXTENSIONS.has(ext);
 }
 
-const HAS_EXPORT_RE = /\bexport\s+(default\b|class\b|function\b|const\b|let\b|var\b|\{)|\bmodule\.exports\b|\bexports\.\w+\s*=/;
+export type ToolchainMarkerStack = 'swift' | 'rust' | 'go' | 'java' | 'dotnet';
+
+/**
+ * The stack a build-manifest file declares, or null if `filePath` is not one.
+ * These files are not inert: the verification planner turns their mere
+ * existence into a mandatory check (`Package.swift` → `swift test`). A real
+ * run (2026-09-19) had the test-fixer invent a `Package.swift` inside a pure
+ * JS/Phaser game, and every remaining fix attempt was burned on a Swift check
+ * the project could never pass.
+ */
+export function toolchainMarkerStack(filePath: string): ToolchainMarkerStack | null {
+  const base = path.basename(filePath);
+  if (base === 'Package.swift') { return 'swift'; }
+  if (base === 'Cargo.toml') { return 'rust'; }
+  if (base === 'go.mod') { return 'go'; }
+  if (/^(pom\.xml|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|gradlew)$/.test(base)) { return 'java'; }
+  if (/\.(csproj|fsproj|sln)$/i.test(base)) { return 'dotnet'; }
+  return null;
+}
+
+const TOOLCHAIN_STACK_RE: Record<ToolchainMarkerStack, RegExp> = {
+  swift: /\bswift(ui)?\b|\bios\b|\bipados\b|\bmacos\b|\bwatchos\b|\btvos\b|\bvisionos\b|\bxcode\b|\bapple platform/,
+  rust: /\brust\b|\bcargo\b/,
+  go: /\bgolang\b|\bgo\s+(module|modules|1\.\d+|language|backend|service|server|cli)\b|,\s*go\b/,
+  java: /\bjava\b|\bkotlin\b|\bscala\b|\bgradle\b|\bmaven\b|\bandroid\b|\bspring\b|\bjvm\b/,
+  dotnet: /\.net\b|\bdotnet\b|\bc#|\bcsharp\b|\bf#|\bblazor\b|\basp\.net\b|\bunity\b|\bmaui\b/,
+};
+
+/**
+ * True when `stackText` (brief chosenStack/targetPlatforms + user prompt,
+ * any case) plausibly asks for the stack `stack`. List items should be
+ * comma-joined with a leading ", " so a bare "Go" entry is recognizable.
+ */
+export function stackTextMentions(stack: ToolchainMarkerStack, stackText: string): boolean {
+  return TOOLCHAIN_STACK_RE[stack].test(stackText.toLowerCase());
+}
+
+const HAS_EXPORT_RE =/\bexport\s+(default\b|class\b|function\b|const\b|let\b|var\b|\{)|\bmodule\.exports\b|\bexports\.\w+\s*=/;
 const CONVENTIONAL_ENTRY_RE = /(^|\/)(index|main|app|server|bootstrap|bin\/[^/]+|[\w.-]+\.config)\.[cm]?[jt]sx?$/i;
 const TEST_FILE_RE = /\.(test|spec)\.[cm]?[jt]sx?$/i;
 const TEST_DIR_RE = /(^|\/)(tests?|__tests__|__mocks__)\//i;

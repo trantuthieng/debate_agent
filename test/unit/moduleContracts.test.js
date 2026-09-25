@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath } = require('../../out/utils/moduleContracts');
+const { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } = require('../../out/utils/moduleContracts');
 
 // Reproduces a real failed run: a generated test file destructured six names
 // from '../src/logic', but src/logic.js only defined createInitialState and
@@ -249,4 +249,25 @@ test('isBinaryAssetPath does not flag text-based files, including SVG', () => {
   for (const p of ['src/game.js', 'index.html', 'levels.json', 'icon.svg', 'README.md', 'src/assets/']) {
     assert.equal(isBinaryAssetPath(p), false, `${p} should not be flagged as binary`);
   }
+});
+
+test('toolchainMarkerStack recognizes build manifests that trigger stack-specific checks', () => {
+  assert.equal(toolchainMarkerStack('Package.swift'), 'swift');
+  assert.equal(toolchainMarkerStack('native/Cargo.toml'), 'rust');
+  assert.equal(toolchainMarkerStack('go.mod'), 'go');
+  assert.equal(toolchainMarkerStack('pom.xml'), 'java');
+  assert.equal(toolchainMarkerStack('build.gradle.kts'), 'java');
+  assert.equal(toolchainMarkerStack('App.csproj'), 'dotnet');
+  assert.equal(toolchainMarkerStack('package.json'), null);
+  assert.equal(toolchainMarkerStack('src/game.swift'), null);
+});
+
+test('stackTextMentions matches the requested stack without false positives on common words', () => {
+  assert.equal(stackTextMentions('swift', ', SwiftUI, Core Data, | , iOS,'), true);
+  assert.equal(stackTextMentions('swift', ', JavaScript, Phaser 3, | , web browser, | build a brick breaker game'), false);
+  assert.equal(stackTextMentions('go', ', Go, Gin,'), true);
+  assert.equal(stackTextMentions('go', 'let players go to the next level'), false);
+  assert.equal(stackTextMentions('java', ', JavaScript, Node.js,'), false);
+  assert.equal(stackTextMentions('java', ', Kotlin, Android,'), true);
+  assert.equal(stackTextMentions('dotnet', ', C#, ASP.NET Core,'), true);
 });

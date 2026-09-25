@@ -445,3 +445,18 @@ Chạy `npm run test:e2e:brick-breaker` nền (`nohup ... & disown`, PID 67469),
 - Hướng sửa khả dĩ (chưa quyết, chưa code): (a) chặn model tạo file toolchain-marker (`Package.swift`, `Cargo.toml`, `pom.xml`, ...) không khớp `chosenStack`/`targetPlatforms` của brief — cùng tinh thần `isBinaryAssetPath()` (fix ngày 18/9) nhưng cho "file toolchain sai nền tảng" thay vì "binary asset"; hoặc (b) chỉ tin file toolchain-marker do chính task lúc coding ban đầu tạo ra, không tin file do TEST-FIXER tự thêm giữa chừng khi cố sửa lỗi test.
 - Task-008 (`b.sta` vs `b.status`) là 1 ca cụ thể của vấn đề rộng hơn: model 8 lần sửa không tự bắt được 1 typo rõ ràng dù reviewer chỉ đúng nhiều lần — có thể do chưa được cho xem đủ ngữ cảnh, hoặc `qwen2.5-coder:14b-instruct` (Game Builder) không đủ mạnh cho debug tinh vi kiểu này; escalate sang `devstral-small-2` hiện chỉ có ở vòng test-fix cuối, không có ở vòng fix theo từng task riêng — có thể cần escalate sớm hơn.
 - Chưa chạy benchmark lần 4 — cần quyết định hướng sửa ở trên trước.
+
+### 2026-09-26 — Sửa 2 nguyên nhân fail của benchmark lần 3 (19/9) + commit checkpoint
+
+Boss yêu cầu "làm hết". Đã commit toàn bộ việc tồn đọng từ 11–19/9 (`4863be8`; `demo/brick-breaker-*`, `demo/word-addin-refs-*` giờ được gitignore — 678MB output benchmark). Lưu ý: `node_modules/.bin/*` bị OneDrive biến symlink thành file text nên `npm run compile` hỏng — chạy trực tiếp `node node_modules/typescript/bin/tsc -p ./` (hoặc `npm ci` để tạo lại).
+
+**Fix #1 — `Package.swift` do model bịa ra ép chạy `swift test` trong project JS.** Nguồn: `VerificationPlanner` (`src/services/verificationPlanner.ts`) biến sự tồn tại của file manifest thành check bắt buộc. Sửa ở gốc (không để file lọt xuống đĩa):
+- `toolchainMarkerStack()` / `stackTextMentions()` (`src/utils/moduleContracts.ts`): nhận diện `Package.swift`, `Cargo.toml`, `go.mod`, `pom.xml`/gradle, `*.csproj`/`*.sln` và stack tương ứng.
+- `_isOffStackToolchainMarker()` (`AgentOrchestrator.ts`): manifest MỚI (chưa tồn tại) mà brief `chosenStack`/`targetPlatforms`/prompt không nhắc tới stack đó → off-stack. File có sẵn (repo của user) và run chưa có brief thì luôn được tin.
+- Áp dụng ở 2 chỗ: `_normalizeTaskItem` (loại khỏi `allowedFiles` lúc lập kế hoạch) và `_dropOffStackToolchainMarkers` gọi đầu `_selfHealAllowedFiles` (bỏ riêng file đó khỏi output của codeWorker/fixer/test-fixer, giữ các file tốt còn lại). Ghi assumption + log warn.
+
+**Fix #2 — task-008 sửa 8/8 lần không xong typo `b.sta`.** Trước đây chỉ `test-fix-*` không có specialist mới escalate model. Giờ trong `_executeFixer`: từ lần sửa thứ 3 (`FIX_ESCALATION_ATTEMPT`), MỌI task (kể cả task của specialist) chuyển sang `fixer.fallbackModel` (mặc định `devstral-small-2`), model gốc làm fallback, vẫn giữ persona specialist. Thêm: bộ chặn "no progress" (dừng sau 2 lần lỗi y hệt) giờ escalate sang model mạnh 1 lần trước khi bỏ cuộc (`escalatedFixTasks`).
+
+**Mục 5.1 cũ (dependency install không retry):** thực tế đã được làm trước đó (`_phaseDependencyInstall` có vòng fix, `test/dependencyInstall.test.js`) — mục 5 chưa cập nhật.
+
+**Bằng chứng:** compile + lint sạch; `npm test` **363/363 pass** (355 + 8 test mới: 2 unit moduleContracts, 3 off-stack manifest, 3 escalation).

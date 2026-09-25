@@ -67,7 +67,7 @@ import type { ContextSection } from '../context/ContextCache';
 import { finalizeCompletedState } from './workflowState';
 import type { SecretVault } from '../connectors/SecretVault';
 import { ConnectorManager } from '../connectors/ConnectorManager';
-import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath } from '../utils/moduleContracts';
+import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
 interface ImprovementConsensus {
   agentRole: 'brainstorm' | 'critic' | 'secondBrainstorm';
@@ -163,6 +163,10 @@ interface WorkflowRoute {
 // AgentOrchestrator
 // -----------------------------------------------------------------------
 export class AgentOrchestrator {
+  /** Fix attempt from which repairs switch to the fixer's stronger fallback model. */
+  private static readonly FIX_ESCALATION_ATTEMPT = 3;
+  /** Tasks whose fixer was escalated early because it stopped making progress. */
+  private readonly escalatedFixTasks = new Set<string>();
   private readonly workspace: AgentWorkspace;
   private readonly fileManager: FileManager;
   private readonly gitReader: GitRepositoryReader;
@@ -2306,6 +2310,19 @@ export class AgentOrchestrator {
             const signature = this._issueSignature(reReview);
             if (signature && signature === lastIssueSignature) {
               noProgressStreak += 1;
+              // Stuck before the scheduled escalation: switch to the stronger
+              // fixer model once instead of giving up on the weaker one.
+              if (
+                noProgressStreak >= maxNoProgress &&
+                attempt < AgentOrchestrator.FIX_ESCALATION_ATTEMPT &&
+                !this.escalatedFixTasks.has(task.id) &&
+                this._canEscalateFixer(task, state)
+              ) {
+                this.escalatedFixTasks.add(task.id);
+                noProgressStreak = 0;
+                this._emit('log', `Fixer for task "${task.id}" made no progress; escalating to the stronger fixer model before giving up.`, 'warn');
+                continue;
+              }
               if (noProgressStreak >= maxNoProgress) {
                 this._emit('log', `Fixer for task "${task.id}" made no progress over ${noProgressStreak + 1} attempts (identical issues); stopping retries to avoid a stuck loop.`, 'warn');
                 this._journal('warn', `Fixer escalation on ${task.id}`,
@@ -4760,15 +4777,19 @@ export class AgentOrchestrator {
       this._sec('# Autonomous Assumptions', assumptions, 14),
     ], task.id.startsWith('test-fix-') ? Math.min(this._contextBudget(), 32_000) : undefined);
 
-    // A specialist-owned task keeps the same specialist for its fixes too —
-    // test-fix-* tasks are synthesized fresh per verification pass and never
-    // carry a specialistId, so they are unaffected and still escalate below.
+    // A specialist-owned task keeps the same specialist (persona and model) for
+    // its fixes. From the 3rd attempt on, every repair — task fix or test-fix,
+    // specialist-owned or not — escalates to the fixer's stronger fallback
+    // model: a real run (2026-09-19) had the specialist's 14B model fail 8/8
+    // times to fix a one-token typo (b.sta → b.status) the reviewer had named.
     const specialist = this._specialistForTask(task, _state);
     const configured = this._agentConfig('fixer');
-    const escalate = !specialist && task.id.startsWith('test-fix-') && _state.fixRetryCount >= 3 && configured.model !== configured.fallbackModel;
-    const model = specialist ? specialist.model : escalate ? configured.fallbackModel : configured.model;
-    const fallbackModel = specialist ? specialist.fallbackModel : escalate ? configured.model : configured.fallbackModel;
-    if (escalate) { this._emit('log', `Repeated verification repair is being escalated to ${model}.`, 'warn'); }
+    const baseModel = specialist ? specialist.model : configured.model;
+    const escalate = this._canEscalateFixer(task, _state)
+      && (_state.fixRetryCount >= AgentOrchestrator.FIX_ESCALATION_ATTEMPT || this.escalatedFixTasks.has(task.id));
+    const model = escalate ? configured.fallbackModel : baseModel;
+    const fallbackModel = escalate ? baseModel : specialist ? specialist.fallbackModel : configured.fallbackModel;
+    if (escalate) { this._emit('log', `Repeated repair of "${task.id}" is being escalated from ${baseModel} to ${model}.`, 'warn'); }
     if (specialist) { this._emit('log', `Fix for task "${task.id}" routed to team specialist "${specialist.name}" (${specialist.model}).`, 'info'); }
     const messages = this._buildMessages('fixer', context, specialist);
 
@@ -4787,6 +4808,13 @@ export class AgentOrchestrator {
       this._emit('error', `Fixer failed: ${formatError(err)}`);
       return null;
     }
+  }
+
+  /** True when the fixer has a distinct stronger model to escalate this task's repairs to. */
+  private _canEscalateFixer(task: TaskItem, state: ProjectState): boolean {
+    const configured = this._agentConfig('fixer');
+    const baseModel = this._specialistForTask(task, state)?.model ?? configured.model;
+    return !!configured.fallbackModel && configured.fallbackModel !== baseModel;
   }
 
   private async _runWorkerToolLoop(
@@ -7260,6 +7288,13 @@ export class AgentOrchestrator {
       : [];
     const taskId = task.id || `task-${String(index + 1).padStart(3, '0')}`;
     const allowedFiles = normalizedAllowedFiles.filter(file => {
+      if (this._isOffStackToolchainMarker(file)) {
+        this.workspace.appendAssumption(
+          'taskManager',
+          `Task ${taskId} planned toolchain manifest "${file}", which does not match the project's chosen stack; removed it from allowedFiles.`
+        );
+        return false;
+      }
       if (!isBinaryAssetPath(file)) { return true; }
       this.workspace.appendAssumption(
         'taskManager',
@@ -8657,11 +8692,45 @@ export class AgentOrchestrator {
     return errors;
   }
 
+  /**
+   * True for a NEW build manifest (Package.swift, Cargo.toml, go.mod, ...) whose
+   * stack the brief/prompt never asked for. Its existence alone makes the
+   * verification planner demand that stack's test command, so a model that
+   * invents one mid-fix creates a check the project can never pass. Existing
+   * files (e.g. a user's own repo) and runs without a parsed brief are trusted.
+   */
+  private _isOffStackToolchainMarker(filePath: string): boolean {
+    const stack = toolchainMarkerStack(filePath);
+    if (!stack) { return false; }
+    const normalized = this._normalizeRelativePath(filePath);
+    if (this.fileManager.fileExists(normalized)) { return false; }
+    const raw = this.workspace.readFile(this.workspace.projectBriefPath);
+    if (!raw) { return false; }
+    let brief: ProjectBrief;
+    try { brief = JSON.parse(raw) as ProjectBrief; } catch { return false; }
+    const list = (value: unknown): string => Array.isArray(value) ? `, ${value.map(String).join(', ')},` : '';
+    const stackText = [list(brief.chosenStack), list(brief.targetPlatforms), this.workspace.readUserPrompt()].join(' | ');
+    return !stackTextMentions(stack, stackText);
+  }
+
+  /** Drop off-stack toolchain manifests from a model's output before it is validated or applied. */
+  private _dropOffStackToolchainMarkers(task: TaskItem, output: CodeWorkerOutput, role: 'codeWorker' | 'fixer'): void {
+    const dropped = output.files
+      .filter(change => change.action !== 'delete' && this._isOffStackToolchainMarker(change.path))
+      .map(change => change.path);
+    if (dropped.length === 0) { return; }
+    output.files = output.files.filter(change => !dropped.includes(change.path));
+    const detail = `Task ${task.id}: ignored ${role} change(s) creating off-stack toolchain manifest(s): ${dropped.join(', ')}`;
+    this._emit('log', `${detail}.`, 'warn');
+    this.workspace.appendAssumption(role, `${detail}. They do not match the brief's chosen stack and would force an unrelated verification command.`);
+  }
+
   private _selfHealAllowedFiles(
     task: TaskItem,
     output: CodeWorkerOutput,
     role: 'codeWorker' | 'fixer'
   ): string[] {
+    this._dropOffStackToolchainMarkers(task, output, role);
     if (!this._selfHealingConfig().enabled || task.allowedFiles.length === 0) { return []; }
 
     const added: string[] = [];
