@@ -479,3 +479,11 @@ Chạy `node test/brick_breaker_e2e.js` nền (`nohup ... & disown`, PID 43873),
 - Chuyển dự án (hoặc ít nhất `node_modules/`, `demo/`, `dist/`) ra khỏi thư mục OneDrive, ví dụ `~/Projects/debate-agent`, hoặc tạm dừng đồng bộ OneDrive khi chạy benchmark. Sau đó `npm ci` để tạo lại `node_modules/.bin`.
 - Cân nhắc `git config core.fileMode false` cho repo này nếu vẫn để trong OneDrive.
 - Chạy lại benchmark lần 4 sau khi xử lý môi trường — 2 fix `815ff86` vẫn CHƯA được xác nhận trên model thật.
+
+### 2026-09-26 (tiếp nữa) — Xử lý môi trường sau khi boss dừng đồng bộ OneDrive + chạy lại benchmark lần 4
+
+- `npm ci`: tạo lại `node_modules/.bin` (trước đó symlink bị OneDrive biến thành file text, kèm bản trùng `* 2`). `npm run compile` chạy lại bình thường. Không tìm thấy file trùng `* 2` nào trong source.
+- `git config core.fileMode false` cho repo → hết hàng trăm file "modified" giả do đổi mode.
+- `test/brick_breaker_e2e.js`: `report()` (gọi mỗi 60s từ heartbeat) giờ bắt lỗi ghi file và chỉ log `[warn]` — trước đây 1 lỗi ghi tạm thời (EACCES như lần 4) ném exception trong `setInterval` và giết cả run nhiều giờ.
+- `npm run check`: 363/363 pass. RAM: memory_pressure 87% free.
+- Chạy lại benchmark: PID 54822, log `/private/tmp/debate-brick20-20260926-055153.log`.

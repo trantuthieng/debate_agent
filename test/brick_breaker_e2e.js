@@ -58,9 +58,15 @@ function report(status) {
     calls: { total: calls.length, failed: calls.filter(call => !call.success).length, byModel: Object.fromEntries([...new Set(calls.map(call => call.model))].map(model => [model, calls.filter(call => call.model === model).length])) },
     independentGameplayReview: 'pending',
   };
-  fs.mkdirSync(path.dirname(reportPath), { recursive: true });
-  fs.writeFileSync(reportPath, `${JSON.stringify(data, null, 2)}\n`);
-  fs.writeFileSync(invocationReportPath, `${JSON.stringify(data, null, 2)}\n`);
+  // A transient write failure (e.g. a sync client briefly locking the folder)
+  // must never kill a multi-hour run from inside the heartbeat timer.
+  try {
+    fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+    fs.writeFileSync(reportPath, `${JSON.stringify(data, null, 2)}\n`);
+    fs.writeFileSync(invocationReportPath, `${JSON.stringify(data, null, 2)}\n`);
+  } catch (err) {
+    console.warn(`${new Date().toISOString()} [warn] Benchmark report not written (${status}): ${err.message}`);
+  }
 }
 
 async function main() {
