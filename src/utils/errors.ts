@@ -95,6 +95,33 @@ export class MissingCapabilityError extends Error {
   }
 }
 
+/**
+ * Raised before any product file is written when the workspace is this
+ * extension's own development source tree. A real run once merged a
+ * generated Python product straight into this extension's src/, silently
+ * corrupting it; this is an honest stop, not a crash.
+ */
+export class SelfWorkspaceGuardError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SelfWorkspaceGuardError';
+  }
+}
+
+/**
+ * Raised before a run starts when the host machine's own memory-pressure
+ * signal (or, as a fallback, free-RAM percentage) shows too little headroom
+ * to safely run five local models sequentially. Stopping honestly here beats
+ * risking a mid-run crash (or a genuinely unresponsive machine) 20+ minutes
+ * into a debate.
+ */
+export class InsufficientResourcesError extends Error {
+  constructor(message: string, public readonly advisory: string) {
+    super(message);
+    this.name = 'InsufficientResourcesError';
+  }
+}
+
 export function isUserAbort(err: unknown): boolean {
   return err instanceof UserAbortError;
 }

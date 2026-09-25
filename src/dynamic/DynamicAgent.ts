@@ -1,14 +1,22 @@
 import type { AgentSpec, OllamaMessage, ToolCallRequest, ToolCallResult } from '../types';
 import { logWarn } from '../utils/logging';
+import { UserAbortError } from '../utils/errors';
+import { retryWithBackoff, type RetryPolicy } from '../utils/retry';
 
 /** Minimal OllamaClient slice the dynamic agent needs (keeps it testable). */
 export interface DynamicAgentClient {
+  chat?(
+    model: string,
+    messages: OllamaMessage[],
+    agentRole?: string,
+    options?: { temperature?: number; num_ctx?: number; num_predict?: number }
+  ): Promise<string>;
   callWithFallback(
     primaryModel: string,
     fallbackModel: string,
     messages: OllamaMessage[],
     agentRole?: string,
-    options?: { temperature?: number; num_ctx?: number },
+    options?: { temperature?: number; num_ctx?: number; num_predict?: number },
     outputFile?: string,
     inputFiles?: string[]
   ): Promise<string>;
@@ -30,7 +38,14 @@ export class DynamicAgent {
     private readonly client: DynamicAgentClient,
     private readonly spec: AgentSpec,
     private readonly tools?: DynamicToolRunner,
-    private readonly maxToolRounds = 3
+    private readonly maxToolRounds = 3,
+    private readonly modelOptions: { num_ctx?: number; num_predict?: number } = {},
+    /**
+     * Retries a failed call against this agent's OWN model only (never a
+     * fallback/different model — see _callOnce). Defaults to a single
+     * attempt so existing callers/tests are unaffected unless they opt in.
+     */
+    private readonly retryPolicy: RetryPolicy = { retries: 0, delayMs: 0 }
   ) {}
 
   get id(): string { return this.spec.id; }
@@ -96,12 +111,35 @@ export class DynamicAgent {
   }
 
   private async _call(messages: OllamaMessage[]): Promise<string> {
+    return retryWithBackoff(
+      () => this._callOnce(messages),
+      this.retryPolicy,
+      (attempt, totalAttempts, err) => logWarn(
+        `Dynamic agent "${this.spec.id}" (${this.spec.model}) call failed (attempt ${attempt}/${totalAttempts}): ` +
+        `${err instanceof Error ? err.message : String(err)}. Retrying the same model...`
+      )
+    );
+  }
+
+  private async _callOnce(messages: OllamaMessage[]): Promise<string> {
+    // Real Ollama clients use the exact preflight-approved model, retried (see
+    // retryPolicy) against that SAME model only. Do not let a failed
+    // participant silently become another participant's fallback model — that
+    // would undermine the "five genuinely distinct models" guarantee.
+    if (this.client.chat) {
+      return this.client.chat(
+        this.spec.model,
+        messages,
+        `dynamic:${this.spec.id}`,
+        { ...this.modelOptions, temperature: this.spec.temperature }
+      );
+    }
     return this.client.callWithFallback(
       this.spec.model,
       this.spec.fallbackModel,
       messages,
       `dynamic:${this.spec.id}`,
-      { temperature: this.spec.temperature }
+      { ...this.modelOptions, temperature: this.spec.temperature }
     );
   }
 
@@ -126,6 +164,7 @@ export class DynamicAgent {
     try {
       return await this.tools!.execute({ id: `${this.spec.id}-${call.name}`, name: call.name, args: call.args });
     } catch (err) {
+      if (err instanceof UserAbortError) { throw err; }
       logWarn(`Dynamic agent "${this.spec.id}" tool "${call.name}" failed: ${err instanceof Error ? err.message : String(err)}`);
       return { id: this.spec.id, name: call.name, success: false, output: '', error: err instanceof Error ? err.message : String(err) };
     }

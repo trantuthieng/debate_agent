@@ -1,5 +1,6 @@
 import type { AgentSpec, AgentTeamPlan, OllamaMessage } from '../types';
 import { logWarn } from '../utils/logging';
+import { UserAbortError } from '../utils/errors';
 
 /** Minimal slice of OllamaClient the factory needs (keeps it unit-testable). */
 export interface TeamDesignerClient {
@@ -8,7 +9,7 @@ export interface TeamDesignerClient {
     fallbackModel: string,
     messages: OllamaMessage[],
     agentRole?: string,
-    options?: { temperature?: number; num_ctx?: number },
+    options?: { temperature?: number; num_ctx?: number; num_predict?: number },
     outputFile?: string,
     inputFiles?: string[]
   ): Promise<T>;
@@ -24,6 +25,8 @@ export interface AgentFactoryOptions {
   designerFallback: string;
   minAgents?: number;
   maxAgents?: number;
+  /** Bounded context/output settings for resource-constrained local models. */
+  modelOptions?: { num_ctx?: number; num_predict?: number };
 }
 
 /**
@@ -47,11 +50,11 @@ export class AgentFactory {
   ) {
     this.roster = [...new Set(opts.roster.filter(Boolean))];
     this.toolNames = [...new Set(opts.toolNames.filter(Boolean))];
-    this.minAgents = Math.max(5, opts.minAgents ?? 5);
+    this.minAgents = Math.max(6, opts.minAgents ?? 6);
     this.maxAgents = Math.max(this.minAgents, opts.maxAgents ?? Math.max(this.minAgents, 7));
   }
 
-  /** Design a team for a goal. Never throws — falls back to a generic team. */
+  /** Design a team; recover model failures with a generic team, but honor Stop. */
   async designTeam(goal: string, context = '', outputFile = ''): Promise<AgentTeamPlan> {
     const trimmedGoal = goal.trim() || 'Accomplish the boss objective with the highest possible quality.';
     try {
@@ -60,17 +63,18 @@ export class AgentFactory {
         this.opts.designerFallback,
         this._designMessages(trimmedGoal, context),
         'agentFactory',
-        { temperature: 0.4 },
+        { ...this.opts.modelOptions, temperature: 0.4 },
         outputFile,
         []
       );
       const plan = this._normalizeTeam(raw, trimmedGoal);
       // If the model under-staffed or produced junk, top up deterministically.
       if (plan.agents.length < this.minAgents) {
-        return this._mergeWithFallback(plan, trimmedGoal);
+        return this._ensureMandatoryCoverage(this._mergeWithFallback(plan, trimmedGoal), trimmedGoal);
       }
-      return plan;
+      return this._ensureMandatoryCoverage(plan, trimmedGoal);
     } catch (err) {
+      if (err instanceof UserAbortError) { throw err; }
       logWarn(`AgentFactory designer model failed: ${err instanceof Error ? err.message : String(err)}. Using deterministic generic team.`);
       return this._fallbackTeam(trimmedGoal);
     }
@@ -147,6 +151,7 @@ export class AgentFactory {
       fallbackModel,
       tools,
       temperature,
+      teamRole: this._normalizeTeamRole(candidate.teamRole, name, specialty),
     };
   }
 
@@ -158,7 +163,7 @@ export class AgentFactory {
       { name: 'Architect', specialty: 'solution & system design', mission: 'Design the concrete approach, structure and key decisions.', tools: this._toolsIfAvailable(['read_file', 'search', 'find_code_examples']) },
       { name: 'Builder', specialty: 'execution & implementation', mission: 'Produce the actual deliverable (code, content, configuration).', tools: this._toolsIfAvailable(['read_file', 'search', 'apply_patch', 'run_command']) },
       { name: 'Critic', specialty: 'risk, quality & red-teaming', mission: 'Attack the plan and output for flaws, risks and gaps before commit.', tools: this._toolsIfAvailable(['read_file', 'search']) },
-      { name: 'Integrator', specialty: 'synthesis & verification', mission: 'Reconcile the team, verify the result and prepare the final answer.', tools: this._toolsIfAvailable(['read_file', 'run_command', 'search']) },
+      { name: 'Verifier', specialty: 'verification & evidence', mission: 'Independently test claims, enforce completion gates, and prepare an evidence-backed handoff.', tools: this._toolsIfAvailable(['read_file', 'run_command', 'search']) },
     ];
 
     const usedIds = new Set<string>();
@@ -180,6 +185,7 @@ export class AgentFactory {
         fallbackModel: this._pickFallback(model),
         tools: b.tools,
         temperature: b.name === 'Critic' ? 0.2 : 0.4,
+        teamRole: b.name.toLowerCase() as AgentSpec['teamRole'],
       });
     }
 
@@ -206,6 +212,36 @@ export class AgentFactory {
       agents.push({ ...extra, model, fallbackModel: this._pickFallback(model) });
     }
     return { ...plan, agents };
+  }
+
+  /** Preserve bespoke members where possible while guaranteeing all six lenses. */
+  private _ensureMandatoryCoverage(plan: AgentTeamPlan, goal: string): AgentTeamPlan {
+    const required: NonNullable<AgentSpec['teamRole']>[] = [
+      'researcher', 'strategist', 'architect', 'builder', 'critic', 'verifier',
+    ];
+    const fallback = this._fallbackTeam(goal);
+    const selected: AgentSpec[] = [];
+    const selectedIds = new Set<string>();
+    for (const role of required) {
+      const existing = plan.agents.find(agent => agent.teamRole === role && !selectedIds.has(agent.id));
+      const agent = existing ?? fallback.agents.find(candidate => candidate.teamRole === role)!;
+      selected.push(agent);
+      selectedIds.add(agent.id);
+    }
+    for (const agent of plan.agents) {
+      if (selected.length >= this.maxAgents) { break; }
+      if (!selectedIds.has(agent.id)) {
+        selected.push(agent);
+        selectedIds.add(agent.id);
+      }
+    }
+    const usedModels = new Set<string>();
+    const diversified = selected.map(agent => {
+      const model = this._pickModel(agent.model, usedModels);
+      usedModels.add(model);
+      return { ...agent, model, fallbackModel: this._pickFallback(model) };
+    });
+    return { ...plan, agents: diversified };
   }
 
   // ------------------------------------------------------------------
@@ -240,7 +276,8 @@ export class AgentFactory {
       '      "systemPrompt": "full system prompt for this agent",',
       `      "model": "one of: ${this.roster.join(' | ') || 'any'}",`,
       `      "tools": [${this.toolNames.map(t => `"${t}"`).join(', ')}],`,
-      '      "temperature": 0.4',
+      '      "temperature": 0.4,',
+      '      "teamRole": "researcher | strategist | architect | builder | critic | verifier"',
       '    }',
       '  ]',
       '}',
@@ -280,6 +317,25 @@ export class AgentFactory {
   private _pickFallback(model: string): string {
     const other = this.roster.find(m => m !== model);
     return other ?? model;
+  }
+
+  private _normalizeTeamRole(
+    value: AgentSpec['teamRole'] | undefined,
+    name: string,
+    specialty: string
+  ): AgentSpec['teamRole'] | undefined {
+    const roles: NonNullable<AgentSpec['teamRole']>[] = [
+      'researcher', 'strategist', 'architect', 'builder', 'critic', 'verifier',
+    ];
+    if (value && roles.includes(value)) { return value; }
+    const text = `${name} ${specialty}`.toLowerCase();
+    if (/research|analyst|market|domain/.test(text)) { return 'researcher'; }
+    if (/strateg|plan|product/.test(text)) { return 'strategist'; }
+    if (/architect|system design|solution design/.test(text)) { return 'architect'; }
+    if (/build|implement|engineer|developer|execution/.test(text)) { return 'builder'; }
+    if (/critic|risk|red.?team|security/.test(text)) { return 'critic'; }
+    if (/verif|test|quality|integrat|audit/.test(text)) { return 'verifier'; }
+    return undefined;
   }
 
   private _clampTemp(value: unknown): number {

@@ -63,6 +63,11 @@
         "command": "localMultiAgentCoder.openSettingsFile",
         "title": "Local Multi-Agent Coder: Open Settings File",
         "category": "Local Multi-Agent Coder"
+      },
+      {
+        "command": "localMultiAgentCoder.configureYouTube",
+        "title": "Local Multi-Agent Coder: Configure YouTube Connector",
+        "category": "Local Multi-Agent Coder"
       }
     ],
     "viewsContainers": {
@@ -90,13 +95,35 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
     "test": "node --test test/*.test.js test/unit/*.test.js",
-    "lint": "eslint src"
+    "test:vscode": "node test/vscode/runTest.js",
+    "test:e2e:ollama": "node test/e2e_run.js",
+    "test:e2e:brick-breaker": "npm run compile && node test/brick_breaker_e2e.js",
+    "test:e2e:word-addin": "npm run compile && node test/word_addin_e2e.js",
+    "test:e2e:build:ollama": "node test/e2e_run.js --build-only",
+    "resume:auto": "npm run compile && node scripts/run-with-auto-resume.js",
+    "check": "npm run compile && npm run lint && npm test",
+    "check:release": "npm run check && npm run test:vscode",
+    "prepackage:vsix": "npm run check:release",
+    "package:vsix": "vsce package --allow-missing-repository --out dist/local-multi-agent-coder-1.0.1.vsix",
+    "postpackage:vsix": "npm run test:vsix",
+    "test:vsix": "node test/vscode/installVsix.js",
+    "lint": "eslint src",
+    "server": "npm run compile && node out/server/index.js",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:logs": "docker compose logs -f"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.59.4",
     "@typescript-eslint/parser": "^8.59.4",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.9.2",
     "eslint": "^10.4.0",
     "typescript": "^5.3.3"
   }

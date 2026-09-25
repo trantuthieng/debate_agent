@@ -12,6 +12,7 @@ interface ActiveSession {
   startedAt: string;
   stdout: string;
   stderr: string;
+  closed: boolean;
 }
 
 export class TerminalSessionRunner {
@@ -33,9 +34,11 @@ export class TerminalSessionRunner {
     }
 
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const proc = cp.exec(command, {
+    // Own a process group, not just the shell: npm spawns a server grandchild.
+    const proc = cp.spawn(command, {
       cwd: this.workspaceRoot,
-      maxBuffer: 10 * 1024 * 1024,
+      shell: true,
+      detached: process.platform !== 'win32',
     });
 
     const session: ActiveSession = {
@@ -45,19 +48,25 @@ export class TerminalSessionRunner {
       startedAt: new Date().toISOString(),
       stdout: '',
       stderr: '',
+      closed: false,
     };
     this.sessions.set(id, session);
 
     proc.stdout?.on('data', chunk => {
-      session.stdout += String(chunk);
+      session.stdout = (session.stdout + String(chunk)).slice(-1_000_000);
       this._appendSessionLog(id, String(chunk));
     });
     proc.stderr?.on('data', chunk => {
-      session.stderr += String(chunk);
+      session.stderr = (session.stderr + String(chunk)).slice(-1_000_000);
       this._appendSessionLog(id, String(chunk));
     });
     proc.on('close', () => {
+      session.closed = true;
       this._appendSessionLog(id, `\n[session closed at ${new Date().toISOString()}]\n`);
+    });
+    proc.on('error', error => {
+      session.closed = true;
+      session.stderr += `\n${error.message}`;
     });
 
     return id;
@@ -66,7 +75,7 @@ export class TerminalSessionRunner {
   read(sessionId: string, maxChars = 12_000): string {
     const session = this.sessions.get(sessionId);
     if (!session) { return ''; }
-    const combined = `${session.stdout}\n${session.stderr}`.trim();
+    const combined = `${session.stdout}\n${session.stderr}${session.closed ? '\n[session closed]' : ''}`.trim();
     return combined.length > maxChars ? combined.slice(-maxChars) : combined;
   }
 
@@ -74,7 +83,15 @@ export class TerminalSessionRunner {
     const session = this.sessions.get(sessionId);
     if (!session) { return false; }
     try {
-      session.process.kill();
+      if (session.process.pid && process.platform !== 'win32') {
+        process.kill(-session.process.pid, 'SIGTERM');
+        // Escalate only the group owned by this session if descendants ignore TERM.
+        const groupId = session.process.pid;
+        const timer = setTimeout(() => { try { process.kill(-groupId, 'SIGKILL'); } catch { /* exited */ } }, 2_000);
+        timer.unref();
+      } else if (session.process.pid) {
+        cp.spawn('taskkill', ['/pid', String(session.process.pid), '/T', '/F'], { windowsHide: true }).on('error', () => {});
+      } else { session.process.kill(); }
     } catch {
       // Non-fatal: the process may already be gone.
     }

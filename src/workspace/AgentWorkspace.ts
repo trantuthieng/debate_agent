@@ -3,6 +3,7 @@ import * as path from 'path';
 import type { ModelConfig, ProjectState, StructuredMemoryEvent } from '../types';
 import { prettyJson } from '../utils/json';
 import { logInfo } from '../utils/logging';
+import { withFsRetry, writeFileAtomic } from '../utils/atomicFile';
 
 // -----------------------------------------------------------------------
 // Default model configuration
@@ -14,13 +15,16 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
   autonomousMode: true,
   askPolicy: 'never',
   debateRounds: 3,
+  maxDevelopmentSprints: 5,
   maxFixRetries: 8,
   autoInstallDependencies: true,
   artifactDir: 'dist',
   createFinalArchive: true,
   requireVerificationScripts: true,
+  allowSelfWorkspace: false,
   selfHealing: {
     enabled: true,
+    allowProductTemplates: false,
     modelCallRetries: 2,
     retryDelayMs: 5_000,
     alternateModelLimit: 3,
@@ -44,11 +48,24 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
       'typescriptlang.org',
     ],
   },
+  assetLibrary: {
+    enabled: false,
+    maxResults: 8,
+    maxBytes: 5_000_000,
+    allowedLicenses: ['cc0', 'pdm', 'by', 'by-sa'],
+  },
+  resourceGuard: {
+    enabled: true,
+    minFreeMemoryPercent: 10,
+    topProcessCount: 5,
+    // Optional app-closing flow; normal runs rely on the OS pressure guard.
+    targetFreeGb: 0,
+  },
   appVerification: {
     enabled: true,
     startServer: true,
     httpSmokeTest: true,
-    browserSmokeTest: false,
+    browserSmokeTest: true,
   },
   githubIntegration: {
     enabled: true,
@@ -74,8 +91,8 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
       fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
     brainstorm: {
-      model: 'qwen3-coder:30b',
-      fallbackModel: 'devstral-small-2',
+      model: 'devstral-small-2',
+      fallbackModel: 'mistral-small3.2:24b',
     },
     critic: {
       model: 'deepseek-coder-v2:16b',
@@ -87,15 +104,15 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
     },
     architect: {
       model: 'devstral-small-2',
-      fallbackModel: 'qwen3-coder:30b',
+      fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
     taskManager: {
       model: 'qwen2.5-coder:14b-instruct',
-      fallbackModel: 'qwen3-coder:30b',
+      fallbackModel: 'gemma3:12b',
     },
     codeWorker: {
       model: 'qwen2.5-coder:14b-instruct',
-      fallbackModel: 'qwen3-coder:30b',
+      fallbackModel: 'devstral-small-2',
     },
     reviewer: {
       model: 'deepseek-coder-v2:16b',
@@ -107,11 +124,11 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
     },
     fixer: {
       model: 'qwen2.5-coder:14b-instruct',
-      fallbackModel: 'qwen3-coder:30b',
+      fallbackModel: 'devstral-small-2',
     },
     finalIntegrator: {
       model: 'devstral-small-2',
-      fallbackModel: 'qwen3-coder:30b',
+      fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
   },
 };
@@ -157,6 +174,7 @@ export class AgentWorkspace {
   get projectStatePath(): string   { return path.join(this.agentDir, 'project_state.json'); }
   get userPromptPath(): string     { return path.join(this.agentDir, 'user_prompt.md'); }
   get modelConfigPath(): string    { return path.join(this.agentDir, 'model_config.json'); }
+  get runLockPath(): string        { return path.join(this.agentDir, 'run.lock'); }
 
   get memoryDir(): string          { return path.join(this.agentDir, 'memory'); }
   get rollingSummaryPath(): string { return path.join(this.memoryDir, 'rolling_summary.md'); }
@@ -176,6 +194,8 @@ export class AgentWorkspace {
   get taskResultsPath(): string    { return path.join(this.tasksDir, 'task_results.json'); }
 
   get ollamaCallsLogPath(): string { return path.join(this.logsDir, 'ollama_calls.jsonl'); }
+  get modelReadinessPath(): string { return path.join(this.logsDir, 'model_readiness.json'); }
+  get verificationPlanPath(): string { return path.join(this.logsDir, 'verification_plan.json'); }
   get terminalLogPath(): string    { return path.join(this.logsDir, 'terminal.log'); }
   get testResultLogPath(): string  { return path.join(this.logsDir, 'test_result.log'); }
   get dependencyInstallLogPath(): string { return path.join(this.logsDir, 'dependency_install.log'); }
@@ -235,23 +255,23 @@ export class AgentWorkspace {
 
     for (const dir of dirs) {
       if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+        withFsRetry(() => fs.mkdirSync(dir, { recursive: true }));
         logInfo(`Created directory: ${dir}`);
       }
     }
 
     // Create default model_config.json only if it doesn't exist
     if (!fs.existsSync(this.modelConfigPath)) {
-      fs.writeFileSync(this.modelConfigPath, prettyJson(DEFAULT_MODEL_CONFIG), 'utf8');
+      withFsRetry(() => fs.writeFileSync(this.modelConfigPath, prettyJson(DEFAULT_MODEL_CONFIG), 'utf8'));
       logInfo('Created default model_config.json');
     } else {
-      fs.writeFileSync(this.modelConfigPath, prettyJson(this.readModelConfig()), 'utf8');
+      withFsRetry(() => fs.writeFileSync(this.modelConfigPath, prettyJson(this.readModelConfig()), 'utf8'));
       logInfo('Updated model_config.json with current defaults');
     }
 
     // Create default project_state.json only if it doesn't exist
     if (!fs.existsSync(this.projectStatePath)) {
-      fs.writeFileSync(this.projectStatePath, prettyJson(createDefaultProjectState()), 'utf8');
+      withFsRetry(() => fs.writeFileSync(this.projectStatePath, prettyJson(createDefaultProjectState()), 'utf8'));
       logInfo('Created default project_state.json');
     }
 
@@ -266,7 +286,7 @@ export class AgentWorkspace {
 
     for (const [filePath, content] of memoryFiles) {
       if (!fs.existsSync(filePath)) {
-        fs.writeFileSync(filePath, content, 'utf8');
+        withFsRetry(() => fs.writeFileSync(filePath, content, 'utf8'));
       }
     }
 
@@ -291,7 +311,7 @@ export class AgentWorkspace {
 
   writeProjectState(state: ProjectState): void {
     state.updatedAt = new Date().toISOString();
-    fs.writeFileSync(this.projectStatePath, prettyJson(state), 'utf8');
+    writeFileAtomic(this.projectStatePath, prettyJson(state));
   }
 
   // ------------------------------------------------------------------
@@ -299,48 +319,56 @@ export class AgentWorkspace {
   // ------------------------------------------------------------------
 
   readModelConfig(): ModelConfig {
+    const defaults = JSON.parse(JSON.stringify(DEFAULT_MODEL_CONFIG)) as ModelConfig;
     if (!fs.existsSync(this.modelConfigPath)) {
-      return DEFAULT_MODEL_CONFIG;
+      return defaults;
     }
     try {
       const raw = fs.readFileSync(this.modelConfigPath, 'utf8');
       const parsed = JSON.parse(raw) as Partial<ModelConfig>;
       // Merge with defaults so new fields are always present
       const merged: ModelConfig = {
-        ...DEFAULT_MODEL_CONFIG,
+        ...defaults,
         ...parsed,
-        agents: { ...DEFAULT_MODEL_CONFIG.agents, ...(parsed.agents ?? {}) },
-        selfHealing: { ...DEFAULT_MODEL_CONFIG.selfHealing, ...(parsed.selfHealing ?? {}) },
-        commandPolicy: { ...DEFAULT_MODEL_CONFIG.commandPolicy, ...(parsed.commandPolicy ?? {}) },
-        webSearch: { ...DEFAULT_MODEL_CONFIG.webSearch, ...(parsed.webSearch ?? {}) },
-        appVerification: { ...DEFAULT_MODEL_CONFIG.appVerification, ...(parsed.appVerification ?? {}) },
-        githubIntegration: { ...DEFAULT_MODEL_CONFIG.githubIntegration, ...(parsed.githubIntegration ?? {}) },
-        skills: { ...DEFAULT_MODEL_CONFIG.skills, ...(parsed.skills ?? {}) },
-        toolCalling: { ...DEFAULT_MODEL_CONFIG.toolCalling, ...(parsed.toolCalling ?? {}) },
-        defaultOptions: { ...DEFAULT_MODEL_CONFIG.defaultOptions, ...(parsed.defaultOptions ?? {}) },
+        agents: { ...defaults.agents, ...(parsed.agents ?? {}) },
+        selfHealing: { ...defaults.selfHealing, ...(parsed.selfHealing ?? {}) },
+        commandPolicy: { ...defaults.commandPolicy, ...(parsed.commandPolicy ?? {}) },
+        webSearch: { ...defaults.webSearch, ...(parsed.webSearch ?? {}) },
+        assetLibrary: { ...defaults.assetLibrary, ...(parsed.assetLibrary ?? {}) },
+        resourceGuard: { ...defaults.resourceGuard, ...(parsed.resourceGuard ?? {}) },
+        appVerification: { ...defaults.appVerification, ...(parsed.appVerification ?? {}) },
+        githubIntegration: { ...defaults.githubIntegration, ...(parsed.githubIntegration ?? {}) },
+        skills: { ...defaults.skills, ...(parsed.skills ?? {}) },
+        toolCalling: { ...defaults.toolCalling, ...(parsed.toolCalling ?? {}) },
+        defaultOptions: { ...defaults.defaultOptions, ...(parsed.defaultOptions ?? {}) },
       };
-      merged.debateRounds = Math.max(1, Math.min(10, Number(merged.debateRounds) || DEFAULT_MODEL_CONFIG.debateRounds));
+      merged.debateRounds = Math.max(1, Math.min(10, Number(merged.debateRounds) || defaults.debateRounds));
+      merged.maxDevelopmentSprints = Math.max(1, Math.min(20, Number(merged.maxDevelopmentSprints) || defaults.maxDevelopmentSprints || 5));
       const maxFixRetries = Number(merged.maxFixRetries);
       const requestTimeoutMs = Number(merged.requestTimeoutMs);
       const modelCallRetries = Number(merged.selfHealing.modelCallRetries);
       const retryDelayMs = Number(merged.selfHealing.retryDelayMs);
       const alternateModelLimit = Number(merged.selfHealing.alternateModelLimit);
       const compactContextChars = Number(merged.selfHealing.compactContextChars);
-      merged.maxFixRetries = Number.isFinite(maxFixRetries) ? Math.max(0, Math.min(20, maxFixRetries)) : DEFAULT_MODEL_CONFIG.maxFixRetries;
-      merged.requestTimeoutMs = Number.isFinite(requestTimeoutMs) ? Math.max(30_000, requestTimeoutMs) : DEFAULT_MODEL_CONFIG.requestTimeoutMs;
-      merged.selfHealing.modelCallRetries = Number.isFinite(modelCallRetries) ? Math.max(0, Math.min(5, modelCallRetries)) : DEFAULT_MODEL_CONFIG.selfHealing.modelCallRetries;
-      merged.selfHealing.retryDelayMs = Number.isFinite(retryDelayMs) ? Math.max(0, retryDelayMs) : DEFAULT_MODEL_CONFIG.selfHealing.retryDelayMs;
-      merged.selfHealing.alternateModelLimit = Number.isFinite(alternateModelLimit) ? Math.max(0, Math.min(10, alternateModelLimit)) : DEFAULT_MODEL_CONFIG.selfHealing.alternateModelLimit;
-      merged.selfHealing.compactContextChars = Number.isFinite(compactContextChars) ? Math.max(2_000, compactContextChars) : DEFAULT_MODEL_CONFIG.selfHealing.compactContextChars;
-      merged.webSearch!.maxResults = Math.max(1, Math.min(10, Number(merged.webSearch!.maxResults) || DEFAULT_MODEL_CONFIG.webSearch!.maxResults));
-      merged.toolCalling!.maxToolRounds = Math.max(1, Math.min(12, Number(merged.toolCalling!.maxToolRounds) || DEFAULT_MODEL_CONFIG.toolCalling!.maxToolRounds));
+      merged.maxFixRetries = Number.isFinite(maxFixRetries) ? Math.max(0, Math.min(20, maxFixRetries)) : defaults.maxFixRetries;
+      merged.requestTimeoutMs = Number.isFinite(requestTimeoutMs) ? Math.max(30_000, requestTimeoutMs) : defaults.requestTimeoutMs;
+      merged.selfHealing.modelCallRetries = Number.isFinite(modelCallRetries) ? Math.max(0, Math.min(5, modelCallRetries)) : defaults.selfHealing.modelCallRetries;
+      merged.selfHealing.retryDelayMs = Number.isFinite(retryDelayMs) ? Math.max(0, retryDelayMs) : defaults.selfHealing.retryDelayMs;
+      merged.selfHealing.alternateModelLimit = Number.isFinite(alternateModelLimit) ? Math.max(0, Math.min(10, alternateModelLimit)) : defaults.selfHealing.alternateModelLimit;
+      merged.selfHealing.compactContextChars = Number.isFinite(compactContextChars) ? Math.max(2_000, compactContextChars) : defaults.selfHealing.compactContextChars;
+      merged.webSearch!.maxResults = Math.max(1, Math.min(10, Number(merged.webSearch!.maxResults) || defaults.webSearch!.maxResults));
+      merged.assetLibrary!.maxResults = Math.max(1, Math.min(20, Number(merged.assetLibrary!.maxResults) || defaults.assetLibrary!.maxResults));
+      merged.assetLibrary!.maxBytes = Math.max(1, Math.min(10_000_000, Number(merged.assetLibrary!.maxBytes) || defaults.assetLibrary!.maxBytes));
+      merged.resourceGuard!.minFreeMemoryPercent = Math.max(0, Math.min(90, Number(merged.resourceGuard!.minFreeMemoryPercent) || defaults.resourceGuard!.minFreeMemoryPercent));
+      merged.resourceGuard!.topProcessCount = Math.max(1, Math.min(20, Number(merged.resourceGuard!.topProcessCount) || defaults.resourceGuard!.topProcessCount));
+      merged.toolCalling!.maxToolRounds = Math.max(1, Math.min(12, Number(merged.toolCalling!.maxToolRounds) || defaults.toolCalling!.maxToolRounds));
       if (merged.autonomousMode || merged.askPolicy === 'never') {
         merged.safeMode = false;
         merged.askPolicy = 'never';
       }
       return merged;
     } catch {
-      return DEFAULT_MODEL_CONFIG;
+      return defaults;
     }
   }
 
@@ -354,19 +382,24 @@ export class AgentWorkspace {
   }
 
   writeFile(filePath: string, content: string): void {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
-    fs.writeFileSync(filePath, content, 'utf8');
+    writeFileAtomic(filePath, content);
   }
 
   appendFile(filePath: string, content: string): void {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
-    fs.appendFileSync(filePath, content, 'utf8');
+    withFsRetry(() => {
+      const dir = path.dirname(filePath);
+      if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
+      fs.appendFileSync(filePath, content, 'utf8');
+    });
   }
 
   fileExists(filePath: string): boolean {
     return fs.existsSync(filePath);
+  }
+
+  /** Best-effort delete — a checkpoint superseded by a completed artifact is not worth failing the run over. */
+  deleteFile(filePath: string): void {
+    try { fs.unlinkSync(filePath); } catch { /* already gone, or never existed */ }
   }
 
   /**

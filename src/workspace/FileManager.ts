@@ -22,6 +22,7 @@ export class FileManager {
     const fullPath = this._resolve(relativePath);
     if (!fs.existsSync(fullPath)) { return null; }
     try {
+      if (fs.statSync(fullPath).isDirectory()) { return null; }
       return fs.readFileSync(fullPath, 'utf8');
     } catch (err) {
       logWarn(`Could not read file "${relativePath}": ${err instanceof Error ? err.message : err}`);
@@ -95,6 +96,12 @@ export class FileManager {
 
     for (const change of changes) {
       const normalizedPath = change.path.replace(/\\/g, '/');
+      if (normalizedPath.endsWith('/')) {
+        // A directory-only scaffold entry (e.g. "src/") has no content to
+        // conflict with — re-"creating" a directory that already exists
+        // (routine across sprints of an iterative build) is always safe.
+        continue;
+      }
       const baseline = baselines?.get(normalizedPath);
       const current = this.getFileSnapshot(normalizedPath);
 
@@ -332,6 +339,29 @@ export class FileManager {
     switch (change.action) {
       case 'create':
       case 'modify':
+        if (change.path.endsWith('/')) {
+          // A directory-only scaffold entry (e.g. "src/" from a project
+          // structure list) — a model has produced this as a literal file
+          // path before. Create the directory itself; writing it as an empty
+          // file would break every real file later written inside it
+          // (ENOTDIR) and can never be recovered without deleting the file.
+          if (content.trim() || change.patch) {
+            throw new Error('A directory entry cannot contain file content or a patch.');
+          }
+          if (fs.existsSync(fullPath)) {
+            const existing = fs.lstatSync(fullPath);
+            if (!existing.isDirectory()) {
+              // Recover the exact zero-byte placeholder from an earlier run;
+              // never discard meaningful file content or follow a symlink.
+              if (!existing.isFile() || existing.size !== 0) {
+                throw new Error('Cannot replace a non-empty file or symlink with a directory.');
+              }
+              fs.unlinkSync(fullPath);
+            }
+          }
+          this.ensureDirectory(fullPath);
+          break;
+        }
         this.ensureDirectory(path.dirname(fullPath));
         fs.writeFileSync(fullPath, content, 'utf8');
         break;

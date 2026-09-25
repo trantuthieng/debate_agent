@@ -1,322 +1,219 @@
-<div align="center">
+# Local Multi-Agent Coder
 
-# 🤖 Local Multi-Agent Coder
+A VS Code extension that turns one boss prompt into a runtime-designed local agent team, a four-round debate, an implementation plan, reviewed code, artifact-aware verification, and an evidence-backed delivery report. Models run locally through Ollama.
 
-**One prompt in. A finished, verified software project out — debated, cross-checked, and built entirely by local LLMs through Ollama, inside VS Code.**
+## Autonomous workflow
 
-🇻🇳 *Một câu lệnh của boss → các agent local tự tranh luận, kiểm tra chéo và xây ra sản phẩm hoàn chỉnh. Không cloud, không API key, không rò rỉ dữ liệu.*
+The sidebar **Start** action always runs the autonomous entry point:
 
-[![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85-blue?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Ollama](https://img.shields.io/badge/Ollama-local%20LLM-black?logo=ollama)](https://ollama.com/)
-[![Tests](https://img.shields.io/badge/tests-62%20passing-brightgreen)](#-running-tests)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+1. Runtime preflight reads Ollama's installed inventory and calls candidate models sequentially.
+2. At least five distinct, responsive local models are selected. The workflow stops before debate if fewer than five qualify.
+3. A meta-agent staffs six required responsibilities: researcher, strategist, architect, builder, critic, and verifier.
+4. The team completes four dependent rounds: independent proposals, cross-critique, author revisions, then weighted independent scoring.
+5. The verdict becomes the authoritative input to architecture, task planning, coding, review, and testing.
+6. Verification is planned from the generated artifact's actual stack. Web products are built and opened in a real headless browser; failed commands, startup errors, broken resources, JavaScript exceptions, placeholder tests, missing deliverables, and unfinished work block completion.
 
-</div>
+Dependency conflicts are repaired using the package manager's actual error output and verified by reinstalling. The workflow saves a checkpoint before each implementation phase. **Resume** continues failed or stopped runs from that checkpoint, preserving existing code. Reaching the sprint limit while work remains produces a failed/incomplete state, never a success report.
 
----
+Resume preserves the autonomous debate/build mode, retries failed and skipped coding tasks, and reruns verification before a resumed retrospective. A worker that proposes no changes can submit existing task files for ordinary review; this does not automatically mark the task complete.
 
-## ✨ What is this?
+Runtime evidence is stored under `.agent-workspace/`, including:
 
-**Local Multi-Agent Coder** is a VS Code extension that turns a single instruction into a working software project. Behind the scenes, a team of specialized AI agents — each running on a **different local model** via [Ollama](https://ollama.com/) — **debate** the approach, **vote** on the best plan, write the code, **cross-check each other's work**, run the tests, and keep iterating until the product is genuinely done.
+- `.agent-workspace/agents/dynamic_team_plan.json`
+- `.agent-workspace/agents/dynamic_team_debate.md`
+- `.agent-workspace/agents/dynamic_team_decision.json`
+- `.agent-workspace/logs/model_readiness.json`
+- `.agent-workspace/logs/verification_plan.json`
+- `.agent-workspace/logs/test_result.log`
+- `.agent-workspace/delivery_manifest.json`
 
-It is built around three principles:
+The legacy `AgentOrchestrator.start()` method is retained for focused maintenance callers. Sidebar prompts and the `Autonomous Goal` command use `runAutonomousGoal()`.
 
-- **🎯 Highest possible output quality.** Nothing ships until multiple independent models agree it is production-ready.
-- **🙋 Minimal human intervention.** Ideally the boss gives one instruction; the agents resolve every ambiguity with explicit assumptions instead of asking questions.
-- **🏠 Fully local.** Designed to run on modest hardware (e.g. a **Mac mini M4, 24 GB RAM**). No API keys, no cloud, no data leaving your machine.
+## Requirements
 
-> Give it a prompt like _"Build a relaxing instrumental-music YouTube channel: research the niche, produce the code, the strategy, and auto-upload"_ — and the agents research, debate, and execute. The only thing they'll ask you for is something they genuinely cannot self-provide, like a YouTube API key.
+- VS Code 1.85 or newer
+- Node.js 22 or newer for development and Extension Host automation
+- Ollama reachable at the configured `ollamaBaseUrl`
+- At least five distinct installed chat/code models that pass a short readiness call
+- Sufficient free disk and memory for the selected models
 
----
+Models run sequentially, including code-generation waves. The client releases the previous model before switching and bounds context using the model's native capacity, weight size, attention cache estimate, and physical RAM. This allows larger models to use available memory without trying to keep the whole debate team resident together. The OS memory-pressure guard still applies; estimates are not proof that every model will fit alongside other apps.
 
-## 🧠 The Debate Engine
+The default roster uses Devstral Small 2, Qwen2.5 Coder 14B/7B, DeepSeek Coder V2 16B, Mistral Small 3.2, and Gemma 3 12B. Automatic discovery excludes embedding models and the locally unstable `qwen3-coder:30b`; explicit configuration can opt back into that model. Matching model digests do not count twice toward debate diversity.
 
-This is the heart of the project. **Before a single line of code is written**, the approach goes through a full multi-round, multi-model debate so the team converges on the strongest plan:
-
-```
-                          ┌─────────────────────────────────────────────┐
-   User Prompt ──────────►│            🧠 DEBATE  (no code yet)          │
-                          └─────────────────────────────────────────────┘
-        │
-        ▼
-   💡 Round 1 — Proposal            Brainstorm model proposes the approach
-        │
-        ▼
-   🔍 Round 2 — Cross-critique      Critic (N rounds) + Product/UX (N rounds)
-        │                           challenge the proposal from every angle
-        ▼
-   🗣️  Round 3 — Response           The proposer answers every critique
-        │                           and converges on one coherent direction
-        ▼
-   ⚖️  Round 4 — Score & Vote       A panel of 5 DIFFERENT models scores the
-        │                           approach (feasibility, completeness, risk,
-        │                           UX, quality) and votes on the winner
-        ▼
-   🧠 Project Brief                 The winning direction is frozen into an
-                                    executable brief
-```
-
-Then the build begins — in small, verifiable sprints:
-
-```
-   🏛️  Architect      Locks the tech stack, structure, and data models
-        │
-        ▼
-   📋 Task Manager    Splits the work into small, dependency-ordered tasks
-        │
-        ▼
-   ┌──────────────────── per-task loop ────────────────────┐
-   │ ⚙️  Code Worker    LLM A writes the code               │
-   │      │                                                 │
-   │      ▼                                                 │
-   │ 🔎 Reviewer       LLM B checks task acceptance         │
-   │      │                                                 │
-   │      ▼                                                 │
-   │ 🕵️  Quality Audit  LLM C (independent, stronger) audits │
-   │      │            overall production quality           │
-   │      ▼                                                 │
-   │ 🔧 Fixer          Repeats until B *and* C are satisfied│
-   └────────────────────────────────────────────────────────┘
-        │
-        ▼
-   🧪 Tester          Runs compile/tests, self-heals failures
-        │
-        ▼
-   🤝 Retrospective   3 models vote: ship, or run another sprint?
-        │
-        ▼
-   📦 Delivery  →  📊 Final Report  →  ✅ Done
-```
-
----
-
-## 🌟 Key Features
-
-| Feature | Description |
-|---|---|
-| 🔒 **100% Local** | Every model runs via Ollama — your code never leaves your machine |
-| 🧬 **Agent-Creates-Agents** | From one goal, a **meta-agent designs a bespoke specialist team** (each with its own model, prompt and tools), debates it to a verdict, then **hands the winning direction to the build pipeline** — one command → finished product, generic to any domain |
-| 🌐 **Governed Research** | Opt-in web search + public GitHub/GitLab repo reading, with cited, freshness-stamped findings, available on demand to any agent |
-| ⚖️ **4-Round Scored Debate** | Propose → cross-critique → respond → a **5-model panel scores and votes** on the best direction before any code is written |
-| 🕵️ **3-Model Code Cross-Check** | One model writes, a second reviews task acceptance, a third (independent, stronger) audits overall quality — the fix loop repeats **until all are satisfied** |
-| 📔 **Live Work Journal** | Auto-generates `AGENT_JOURNAL.md` — a timestamped, icon-tagged log of every thought, critique, decision, task, and report. The main **boss ⇄ agents** communication channel |
-| 🤝 **Multi-Model by Design** | Each role is bound to a distinct model, so debate and review bring genuinely independent perspectives |
-| 🔁 **Sprint Retrospectives** | After each sprint, models vote on whether the product is complete or needs another pass |
-| 🔄 **Self-Healing** | Automatically retries with fallback/alternate models, compacts context, and recovers from bad output |
-| 🧠 **Memory & Audit Trail** | Rolling summary, decisions, assumptions, lessons learned, and full call/terminal logs under `.agent-workspace/` |
-| 🌿 **Git-Aware** | Reads a snapshot of your repo and shares it with every agent |
-| 🛠️ **Tool-Using Agents** | Agents can read files, search the repo, run safe commands, apply patches, and fetch URLs |
-| 🛡️ **Command Safety Policy** | Dangerous commands and out-of-workspace writes require approval; safe build/test commands run automatically |
-| 💾 **Hardware-Aware** | Tuned model keep-alive and context budgets to fit constrained RAM (e.g. 24 GB) |
-
----
-
-## 📦 Requirements
-
-- [VS Code](https://code.visualstudio.com/) `^1.85`
-- [Ollama](https://ollama.com/) installed and running locally
-- The local models referenced in your config pulled ahead of time. The default roster, for example:
-  ```bash
-  ollama pull qwen3-coder:30b
-  ollama pull deepseek-coder-v2:16b
-  ollama pull qwen2.5-coder:14b-instruct
-  ollama pull qwen2.5-coder:7b-instruct
-  ollama pull devstral-small-2
-  ```
-  > 💡 On 24 GB machines, prefer a roster you can actually keep resident. Every role can fall back to a smaller model, and you can point all roles at one or two models if you're tight on RAM.
-
----
-
-## 🛠️ Installation & Setup
-
-1. **Clone and install**
-   ```bash
-   git clone https://github.com/trantuthieng/debate_agent.git
-   cd debate_agent
-   npm install
-   ```
-
-2. **Compile**
-   ```bash
-   npm run compile
-   ```
-
-3. **Launch in VS Code**
-   - Press `F5` to open the Extension Development Host
-   - Click the 🤖 icon in the Activity Bar to open the **Agent Coder** panel
-
-4. **Configure your models** in `.agent-workspace/model_config.json` (see [Configuration](#️-configuration))
-
----
-
-## 🎮 Usage
-
-1. Open the **Agent Coder** panel from the Activity Bar.
-2. Type what you want built — one clear instruction is enough.
-3. Click **Start** and watch the timeline, agent activity, and debate unfold in real time.
-4. Follow along in **`AGENT_JOURNAL.md`** (created at the workspace root) for the full narrative.
-5. Review the generated files, the final report, and the audit trail in `.agent-workspace/`.
-
-### Available Commands
-
-| Command | Description |
-|---|---|
-| `Local Multi-Agent Coder: Open Panel` | Open the main UI |
-| `Local Multi-Agent Coder: Start New Project` | Start a fresh generation |
-| `Local Multi-Agent Coder: Design Agent Team (Agent-Creates-Agents)` | From one goal, a meta-agent designs a specialist team and debates it to a verdict |
-| `Local Multi-Agent Coder: Autonomous Goal (Design → Debate → Build)` | One command → finished product: the team self-organizes, debates, then builds & verifies it |
-| `Local Multi-Agent Coder: Resume Workflow` | Continue an interrupted run |
-| `Local Multi-Agent Coder: Stop Workflow` | Abort the current run |
-| `Local Multi-Agent Coder: Show Agent Notes` | View agent reasoning & decisions |
-| `Local Multi-Agent Coder: Open Settings File` | Edit model configuration |
-
----
-
-## 📔 The Work Journal
-
-Every run writes **`AGENT_JOURNAL.md`** to the workspace root — a human-readable, chronological log (newest at the bottom) that doubles as the communication channel between you and the agents:
-
-```markdown
-# 🤖 Agent Work Journal
-
-### 🚀 Workflow started — route: full_project
-`2026-06-14 09:12:03 UTC` · **system**
-
-### 💡 Round 1 — Initial proposal
-`2026-06-14 09:12:48 UTC` · **brainstorm**
-> Core goal, suggested architecture, risks…
-
-### 🔍 Round 2 — Critique (round 1/3)
-`2026-06-14 09:14:10 UTC` · **critic**
-> Missing requirements, security concerns…
-
-### ⚖️ Round 4 — Panel verdict: 8.4/10 (high agreement)
-`2026-06-14 09:21:55 UTC` · **debate-panel**
-> Winning direction + ranked recommendations…
-
-### 🕵️ Quality audit for task-003
-`2026-06-14 09:40:12 UTC` · **quality-auditor**
-> ✅ Passed holistic quality audit.
-```
-
-Icons map to the moment: 🚀 start · 💡 propose · 🔍 critique · 🎨 product · 🗣️ respond · ⚖️ vote · 🧠 brief · 🏛️ architecture · 📋 plan · ⚙️ code · 🔎 review · 🕵️ audit · 🔧 fix · 🧪 test · 🤝 retrospective · 📊 report · ✅ done · ⚠️ warn · ❌ error.
-
----
-
-## 🗂️ Project Structure
-
-```
-src/
-├── 📄 extension.ts              # Extension entry point
-├── 🏛️  orchestrator/             # AgentOrchestrator — the brain (debate, sprints, cross-check)
-├── 🧬 dynamic/                  # Agent-that-creates-agents (AgentFactory, DynamicAgent, DynamicTeam)
-├── 🤖 ollama/                   # Ollama API client (timeouts, fallback, keep-alive)
-├── 💬 prompts/                  # System prompts per agent role
-├── 📦 types.ts                  # TypeScript interfaces & types
-├── ⚙️  services/                 # Verification, patches, search, research, web/github fetch…
-├── 🧰 tools/                    # Autonomous tool registry (read/search/run/patch/fetch/research)
-├── 🖥️  terminal/                 # Command runner + safety policy + approval
-├── 🗃️  workspace/                # File manager, agent workspace, the work journal
-├── 🧠 context/                  # Context cache & budget assembly
-├── 🌿 git/                      # Repo snapshot reader
-├── 🌐 webview/                  # Sidebar panel UI
-└── 🔧 utils/                    # Helpers (json, errors, logging…)
-
-test/
-├── 🧪 unit/                     # Unit tests (capabilities, research, policy…)
-└── 🔗 orchestrator.test.js      # Debate scoring, panel diversity, consensus, recovery…
-
-.agent-workspace/               # Per-run state (gitignored, except model_config.json)
-├── memory/                     # rolling summary, decisions, assumptions, lessons
-├── agents/                     # every agent note + debate rounds + scores
-├── tasks/                      # task plan & results
-├── patches/                    # applied-patch audit trail
-└── logs/                       # ollama calls, terminal, workflow logs
-AGENT_JOURNAL.md                # human-readable run journal (gitignored)
-```
-
----
-
-## ⚙️ Configuration
-
-Everything is driven by `.agent-workspace/model_config.json`. Assign a distinct model (and fallback) to each role, tune the debate, self-healing, and command safety:
-
-```jsonc
-{
-  "ollamaBaseUrl": "http://localhost:11434",
-  "requestTimeoutMs": 600000,
-
-  "autonomousMode": true,      // run end-to-end without approval prompts
-  "safeMode": false,           // ⚠️ forced off while autonomousMode is on
-  "askPolicy": "never",        // resolve ambiguity with assumptions, don't ask
-
-  "debateRounds": 3,           // inner rounds for the critic & product debate
-  "maxFixRetries": 8,          // quality over speed: keep fixing until clean
-  "autoInstallDependencies": true,
-  "requireVerificationScripts": true,
-
-  "selfHealing": {
-    "enabled": true,
-    "modelCallRetries": 2,
-    "retryDelayMs": 5000,
-    "alternateModelLimit": 3,
-    "compactContextChars": 12000
-  },
-
-  "commandPolicy": {
-    "approvedPrefixes": [],
-    "requireApprovalForNetwork": true,
-    "requireApprovalForExternalWrites": true
-  },
-
-  "defaultOptions": { "temperature": 0.1, "num_ctx": 8192, "top_p": 0.9 },
-
-  "agents": {
-    "briefBuilder":     { "model": "devstral-small-2",            "fallbackModel": "qwen2.5-coder:14b-instruct" },
-    "brainstorm":       { "model": "qwen3-coder:30b",             "fallbackModel": "devstral-small-2" },
-    "critic":           { "model": "deepseek-coder-v2:16b",       "fallbackModel": "qwen2.5-coder:14b-instruct" },
-    "secondBrainstorm": { "model": "qwen2.5-coder:14b-instruct",  "fallbackModel": "qwen2.5-coder:7b-instruct" },
-    "architect":        { "model": "devstral-small-2",            "fallbackModel": "qwen3-coder:30b" },
-    "taskManager":      { "model": "qwen2.5-coder:14b-instruct",  "fallbackModel": "qwen3-coder:30b" },
-    "codeWorker":       { "model": "qwen2.5-coder:14b-instruct",  "fallbackModel": "qwen3-coder:30b" },
-    "reviewer":         { "model": "deepseek-coder-v2:16b",       "fallbackModel": "qwen2.5-coder:14b-instruct" },
-    "tester":           { "model": "qwen2.5-coder:7b-instruct",   "fallbackModel": "qwen2.5-coder:14b-instruct" },
-    "fixer":            { "model": "qwen2.5-coder:14b-instruct",  "fallbackModel": "qwen3-coder:30b" },
-    "finalIntegrator":  { "model": "devstral-small-2",            "fallbackModel": "qwen3-coder:30b" }
-  }
-}
-```
-
-**Notes**
-- The **quality auditor** (the 3rd cross-check model) reuses the strongest role — `brainstorm` — so the audit is independent of the code writer and task reviewer.
-- The **scoring panel** uses 5 distinct role models: `brainstorm`, `critic`, `secondBrainstorm`, `architect`, `reviewer`.
-- `autonomousMode: true` disables `safeMode` and approval prompts — intended for hands-off runs. Set it to `false` (and `askPolicy: "allow"`) if you want approval gates.
-- Tight on RAM? Point several roles at the same model; the debate/cross-check logic still works, just with less model diversity.
-
----
-
-## 🧪 Running Tests
+Install models with commands such as:
 
 ```bash
-npm test          # unit + integration + orchestrator tests
+ollama pull qwen2.5-coder:7b-instruct
+ollama pull qwen2.5-coder:14b-instruct
+ollama pull deepseek-coder-v2:16b
 ```
 
-Static checks:
+Use five genuinely different installed model names. A missing configured model may be replaced by another installed, responsive model, but the verdict is marked `degraded`. Fewer than five responsive distinct models produces `blocked`, never a silent duplicate fallback.
+
+## Development
 
 ```bash
-npm run compile   # TypeScript build
-npm run lint      # ESLint
+npm install
+npm run compile
+npm run lint
+npm test
 ```
 
----
+Press `F5` in VS Code to launch an Extension Development Host. Open a workspace, select the **Local Multi-Agent Coder** activity-bar view, enter a goal, and choose **Start**.
 
-## 🤝 Contributing
+The real Ollama E2E is intentionally separate because it is slow and hardware-dependent:
 
-Pull requests are welcome! Please open an issue first to discuss substantial changes. Keep `npm run compile`, `npm run lint`, and `npm test` green.
+```bash
+npm run compile
+npm run test:e2e:ollama
+```
 
----
+It discovers five installed models, calls `runAutonomousGoal()`, and asserts that the dynamic-team artifacts exist and a completed state contains no active tasks. It also executes the generated CLI to verify its user-facing contract, then writes `dist/benchmarks/ollama-e2e-latest.json` with model readiness timings, phase transitions, Ollama call totals, elapsed time, host memory evidence, and a `usedDeterministicRecovery` flag. That flag is `true` when the deliverable was produced (at least in part) by the deterministic template fallback rather than the model pipeline — a passing run can still legitimately exercise that resilience path, but the benchmark must say so rather than let a template pass as model output.
 
-## 📄 License
+For faster diagnosis of downstream regressions after a full debate has already been validated, run the real-model build pipeline in isolation:
 
-MIT © [trantuthieng](https://github.com/trantuthieng)
+```bash
+npm run test:e2e:build:ollama
+```
+
+This exercises briefing, architecture, task planning, code/recovery, review, tests, delivery, and final integration; it writes `dist/benchmarks/ollama-build-e2e-latest.json`. It does not replace the full debate E2E in release evidence.
+
+For predictable execution on unified-memory Macs, the E2E prefers five installed 7B–16B models, assigns code generation/review to coding-specialized models, caps dynamic-team context at 8K and responses at 768 tokens, and proportionally compacts every participant's text before aggregate critique/refinement/scoring prompts. Its fixture is intentionally dependency-free so network installation cannot affect the result. Override the benchmark roster when needed with `E2E_MODELS=model-a,model-b,model-c,model-d,model-e npm run test:e2e:ollama`.
+
+The real VS Code Extension Host smoke test downloads a matching VS Code test runtime on first use, activates the packaged extension entry point, verifies every contributed command, focuses the actual sidebar, and exercises the safe Stop command:
+
+```bash
+npm run test:vscode
+```
+
+## Model configuration
+
+The first run creates `.agent-workspace/model_config.json`. Important controls include:
+
+- `ollamaBaseUrl` and `requestTimeoutMs`
+- role-specific primary and fallback models under `agents`
+- `defaultOptions.num_ctx` for memory pressure
+- `maxFixRetries` and `requireVerificationScripts`
+- `maxDevelopmentSprints` (default 5), independent of debate rounds
+- `selfHealing.allowProductTemplates` (default `false`): optional legacy built-in product templates; keep disabled when measuring model-generated product quality
+- command approval, web research, GitHub, skills, and app-smoke-test policies
+- `allowSelfWorkspace` (default `false`)
+
+Model names in configuration are requests, not proof of availability. `ModelReadinessService` resolves them against `OllamaClient.listModels()` and probes exact models without fallback before a debate can begin.
+
+### Self-workspace guard
+
+Before writing any product file, `runAutonomousGoal()`/`start()` refuse to build into a workspace that is this extension's own development source tree (detected by its `package.json` name plus the presence of `src/orchestrator/AgentOrchestrator.ts`). This exists because a real run once merged a generated product straight into this extension's own `src/`, corrupting it and leaking into a release archive. Open a separate, empty folder for the generated product; set `"allowSelfWorkspace": true` in `.agent-workspace/model_config.json` only if you intentionally want the agent to modify this extension itself.
+
+## Artifact-aware verification
+
+`VerificationPlanner` detects Node, Python, Go, Rust, Java/Gradle/Maven, .NET, and Swift projects. It uses package scripts where present and stack-native commands such as `python3 -m pytest`, `go test ./...`, `cargo test`, `mvn test`, `dotnet test`, and `swift test`.
+
+Each sprint installs declared Node/Python dependencies when `autoInstallDependencies` is enabled (default). Failures trigger bounded manifest repair with the original stdout/stderr supplied to the fixer. Repairs preserve dependency declarations and verification scripts; they cannot bypass the resolver with `--force` or `--legacy-peer-deps`. Every repair is reinstalled before success, and test fixes that change manifests trigger a fresh installation.
+
+Browser smoke verification requires Chrome, Chromium, or Edge (or `DEBATE_AGENT_BROWSER_PATH`). It uses a temporary browser profile, checks resource loading and uncaught JavaScript errors, and saves `.agent-workspace/logs/browser-smoke.png`. Static HTML works without a package manifest. Webpack/Vite projects without a build script receive an explicit local build check. A successful startup check does not by itself prove gameplay, accessibility, frame rate, or every requested feature.
+
+For explicit collection counts such as “20 levels”, agents create `acceptance.json` pointing to the product's actual JSON array or JavaScript array export. The verifier counts that collection independently, including arrays generated by code, and sends missing or failing evidence through the fixer. The original goal supplies the expected count; a model cannot change it in the manifest. Evidence is saved to `.agent-workspace/logs/collection_acceptance.json`. Count verification complements behavioral tests; it does not establish that every item behaves correctly.
+
+If build, runtime, and tests pass but a measured collection is still too small, the remaining content is planned in the next sprint. Broken or missing bindings remain repair work. Final completion still requires every requested count to pass.
+
+Run the real 20-level product benchmark with shipped settings:
+
+```bash
+npm run test:e2e:brick-breaker
+```
+
+It sends one goal to `runAutonomousGoal()`, preserves generated files under `demo/brick-breaker-20-*`, and writes `dist/benchmarks/brick-breaker-20-latest.json`. The report distinguishes pipeline completion, template recovery, and the separate gameplay review. To resume a preserved failed run: `BRICK_E2E_WORKSPACE=/absolute/path node test/brick_breaker_e2e.js --resume`.
+
+Python artifacts must include a non-empty `requirements.txt` or recognizable `pyproject.toml`. Placeholder tests such as `assert True`, empty test functions, and empty JavaScript test callbacks are blockers. Extension tests are not substituted for generated-product tests.
+
+## Visual asset search (opt-in)
+
+Local chat/code models cannot draw or generate images — Ollama does not host text-to-image models. For products that need real artwork (a game's character sprites, icons, thumbnails), `AssetLibraryService` gives agents a `search_image_assets` / `fetch_image_asset` tool pair backed by [Openverse](https://openverse.org), a search engine over openly-licensed images that requires no API key.
+
+- Disabled by default (`assetLibrary.enabled: false`); auto-enabled for a run when the goal mentions a game, character, sprite, artwork, or similar (bilingual EN/VI), same mechanism as the web-research auto-enable.
+- `search_image_assets` returns candidate images filtered to `assetLibrary.allowedLicenses` (default `cc0`, `pdm`, `by`, `by-sa`), each with a direct URL, creator, and license.
+- `fetch_image_asset` downloads one chosen image into the workspace, rejects non-image responses and anything over `assetLibrary.maxBytes` (default 5 MB), and appends its license/creator/source to `ASSET_LICENSES.md` in the generated project — review that file before shipping or publishing.
+- This complements, not replaces, code-drawn (Canvas/SVG) art: procedural shapes still cost nothing and need no license review, and remain the default for simple games.
+
+## Pre-run resource guard
+
+Running five local models sequentially through a full debate is heavy. Before the first model call, `SystemResourceService` always logs a resource advisory — free RAM, swap, and the biggest RAM-consuming apps right now (grouped by app, e.g. "Microsoft Edge: ~4.4 GB across 25 processes") — so the boss can close what isn't needed before a long run, without the extension touching any other process itself.
+
+- On macOS, the block decision uses the OS's own memory-pressure verdict (`kern.memorystatus_vm_pressure_level`), not raw free-RAM or swap numbers — macOS routinely shows low "free" memory and nonzero swap on a perfectly healthy machine (it uses spare RAM as reclaimable disk cache), so those numbers alone would false-positive constantly. The run is hard-blocked only when macOS itself reports critical pressure.
+- Off macOS (or if that signal can't be read), it falls back to `resourceGuard.minFreeMemoryPercent` (default 10%).
+- Configurable via `resourceGuard` in `model_config.json` (`enabled`, `minFreeMemoryPercent`, `topProcessCount`); enabled by default.
+- A block is an honest stop (`InsufficientResourcesError`), same family as the self-workspace guard — it never suspends, kills, or reprioritizes other processes. Close some of the listed apps (or wait) and start again.
+
+## Controlled external actions
+
+The connector foundation lives in `src/connectors/`:
+
+- capability declarations for research, read/write, OAuth, upload, scheduling, and publish;
+- an idempotent persistent job queue with bounded retries, audit history, and optional rollback;
+- `VSCodeSecretVault`, which stores credentials in VS Code `SecretStorage`, never workspace JSON or journals;
+- explicit per-run approval scopes and `draft-only` or `auto-publish` policies.
+
+The first vertical is `YouTubeConnector`. It supports API-key research, OAuth 2.0 authorization-code exchange and refresh, resumable private draft upload, thumbnail upload, scheduled publishing, and status reads. Upload requires the YouTube upload OAuth scope and explicit `musicRightsConfirmed: true`. Scheduling is rejected under `draft-only` before any network call.
+
+Run **Local Multi-Agent Coder: Configure YouTube Connector** from the Command Palette. It stores the client ID, client secret, optional research API key, granted scope, publish policy, access token, and refresh token in VS Code `SecretStorage`; none are written to the workspace. The user completes Google consent once, after which approved jobs can run without a per-video prompt.
+
+## Chatbot (Q&A over the debate core, Docker + Tailscale)
+
+A second, independent entry point exposes the same multi-model debate rigor as a general
+question-answering chatbot ("should I buy iPhone 18?") reachable from a phone over Tailscale —
+separate from the VS Code extension and from the software-build pipeline. It reuses the debate
+core (`DynamicAgent`, `OllamaClient`, `WebSearchService`) through a **new, lighter debate engine**
+(`src/dynamic/QaDebate.ts`) tuned for short factual/decision questions: it does not touch the
+VS Code extension, the software-build `DynamicTeam` protocol, or any of its checkpoint/resume state.
+
+**Run locally (no Docker) against your own Ollama:**
+```bash
+npm run server
+# Chatbot at http://localhost:8787 — reads OLLAMA_BASE_URL (default http://localhost:11434 is
+# NOT the default here; see below), PORT, CHAT_DATA_DIR env vars.
+OLLAMA_BASE_URL=http://localhost:11434 npm run server
+```
+
+**Run in Docker with a private Tailscale link to your phone:**
+```bash
+cp .env.example .env            # then paste your own key into TS_AUTHKEY (see the file for the URL)
+docker compose up -d
+docker compose logs ts-chatbot  # find the tailnet hostname assigned to "debate-chatbot"
+```
+Open `https://debate-chatbot.<your-tailnet>.ts.net` on any device signed into your tailnet
+(e.g. the Tailscale app on your phone) — private to your own devices, never exposed to the public
+internet (`AllowFunnel: false` in `tailscale/config/serve.json`). Ollama itself is **not** moved
+into Docker — the container reaches it on the host via `OLLAMA_BASE_URL` (default
+`http://host.docker.internal:11434`), so your existing models/weights stay exactly where they are.
+
+The web UI's settings panel (gear icon) persists these as defaults (`GET`/`POST /api/config`):
+- **Số vòng tranh luận (debate rounds, 1–6)** — round 1 is every agent's independent initial
+  answer; each additional round makes every agent read the others' latest positions and revise its
+  own before a final synthesis call produces the actual answer. Round 1 alone is a "quick mode."
+- **Số AI Agent (agent count, 3–8)** — independent, distinct-model participants; capped live to
+  however many distinct models are actually installed (`GET /api/models`).
+- **Web search toggle** — grounds the debate in one shared `ResearchService.webResearch()` call
+  before round 1 (DuckDuckGo scrape, no API key), rather than every agent searching independently.
+
+## Current limits
+
+- OAuth consent still requires the user's browser interaction on first connection.
+- Copyright ownership cannot be inferred reliably; uploads require an explicit rights confirmation and remain subject to YouTube checks.
+- Real-model E2E and RAM/time benchmarks require a self-hosted Mac with Ollama and are not suitable for every pull request.
+- External publishing only occurs through a registered connector job with the required approval scope and policy.
+- The Docker + Tailscale chatbot deployment is tested by unit/integration tests against a fake Ollama client (`test/unit/serverRoutes.test.js`, `test/unit/qaDebate.test.js`) and by manually running the plain-Node server; the `docker compose up` + real Tailscale path itself requires your own Docker daemon and Tailscale account and has not been exercised end to end in CI.
+
+## Release checks
+
+Fast CI runs compile, lint, and deterministic unit/integration tests with fake Ollama. The manual/nightly workflow runs the real autonomous E2E on a self-hosted macOS runner after verifying that at least five local models are installed.
+
+To run the complete local release gate and build an installable VSIX:
+
+```bash
+npm run check:release
+npm run package:vsix
+```
+
+The package is written to `dist/local-multi-agent-coder-1.0.1.vsix`. The packaging command automatically installs it into a temporary clean VS Code profile and verifies its manifest and compiled entry point before reporting success.

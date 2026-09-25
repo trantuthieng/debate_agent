@@ -98,6 +98,28 @@ function makeTerminal({ scripts = [], compileSuccess = true, testSuccess = true 
   };
 }
 
+/** A minimal, valid 5-agent AgentTeamPlan for the given goal, staffed the way AgentFactory would. */
+function makeTeamPlan(goal, generatedAt = new Date().toISOString()) {
+  const roles = ['researcher', 'strategist', 'architect', 'builder', 'critic'];
+  return {
+    goal,
+    rationale: 'Test team composed to cover the goal across complementary specialties.',
+    agents: roles.map((role, i) => ({
+      id: role,
+      name: role[0].toUpperCase() + role.slice(1),
+      specialty: `${role} specialty`,
+      mission: `${role} mission`,
+      systemPrompt: `You are the ${role}.`,
+      model: `model-${role}`,
+      fallbackModel: `model-${role}-fallback`,
+      tools: [],
+      temperature: 0.4,
+      teamRole: role,
+    })),
+    generatedAt,
+  };
+}
+
 async function makeOrchestrator(root, { maxFixRetries = 0, terminal, testerOutput } = {}) {
   const orchestrator = new AgentOrchestrator(root);
   await orchestrator.workspace.initialize();
@@ -167,6 +189,65 @@ test('toolchain discovery writes git snapshot for agent context', async () => {
   assert.equal(snapshot.isRepository, true);
   assert.equal(snapshot.branch, 'main');
   assert.match(rollingSummary, /Git: main \(1 changed file\(s\)\)/);
+});
+
+function makeSwiftOnlyTerminal() {
+  return {
+    detectPackageManager: () => 'npm',
+    hasPackageScript: () => false,
+    runSafeCommand: async command => {
+      if (command.startsWith('swift ')) { return makeResult(command, true, 'swift-driver version 1.0'); }
+      if (command.startsWith('xcodebuild')) { return makeResult(command, false, 'xcode-select: error'); }
+      return makeResult(command, false, 'not found');
+    },
+    runTests: async () => makeResult('npm test', true, 'ok'),
+  };
+}
+
+// Reproduces a real run: this constraint used to fire whenever Swift CLI tools
+// were merely installed, worded as "All Apple platform projects MUST...", and
+// a fixer working on an unrelated browser/Phaser.js game read it out of context
+// and invented a Package.swift for it, which then got "swift test" wired up as
+// the verification command and never passed.
+test('the Swift/Package.swift toolchain constraint is not injected for a non-Apple project', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.terminal = makeSwiftOnlyTerminal();
+  orchestrator.workspace.writeFile(orchestrator.workspace.projectBriefPath, JSON.stringify({
+    projectName: 'brick-breaker-game',
+    goal: 'Build a brick breaker browser game',
+    appType: 'game',
+    targetPlatforms: ['modern web browser'],
+    chosenStack: ['JavaScript', 'Phaser.js', 'HTML5 Canvas'],
+    coreFeatures: [], assumptions: [], nonGoals: [], acceptanceCriteria: [],
+    deliveryArtifacts: [], buildAndRunCommands: [], verificationCommands: [],
+  }));
+
+  await orchestrator._phaseToolchainDiscovery(makeState({ currentPhase: 'toolchain_discovery' }));
+
+  const assumptions = fs.readFileSync(orchestrator.workspace.assumptionsPath, 'utf8');
+  assert.doesNotMatch(assumptions, /TOOLCHAIN CONSTRAINT/);
+});
+
+test('the Swift/Package.swift toolchain constraint IS injected for a genuine native Apple project', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.terminal = makeSwiftOnlyTerminal();
+  orchestrator.workspace.writeFile(orchestrator.workspace.projectBriefPath, JSON.stringify({
+    projectName: 'weather-app',
+    goal: 'Build a native iOS weather app',
+    appType: 'mobile',
+    targetPlatforms: ['iOS'],
+    chosenStack: ['Swift', 'SwiftUI'],
+    coreFeatures: [], assumptions: [], nonGoals: [], acceptanceCriteria: [],
+    deliveryArtifacts: [], buildAndRunCommands: [], verificationCommands: [],
+  }));
+
+  await orchestrator._phaseToolchainDiscovery(makeState({ currentPhase: 'toolchain_discovery' }));
+
+  const assumptions = fs.readFileSync(orchestrator.workspace.assumptionsPath, 'utf8');
+  assert.match(assumptions, /TOOLCHAIN CONSTRAINT/);
+  assert.match(assumptions, /Package\.swift/);
 });
 
 test('testing skips npx tsc when no compile/build script exists', async () => {
@@ -295,6 +376,189 @@ test('task manager receives prompt referenced file content', async () => {
   assert.match(capturedMessages[1].content, /IMPORTANT REQ/);
 });
 
+// Boss feedback (2026-09-18): AgentFactory designs a bespoke specialist team
+// (Researcher/Strategist/Architect/Builder/Critic/Verifier), but that team
+// previously only ever debated the direction — every line of actual code was
+// then written by one single generic codeWorker model, regardless of which
+// specialist's domain a task fell into. These tests cover the fix: the task
+// manager sees the designed roster and can assign a task to a specific
+// specialist by id, and normalization only trusts an id that is really a
+// member of the CURRENT run's team.
+test('task planning surfaces the dynamic team roster so tasks can be assigned to the right specialist', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'task_planning', createdAt: new Date(Date.now() - 5000).toISOString() });
+  const plan = makeTeamPlan(state.projectGoal);
+  orchestrator.workspace.writeFile(orchestrator.workspace.agentNotePath('dynamic_team_plan.json'), JSON.stringify(plan));
+
+  let capturedMessages = null;
+  orchestrator.ollama = {
+    callWithFallback: async (_model, _fallback, messages) => {
+      capturedMessages = messages;
+      return JSON.stringify({
+        tasks: [{
+          id: 'task-001', title: 'Build the UI', description: 'd', assignedAgent: 'codeWorker',
+          specialistId: 'builder', dependsOn: [], allowedFiles: ['src/ui.js'], forbiddenActions: [],
+          acceptanceCriteria: ['works'], status: 'pending', createdAt: new Date().toISOString(),
+        }],
+        totalTasks: 1, estimatedComplexity: 'low', createdAt: new Date().toISOString(),
+      });
+    },
+  };
+
+  await orchestrator._phaseTaskPlanning(state);
+
+  assert.match(capturedMessages[1].content, /Specialist Team Roster/);
+  assert.match(capturedMessages[1].content, /id: "builder"/);
+  assert.match(capturedMessages[1].content, /builder specialty/);
+  const savedPlan = JSON.parse(fs.readFileSync(orchestrator.workspace.taskPlanPath, 'utf8'));
+  assert.equal(savedPlan.tasks[0].specialistId, 'builder');
+});
+
+test('task planning omits the roster section and specialistId when no dynamic team was designed', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  let capturedMessages = null;
+  orchestrator.ollama = {
+    callWithFallback: async (_model, _fallback, messages) => {
+      capturedMessages = messages;
+      return JSON.stringify({
+        tasks: [{
+          id: 'task-001', title: 'Setup', description: 'd', assignedAgent: 'codeWorker',
+          dependsOn: [], allowedFiles: ['package.json'], forbiddenActions: [],
+          acceptanceCriteria: ['works'], status: 'pending', createdAt: new Date().toISOString(),
+        }],
+        totalTasks: 1, estimatedComplexity: 'low', createdAt: new Date().toISOString(),
+      });
+    },
+  };
+
+  await orchestrator._phaseTaskPlanning(makeState({ currentPhase: 'task_planning' }));
+
+  assert.doesNotMatch(capturedMessages[1].content, /Specialist Team Roster/);
+  const savedPlan = JSON.parse(fs.readFileSync(orchestrator.workspace.taskPlanPath, 'utf8'));
+  assert.equal(savedPlan.tasks[0].specialistId, undefined);
+});
+
+test('task normalization drops a specialistId that is not a real member of the current team plan', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'task-001', title: 'Build the UI', description: 'd', assignedAgent: 'codeWorker',
+    specialistId: 'nonexistent-agent', dependsOn: [], allowedFiles: ['src/ui.js'], forbiddenActions: [],
+    acceptanceCriteria: ['works'], status: 'pending', createdAt: '',
+  };
+
+  const validIds = new Set(['builder', 'critic']);
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString(), validIds);
+
+  assert.equal(normalized.specialistId, undefined);
+  const assumptions = orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '';
+  assert.match(assumptions, /nonexistent-agent/);
+  assert.match(assumptions, /not a member of the current team plan/);
+});
+
+test('task normalization keeps a specialistId that is a real member of the current team plan', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'task-001', title: 'Build the UI', description: 'd', assignedAgent: 'codeWorker',
+    specialistId: 'builder', dependsOn: [], allowedFiles: ['src/ui.js'], forbiddenActions: [],
+    acceptanceCriteria: ['works'], status: 'pending', createdAt: '',
+  };
+
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString(), new Set(['builder', 'critic']));
+
+  assert.equal(normalized.specialistId, 'builder');
+});
+
+test('coding routes a specialist-assigned task to that specialist\'s own model, framed but not replacing the code worker contract', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'coding', createdAt: new Date(Date.now() - 5000).toISOString() });
+  const plan = makeTeamPlan(state.projectGoal);
+  orchestrator.workspace.writeFile(orchestrator.workspace.agentNotePath('dynamic_team_plan.json'), JSON.stringify(plan));
+  orchestrator.toolRegistry = { manifestForPrompt: () => '' };
+
+  let capturedModel, capturedFallback, capturedSystemPrompt;
+  orchestrator.ollama = {
+    callWithFallbackJson: async (model, fallback, messages) => {
+      capturedModel = model; capturedFallback = fallback; capturedSystemPrompt = messages[0].content;
+      return { reasoning: 'done', files: [{ path: 'src/ui.js', action: 'create', content: 'x' }], needUserInput: false, questions: [] };
+    },
+  };
+
+  const task = {
+    id: 'task-001', title: 'Build the UI', description: 'd', assignedAgent: 'codeWorker',
+    specialistId: 'builder', dependsOn: [], allowedFiles: ['src/ui.js'], forbiddenActions: [],
+    acceptanceCriteria: ['works'], status: 'pending', createdAt: new Date().toISOString(),
+  };
+
+  await orchestrator._executeCodeWorker(task, '', '', state);
+
+  assert.equal(capturedModel, 'model-builder');
+  assert.equal(capturedFallback, 'model-builder-fallback');
+  assert.match(capturedSystemPrompt, /SPECIALIST ASSIGNMENT/);
+  assert.match(capturedSystemPrompt, /Builder/);
+  assert.match(capturedSystemPrompt, /builder specialty/);
+});
+
+test('coding falls back to the standard code worker model when a task has no specialist assigned', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'coding' });
+  orchestrator.toolRegistry = { manifestForPrompt: () => '' };
+
+  let capturedModel;
+  orchestrator.ollama = {
+    callWithFallbackJson: async model => {
+      capturedModel = model;
+      return { reasoning: 'done', files: [{ path: 'src/index.js', action: 'create', content: 'x' }], needUserInput: false, questions: [] };
+    },
+  };
+
+  const task = {
+    id: 'task-001', title: 'Setup', description: 'd', assignedAgent: 'codeWorker',
+    dependsOn: [], allowedFiles: ['src/index.js'], forbiddenActions: [],
+    acceptanceCriteria: ['works'], status: 'pending', createdAt: new Date().toISOString(),
+  };
+
+  await orchestrator._executeCodeWorker(task, '', '', state);
+
+  assert.equal(capturedModel, orchestrator.modelConfig.agents.codeWorker.model);
+});
+
+test('fixing a specialist-assigned task stays with the same specialist, not the generic fixer model', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'fixing', createdAt: new Date(Date.now() - 5000).toISOString() });
+  const plan = makeTeamPlan(state.projectGoal);
+  orchestrator.workspace.writeFile(orchestrator.workspace.agentNotePath('dynamic_team_plan.json'), JSON.stringify(plan));
+  orchestrator.toolRegistry = { manifestForPrompt: () => '' };
+
+  let capturedModel, capturedFallback, capturedSystemPrompt;
+  orchestrator.ollama = {
+    callWithFallbackJson: async (model, fallback, messages) => {
+      capturedModel = model; capturedFallback = fallback; capturedSystemPrompt = messages[0].content;
+      return { reasoning: 'fixed', files: [{ path: 'src/ui.js', action: 'modify', content: 'x' }], needUserInput: false, questions: [] };
+    },
+  };
+
+  const task = {
+    id: 'task-001', title: 'Build the UI', description: 'd', assignedAgent: 'codeWorker',
+    specialistId: 'builder', dependsOn: [], allowedFiles: ['src/ui.js'], forbiddenActions: [],
+    acceptanceCriteria: ['works'], status: 'pending', createdAt: new Date().toISOString(),
+  };
+  const review = { taskId: task.id, approved: false, issues: ['broken'], suggestions: [], securityConcerns: [], needsFix: true, fixSuggestions: ['fix it'], reviewedAt: new Date().toISOString() };
+
+  await orchestrator._executeFixer(task, review, state, false);
+
+  assert.equal(capturedModel, 'model-builder');
+  assert.equal(capturedFallback, 'model-builder-fallback');
+  assert.match(capturedSystemPrompt, /SPECIALIST ASSIGNMENT/);
+});
+
 test('autonomous architecture records assumptions instead of pausing for user input', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);
@@ -319,6 +583,112 @@ test('autonomous architecture records assumptions instead of pausing for user in
   assert.equal(plan.needUserInput, false);
   assert.equal(plan.readyToCode, true);
   assert.match(assumptions, /Which visual style should the game use/);
+});
+
+// Boss feedback (2026-09-18, part 2): specialist dispatch should not stop at
+// coding/fixing — the SAME designed team already argued for this project's
+// direction, so the planning phases (brief, architecture, task plan) should
+// route to whichever specialist's teamRole naturally owns that phase (the
+// "architect" teamRole specialist formalizes the architecture doc, etc.)
+// instead of always using the fixed generic briefBuilder/architect/
+// taskManager model, EVEN when a dynamic team was designed for this run.
+test('architecture is routed to the team\'s "architect" specialist when a dynamic team was designed', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'architecture', createdAt: new Date(Date.now() - 5000).toISOString() });
+  const plan = makeTeamPlan(state.projectGoal);
+  orchestrator.workspace.writeFile(orchestrator.workspace.agentNotePath('dynamic_team_plan.json'), JSON.stringify(plan));
+
+  let capturedModel, capturedFallback, capturedSystemPrompt;
+  orchestrator.ollama = {
+    callWithFallback: async (model, fallback, messages) => {
+      capturedModel = model; capturedFallback = fallback; capturedSystemPrompt = messages[0].content;
+      return JSON.stringify({
+        summary: 's', technology: ['t'], projectStructure: ['p'], keyDecisions: ['d'],
+        constraints: [], needUserInput: false, questions: [], readyToCode: true,
+      });
+    },
+  };
+
+  await orchestrator._phaseArchitecture(state);
+
+  assert.equal(capturedModel, 'model-architect');
+  assert.equal(capturedFallback, 'model-architect-fallback');
+  assert.match(capturedSystemPrompt, /SPECIALIST ASSIGNMENT/);
+  assert.match(capturedSystemPrompt, /Architect/);
+});
+
+test('architecture uses the standard fixed model when no dynamic team was designed', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  let capturedModel;
+  orchestrator.ollama = {
+    callWithFallback: async model => {
+      capturedModel = model;
+      return JSON.stringify({
+        summary: 's', technology: ['t'], projectStructure: ['p'], keyDecisions: ['d'],
+        constraints: [], needUserInput: false, questions: [], readyToCode: true,
+      });
+    },
+  };
+
+  await orchestrator._phaseArchitecture(makeState({ currentPhase: 'architecture' }));
+
+  assert.equal(capturedModel, orchestrator.modelConfig.agents.architect.model);
+});
+
+test('the project brief is routed to the team\'s "strategist" specialist when a dynamic team was designed', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'briefing', createdAt: new Date(Date.now() - 5000).toISOString() });
+  const plan = makeTeamPlan(state.projectGoal);
+  orchestrator.workspace.writeFile(orchestrator.workspace.agentNotePath('dynamic_team_plan.json'), JSON.stringify(plan));
+
+  let capturedModel, capturedSystemPrompt;
+  orchestrator.ollama = {
+    callWithFallbackJson: async (model, _fallback, messages) => {
+      capturedModel = model; capturedSystemPrompt = messages[0].content;
+      return {
+        projectName: 'p', goal: 'g', appType: 'web', targetPlatforms: [], chosenStack: ['x'],
+        coreFeatures: [], assumptions: [], nonGoals: [], acceptanceCriteria: ['a'],
+        deliveryArtifacts: [], buildAndRunCommands: [], verificationCommands: [],
+      };
+    },
+  };
+
+  await orchestrator._phaseBriefing(state);
+
+  assert.equal(capturedModel, 'model-strategist');
+  assert.match(capturedSystemPrompt, /SPECIALIST ASSIGNMENT/);
+  assert.match(capturedSystemPrompt, /Strategist/);
+});
+
+test('task planning model itself is routed to the team\'s "strategist" specialist', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'task_planning', createdAt: new Date(Date.now() - 5000).toISOString() });
+  const plan = makeTeamPlan(state.projectGoal);
+  orchestrator.workspace.writeFile(orchestrator.workspace.agentNotePath('dynamic_team_plan.json'), JSON.stringify(plan));
+
+  let capturedModel;
+  orchestrator.ollama = {
+    callWithFallback: async model => {
+      capturedModel = model;
+      return JSON.stringify({
+        tasks: [{
+          id: 'task-001', title: 't', description: 'd', assignedAgent: 'codeWorker',
+          dependsOn: [], allowedFiles: ['x.js'], forbiddenActions: [], acceptanceCriteria: ['c'],
+          status: 'pending', createdAt: new Date().toISOString(),
+        }],
+        totalTasks: 1, estimatedComplexity: 'low', createdAt: new Date().toISOString(),
+      });
+    },
+  };
+
+  await orchestrator._phaseTaskPlanning(state);
+
+  assert.equal(capturedModel, 'model-strategist');
 });
 
 test('testing fails instead of completing when checks keep failing', async () => {
@@ -392,7 +762,7 @@ test('testing uses xcode project verification when no package scripts exist', as
   assert.deepEqual(terminal.commands, ['xcodebuild -list -project "TinyApp.xcodeproj"']);
 });
 
-test('testing continues with warning when fixer agent produces no output', async () => {
+test('testing fails honestly when fixer agent produces no output', async () => {
   const root = makeTempWorkspace();
   fs.writeFileSync(path.join(root, 'package.json'), '{"scripts":{"compile":"node --check src/index.js","test":"node --test"}}');
   const terminal = makeTerminal({
@@ -414,10 +784,139 @@ test('testing continues with warning when fixer agent produces no output', async
   });
   orchestrator._executeFixer = async () => null;
 
-  await orchestrator._phaseTesting(makeState());
+  await assert.rejects(
+    () => orchestrator._phaseTesting(makeState()),
+    /fixer model produced no usable output/i
+  );
 
   const testerNote = fs.readFileSync(orchestrator.workspace.testerPath, 'utf8');
-  assert.match(testerNote, /Self-Healing Verification Warning/);
+  assert.match(testerNote, /Fixer Unavailable On Attempt 1/);
+});
+
+// The same retry loop had a second, identically-shaped gap a few lines above
+// the one reproduced below: attempt 1 finding no safe target files used to
+// abort the whole run instead of letting attempt 2+ try again.
+test('a fix attempt that finds no safe target files retries instead of aborting the run', async () => {
+  const root = makeTempWorkspace();
+  const terminal = makeTerminal({
+    scripts: ['compile', 'test'],
+    compileSuccess: false,
+    testSuccess: false,
+  });
+  const orchestrator = await makeOrchestrator(root, {
+    maxFixRetries: 2,
+    terminal,
+    testerOutput: {
+      passed: false,
+      testsRun: 1,
+      errors: ['tests failed'],
+      warnings: [],
+      needsFix: true,
+      fixDescription: 'Fix the failing checks.',
+    },
+  });
+  let fixerCalls = 0;
+  orchestrator._executeFixer = async () => { fixerCalls += 1; return null; };
+  orchestrator._collectTestFixAllowedFiles = () => [];
+
+  await assert.rejects(
+    () => orchestrator._phaseTesting(makeState()),
+    /Project checks still fail after 2 fix attempt/
+  );
+  // The fixer was never even reachable (no safe files), but the loop still
+  // ran both attempts rather than aborting after the first.
+  assert.equal(fixerCalls, 0);
+  const testerNote = fs.readFileSync(orchestrator.workspace.testerPath, 'utf8');
+  assert.match(testerNote, /Fix Attempt 1 Had No Safe Target Files/);
+  assert.match(testerNote, /Fix Attempt 2 Had No Safe Target Files/);
+});
+
+// A third instance of the same gap: the per-task coding-phase fixer loop
+// already treats "unsafe file changes" as discard-and-retry (break, then
+// deterministic recovery), never as a reason to kill the whole run — but this
+// loop used to throw here instead, for no good reason once the other two
+// spots in this same loop were fixed to retry.
+test('a fix attempt producing unsafe file changes retries instead of aborting the run', async () => {
+  const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'package.json'), '{"scripts":{"compile":"node --check src/index.js","test":"node --test"}}');
+  const terminal = makeTerminal({
+    scripts: ['compile', 'test'],
+    compileSuccess: false,
+    testSuccess: false,
+  });
+  const orchestrator = await makeOrchestrator(root, {
+    maxFixRetries: 2,
+    terminal,
+    testerOutput: {
+      passed: false,
+      testsRun: 1,
+      errors: ['tests failed'],
+      warnings: [],
+      needsFix: true,
+      fixDescription: 'Fix the failing checks.',
+    },
+  });
+  orchestrator._executeFixer = async () => ({
+    reasoning: 'Attempting a fix',
+    files: [{ path: 'evil.sh', action: 'create', content: 'rm -rf /' }],
+    needUserInput: false,
+    questions: [],
+  });
+  orchestrator._validateTaskFileChanges = () => ['File "evil.sh" is outside the task allowedFiles list.'];
+
+  await assert.rejects(
+    () => orchestrator._phaseTesting(makeState()),
+    /Project checks still fail after 2 fix attempt/
+  );
+  const testerNote = fs.readFileSync(orchestrator.workspace.testerPath, 'utf8');
+  assert.match(testerNote, /Fix Attempt 1 Produced Unsafe File Changes/);
+  assert.match(testerNote, /Fix Attempt 2 Produced Unsafe File Changes/);
+});
+
+// Reproduces a real run: the fixer's only proposed change on attempt 2 of an
+// 8-attempt budget was a fragile diff to package.json that failed to apply
+// (0 files applied), which used to throw and abort the entire workflow right
+// there instead of just counting that as one failed attempt and retrying.
+test('a fix attempt whose only change fails to apply retries instead of aborting the run', async () => {
+  const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'package.json'), '{"scripts":{"compile":"node --check src/index.js","test":"node --test"}}');
+  const terminal = makeTerminal({
+    scripts: ['compile', 'test'],
+    compileSuccess: false,
+    testSuccess: false,
+  });
+  const orchestrator = await makeOrchestrator(root, {
+    maxFixRetries: 2,
+    terminal,
+    testerOutput: {
+      passed: false,
+      testsRun: 1,
+      errors: ['tests failed'],
+      warnings: [],
+      needsFix: true,
+      fixDescription: 'Fix the failing checks.',
+    },
+  });
+  let fixerCalls = 0;
+  orchestrator._executeFixer = async () => {
+    fixerCalls += 1;
+    return {
+      reasoning: 'Attempting a fix',
+      files: [{ path: 'package.json', action: 'modify', patch: 'not a real unified diff' }],
+      needUserInput: false,
+      questions: [],
+    };
+  };
+  // Every attempt's only change fails to apply, exactly like a fragile diff
+  // that gets skipped by the patch service, leaving nothing applied.
+  orchestrator._applyCodeChanges = async () => false;
+
+  await assert.rejects(
+    () => orchestrator._phaseTesting(makeState()),
+    /Project checks still fail after 2 fix attempt/
+  );
+  // Both attempts were actually tried — the first failed-apply did not abort early.
+  assert.equal(fixerCalls, 2);
 });
 
 test('self-healing expands underspecified allowedFiles for safe task-local swift models', async () => {
@@ -581,6 +1080,88 @@ test('worker output normalization prevents missing files from crashing coding', 
   assert.match(output.reasoning, /incomplete response/);
 });
 
+test('coding recovers a known CLI task when the model returns an empty files array', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Build a complete CLI called Focus Tool with add list done stats commands and node:test coverage.');
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-empty-cli',
+    title: 'Create project scaffold and scripts',
+    description: 'Create a runnable command line tool.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['package.json', 'src/cli.js', 'test/cli.test.js', 'README.md'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['npm test passes'],
+    status: 'pending',
+    createdAt: now,
+  };
+  orchestrator.workspace.writeFile(orchestrator.workspace.taskPlanPath, JSON.stringify({
+    tasks: [task],
+    totalTasks: 1,
+    estimatedComplexity: 'low',
+    createdAt: now,
+  }));
+  orchestrator._executeCodeWorker = async () => ({
+    reasoning: 'The implementation is complete.',
+    files: [],
+    needUserInput: false,
+    questions: [],
+  });
+  orchestrator._executeReviewer = async () => ({
+    taskId: task.id,
+    approved: true,
+    issues: [],
+    suggestions: [],
+    securityConcerns: [],
+    needsFix: false,
+    fixSuggestions: [],
+    reviewedAt: new Date().toISOString(),
+  });
+
+  const state = makeState({ currentPhase: 'coding' });
+  await orchestrator._phaseCoding(state);
+
+  assert.deepEqual(state.completedTasks, [task.id]);
+  assert.deepEqual(state.failedTasks, []);
+  assert.ok(fs.existsSync(path.join(root, 'src/cli.js')));
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('resumed no-op reviews existing outputs and does not bypass a rejecting reviewer', async t => {
+  for (const approved of [true, false]) {
+    const root = makeTempWorkspace();
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const agent = await makeOrchestrator(root);
+    agent.modelConfig.selfHealing.allowProductTemplates = false;
+    agent.fileManager.writeWorkspaceFile('src/main.js', 'module.exports = 42;\n');
+    const task = { id: 'existing', title: 'Existing implementation', description: 'Verify implementation',
+      allowedFiles: ['src/main.js'], dependsOn: [], forbiddenActions: [], acceptanceCriteria: ['Meets the task'],
+      status: 'pending', assignedAgent: 'codeWorker', createdAt: new Date().toISOString() };
+    agent.workspace.writeFile(agent.workspace.taskPlanPath, JSON.stringify({ tasks: [task], totalTasks: 1 }));
+    agent._executeCodeWorker = async () => ({ reasoning: 'Already implemented', files: [], needUserInput: false, questions: [] });
+    let reviewed = 0;
+    agent._executeReviewer = async (_, output) => {
+      reviewed++;
+      assert.equal(output.files[0].content, 'module.exports = 42;\n');
+      return { approved, needsFix: !approved, issues: approved ? [] : ['Incorrect behavior'], suggestions: [], fixSuggestions: [], securityConcerns: [] };
+    };
+    agent._applyCodeChanges = async () => { assert.fail('Review-only snapshots must not be written'); };
+    agent._runMicroSprintChecks = async () => {};
+    const state = makeState({ currentPhase: 'coding', activeTasks: [task.id] });
+    if (approved) { await agent._phaseCoding(state); }
+    else { await assert.rejects(agent._phaseCoding(state), /Build is not viable/); }
+    assert.equal(reviewed, 1);
+    assert.deepEqual(state.completedTasks, approved ? [task.id] : []);
+    assert.equal(agent.fileManager.readWorkspaceFile('src/main.js'), 'module.exports = 42;\n');
+    assert.equal(agent._existingTaskReviewOutput({ allowedFiles: ['src/main.js', 'missing.js'] }, { files: [] }), null);
+    agent.fileManager.writeWorkspaceFile('empty.js', '');
+    assert.equal(agent._existingTaskReviewOutput({ allowedFiles: ['empty.js'] }, { files: [] }), null);
+  }
+});
+
 test('patch application blocks stale file baselines instead of overwriting user edits', async () => {
   const root = makeTempWorkspace();
   fs.mkdirSync(path.join(root, 'src'), { recursive: true });
@@ -605,6 +1186,71 @@ test('patch application blocks stale file baselines instead of overwriting user 
   assert.equal(fs.readFileSync(path.join(root, 'src/index.js'), 'utf8'), 'module.exports = "user edit";\n');
   const memoryEvents = fs.readFileSync(orchestrator.workspace.memoryEventsPath, 'utf8');
   assert.match(memoryEvents, /blocked because target files changed/);
+});
+
+test('a directory-scaffold entry ("src/") creates a real directory, not an empty file that later breaks writes', async () => {
+  // Reproduces a real failure: the code worker's file list included a
+  // directory-only scaffold entry from the project structure ("src/",
+  // "public/", "styles/"). Writing it as a literal empty file left `src`
+  // unable to hold `src/game.js`, failing with ENOTDIR.
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const scaffold = {
+    reasoning: 'Create project structure.',
+    files: [
+      { path: 'src/', action: 'create', content: '' },
+      { path: 'public/', action: 'create', content: '' },
+    ],
+    needUserInput: false,
+    questions: [],
+  };
+  const applied = await orchestrator._applyCodeChanges('patch-scaffold', scaffold, makeState({ currentPhase: 'coding' }));
+  assert.equal(applied, true);
+  assert.equal(fs.statSync(path.join(root, 'src')).isDirectory(), true);
+  assert.equal(fs.statSync(path.join(root, 'public')).isDirectory(), true);
+
+  // A later task writing a real file inside that directory must succeed.
+  const followUp = {
+    reasoning: 'Add game entry point.',
+    files: [{ path: 'src/game.js', action: 'create', content: 'console.log("game");\n' }],
+    needUserInput: false,
+    questions: [],
+  };
+  const appliedFollowUp = await orchestrator._applyCodeChanges('patch-followup', followUp, makeState({ currentPhase: 'coding' }));
+  assert.equal(appliedFollowUp, true);
+  assert.equal(fs.readFileSync(path.join(root, 'src/game.js'), 'utf8'), 'console.log("game");\n');
+});
+
+test('re-creating an already-existing directory-scaffold entry across sprints is not blocked as a baseline conflict', async () => {
+  // Reproduces a real failure: sprint 1 created src/; sprint 2's fresh task
+  // plan re-listed "src/" as a create-without-baseline (a fresh planning
+  // cycle has no read baseline for it), which the safety guard treated as an
+  // unsafe overwrite and blocked — skipping every dependent task and failing
+  // the whole sprint even though nothing would actually have been overwritten.
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+
+  const sprintTwoScaffold = {
+    reasoning: 'Re-affirm project structure.',
+    files: [{ path: 'src/', action: 'create', content: '' }],
+    needUserInput: false,
+    questions: [],
+  };
+  const applied = await orchestrator._applyCodeChanges('patch-sprint-2-scaffold', sprintTwoScaffold, makeState({ currentPhase: 'coding' }));
+  assert.equal(applied, true, 'a directory marker for an existing directory must never be treated as an overwrite conflict');
+
+  // A real file still gets the full baseline-conflict protection.
+  fs.writeFileSync(path.join(root, 'src/existing.js'), 'module.exports = "real file";\n');
+  const conflicting = {
+    reasoning: 'Recreate an existing real file without reading it first.',
+    files: [{ path: 'src/existing.js', action: 'create', content: 'overwritten' }],
+    needUserInput: false,
+    questions: [],
+  };
+  const appliedConflict = await orchestrator._applyCodeChanges('patch-conflict', conflicting, makeState({ currentPhase: 'coding' }));
+  assert.equal(appliedConflict, false, 'a real file without a baseline must still be protected');
+  assert.equal(fs.readFileSync(path.join(root, 'src/existing.js'), 'utf8'), 'module.exports = "real file";\n');
 });
 
 test('tester receives a focused diagnostic bundle before raw logs', async () => {
@@ -696,6 +1342,122 @@ test('task normalization removes contradictory forbidden actions for required fi
   assert.deepEqual(normalized.allowedFiles, ['package.json', 'README.md']);
 });
 
+// Reproduces a real failed run (2026-09-17): the task plan assigned
+// src/assets/spritesheet.png to task-001. A text-only code worker always
+// writes such a file 0 bytes; the heuristic "file is empty" review issue
+// then recurred identically across every fix attempt, tripping the stuck-loop
+// guard and failing the whole build (0/5 tasks) over a plan step no model
+// could ever satisfy. Task normalization must strip binary asset paths
+// before a code worker is ever asked to author them.
+test('task normalization strips binary asset paths a text-only model cannot author', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'sprint-01-task-001',
+    title: 'Setup project structure and initial files',
+    description: 'Create the basic project structure.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: [
+      'index.html', 'src/game.js', 'src/levels.json',
+      'src/assets/spritesheet.png', 'src/assets/spritesheet.json',
+      'src/assets/theme.mp3', 'README.md', 'package.json',
+    ],
+    forbiddenActions: [],
+    acceptanceCriteria: ['Project structure is created with all necessary directories and files'],
+    status: 'pending',
+    createdAt: '',
+  };
+
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString());
+
+  assert.deepEqual(normalized.allowedFiles, [
+    'index.html', 'src/game.js', 'src/levels.json',
+    'src/assets/spritesheet.json', 'README.md', 'package.json',
+  ]);
+  const assumptions = orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '';
+  assert.match(assumptions, /spritesheet\.png/);
+  assert.match(assumptions, /procedurally/);
+});
+
+// Reproduces a real failed run (2026-09-18, re-run after the fix above): with
+// the binary-asset bug fixed, task-001 failed a DIFFERENT way — the task
+// manager (violating its own rule 9) wrote acceptance criteria "All required
+// files are present and empty." No matter what the code worker did, the
+// heuristic "file is empty" review check (correctly) rejected it identically
+// on every fix attempt, tripping the stuck-loop guard and failing the whole
+// build (0/30 tasks) over a task that was unwinnable by construction.
+test('task normalization reconciles acceptance criteria that contradict the "no empty files" review rule', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'sprint-01-task-001',
+    title: 'Create initial project structure',
+    description: 'Set up the project with the required directory structure and initial files.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/main.js', 'src/gameLoop.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['Project structure matches the architecture plan', 'All required files are present and empty'],
+    status: 'pending',
+    createdAt: '',
+  };
+
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString());
+
+  // Original wording is kept (it may carry other real information) but a
+  // corrective criterion is appended so the task is actually achievable.
+  assert.ok(normalized.acceptanceCriteria.includes('All required files are present and empty'));
+  assert.ok(normalized.acceptanceCriteria.some(c => /real, minimal, working content/.test(c)));
+  const assumptions = orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '';
+  assert.match(assumptions, /empty.*blank|blank.*empty/i);
+});
+
+test('task normalization leaves ordinary acceptance criteria untouched (no false positive on unrelated "empty" mentions)', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'task-001',
+    title: 'Validate form input',
+    description: 'd',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/form.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['Shows a validation error when the input field is empty', 'src/form.js exports a validate function'],
+    status: 'pending',
+    createdAt: '',
+  };
+
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString());
+
+  assert.deepEqual(normalized.acceptanceCriteria, task.acceptanceCriteria);
+});
+
+test('every phase change and error is pushed to Telegram so the boss can follow a run from their phone', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const sent = [];
+  orchestrator.telegram.notify = message => sent.push(message);
+
+  orchestrator._setPhase(makeState(), 'coding', 'Code Workers: Executing tasks...');
+  orchestrator._emit('error', 'Task "task-001" produced unsafe file changes: nope.');
+
+  assert.equal(sent.length, 2);
+  assert.match(sent[0], /coding/i);
+  assert.match(sent[0], /Executing tasks/);
+  assert.match(sent[1], /^❌/);
+  assert.match(sent[1], /task-001/);
+});
+
+test('Telegram notify() is never called synchronously when unconfigured (no crash without credentials)', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  assert.equal(orchestrator.telegram.isConfigured, false);
+  assert.doesNotThrow(() => orchestrator._setPhase(makeState(), 'architecture', 'deciding stack'));
+});
+
 test('sprint task scoping prevents repeated planning cycles from colliding', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);
@@ -760,6 +1522,55 @@ test('improvement consensus stops only when all brainstorm agents agree no work 
 
   assert.equal(orchestrator._consensusReadyToStop(stopConsensus), true);
   assert.equal(orchestrator._consensusReadyToStop(continueConsensus), false);
+});
+
+// Reproduces a real run: three model-based retrospective agents (brainstorm,
+// critic, secondBrainstorm) all unanimously claimed "all 20 levels work" for a
+// game that actually shipped invalid JSON with a "// Add 19 more levels here"
+// stub comment. A deterministic, model-independent scan now re-checks every
+// changed file's current on-disk content and overrides a false STOP verdict.
+test('a deterministic structural scan overrides a unanimous but wrong "ready to stop" verdict', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  fs.writeFileSync(
+    path.join(root, 'levels.json'),
+    '[\n  {"level": 1}\n  // Add 19 more levels here\n]\n'
+  );
+  orchestrator.workspace.writeFile(
+    orchestrator.workspace.taskResultsPath,
+    JSON.stringify({
+      results: {
+        'sprint-01-task-001': {
+          taskId: 'sprint-01-task-001',
+          status: 'completed',
+          completedAt: new Date().toISOString(),
+          files: [{ path: 'levels.json', action: 'create' }],
+        },
+      },
+      updatedAt: new Date().toISOString(),
+    })
+  );
+
+  // All three retrospective agents hallucinate a confident "done" verdict,
+  // exactly as happened in the real run — they never saw the file content
+  // before this fix, and even now a model could still get it wrong, so the
+  // deterministic scan must not depend on them getting it right.
+  orchestrator.ollama = {
+    callWithFallbackJson: async () => ({
+      readyToStop: true,
+      confidence: 'high',
+      remainingWork: [],
+      nextSprintGoal: '',
+      rationale: 'All 20 levels work correctly.',
+    }),
+  };
+
+  const consensus = await orchestrator._phaseImprovementConsensus(makeState(), 1);
+
+  assert.equal(orchestrator._consensusReadyToStop(consensus), false);
+  assert.ok(consensus.every(item => item.readyToStop === false));
+  assert.ok(consensus.every(item => item.remainingWork.some(w => w.includes('levels.json') && w.includes('not valid JSON'))));
 });
 
 test('debate scoring aggregates the panel and selects the highest-scored direction', async () => {
@@ -910,6 +1721,160 @@ test('a fragile diff edit does not discard the good new files in the same batch'
   assert.match(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), /Nothing here matches/);
 });
 
+test('a filesystem hiccup while persisting a failed state does not crash the error handler', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+
+  // Reproduces a real failure from a live run: the workspace directory
+  // (on a cloud-synced volume) briefly disappeared exactly while the
+  // orchestrator tried to record that the run had failed, turning an honest
+  // failure into an uncaught crash that left project_state.json stuck
+  // showing "running" forever.
+  fs.rmSync(path.join(root, '.agent-workspace'), { recursive: true, force: true });
+
+  assert.doesNotThrow(() => orchestrator._handleTopLevelError(new Error('Ollama crashed mid-debate')));
+});
+
+test('InsufficientResourcesError is an honest stop that surfaces the full resource advisory', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const { InsufficientResourcesError } = require('../out/utils/errors');
+  let emitted = '';
+  orchestrator.setCallbacks({ onError: msg => { emitted = msg; } });
+
+  orchestrator._handleTopLevelError(new InsufficientResourcesError(
+    'Not enough free memory headroom to safely start a five-model run.',
+    'Biggest RAM users right now:\n  - Microsoft Edge: ~2000 MB'
+  ));
+
+  assert.match(emitted, /Not enough free memory headroom/);
+  assert.match(emitted, /Biggest RAM users/);
+  const state = orchestrator.workspace.readProjectState();
+  assert.equal(state.status, 'failed');
+});
+
+// A pre-flight gate (resource check, model readiness, missing capability) can
+// fire BEFORE _runWorkflow — and therefore before its own try/catch — ever
+// starts. That failure used to reach the boss only via the transient onError
+// callback and never appear in AGENT_JOURNAL.md, leaving no durable record of
+// why a run never got past its pre-flight checks. _handleTopLevelError must
+// now always leave a journal entry, regardless of which gate stopped the run
+// or whether the journal file existed yet.
+test('a pre-flight gate failure is always recorded in AGENT_JOURNAL.md, even if the journal never existed yet', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const { InsufficientResourcesError, MissingCapabilityError } = require('../out/utils/errors');
+
+  // Simulate a run that failed before initializeJournal() was ever reached.
+  fs.rmSync(orchestrator.workspace.journalPath, { force: true });
+  assert.equal(fs.existsSync(orchestrator.workspace.journalPath), false);
+
+  orchestrator._handleTopLevelError(new InsufficientResourcesError(
+    'Not enough free memory headroom to safely start a five-model run.',
+    'Biggest RAM users right now:\n  - Microsoft Edge: ~2000 MB'
+  ));
+
+  let journal = fs.readFileSync(orchestrator.workspace.journalPath, 'utf8');
+  assert.match(journal, /insufficient resources/i);
+  assert.match(journal, /Not enough free memory headroom/);
+
+  orchestrator._handleTopLevelError(new MissingCapabilityError('Missing YouTube API credentials.', []));
+  journal = fs.readFileSync(orchestrator.workspace.journalPath, 'utf8');
+  assert.match(journal, /missing capability/i);
+  assert.match(journal, /Missing YouTube API credentials/);
+
+  orchestrator._handleTopLevelError(new Error('Ollama crashed mid-debate'));
+  journal = fs.readFileSync(orchestrator.workspace.journalPath, 'utf8');
+  assert.match(journal, /Workflow stopped with an error/);
+  assert.match(journal, /Ollama crashed mid-debate/);
+});
+
+test('RAM optimization is never applied without an explicit boss approval', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const proposal = {
+    id: 'ram-1',
+    currentFreeMb: 5000,
+    targetFreeMb: 20 * 1024,
+    apps: [{ name: 'Microsoft Edge', residentMb: 3000 }],
+  };
+  let notified = null;
+  orchestrator.setCallbacks({ onRamOptimizationNeeded: p => { notified = p; } });
+
+  const pending = orchestrator._requestRamOptimization(proposal);
+  assert.deepEqual(notified, proposal);
+  orchestrator.resolveRamOptimization('ram-1', true);
+
+  assert.equal(await pending, true);
+});
+
+test('RAM optimization defaults to declined if the boss never answers (timeout)', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator._ramOptimizationTimeoutMs = 1;
+
+  const approved = await orchestrator._requestRamOptimization({
+    id: 'ram-2', currentFreeMb: 1000, targetFreeMb: 20 * 1024, apps: [{ name: 'Calendar', residentMb: 500 }],
+  });
+  assert.equal(approved, false);
+});
+
+test('aborting a run declines any still-pending RAM optimization request instead of closing apps', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const pending = orchestrator._requestRamOptimization({
+    id: 'ram-3', currentFreeMb: 1000, targetFreeMb: 20 * 1024, apps: [{ name: 'Calendar', residentMb: 500 }],
+  });
+  orchestrator._clearPendingApprovals(true); // an abort resolves patch/command approvals as `approved`...
+  // ...but RAM optimization must still come back false regardless, since closing
+  // apps is never a side effect of aborting.
+  assert.equal(await pending, false);
+});
+
+test('fallback project structure trusts the brief\'s own deliveryArtifacts over an appType guess', async () => {
+  // Reproduces a real failure: the real brief model correctly classified a
+  // browser game's deliveryArtifacts as HTML5/Phaser.js files but labeled
+  // appType "web" (not "game"). A later sprint's task-planning self-heal
+  // ignored deliveryArtifacts and used an appType-only heuristic that does
+  // not recognize "web" as a game, falling through to an unrelated
+  // React+Vite+TypeScript scaffold and corrupting the project with two
+  // incompatible tech stacks.
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const brief = {
+    projectName: 'brick-breaker-game',
+    goal: 'Build a brick breaker (Arkanoid-style) browser game with 30 different levels.',
+    appType: 'web',
+    targetPlatforms: ['all modern web browsers'],
+    chosenStack: ['HTML5', 'CSS3', 'JavaScript', 'Phaser.js'],
+    coreFeatures: ['30 levels of increasing difficulty'],
+    assumptions: [],
+    nonGoals: [],
+    acceptanceCriteria: [],
+    deliveryArtifacts: ['package.json', 'index.html', 'styles.css', 'src/logic.js', 'src/render.js', 'src/app.js', 'test/logic.test.js', 'README.md'],
+    buildAndRunCommands: ['npm install'],
+    verificationCommands: ['npm test'],
+  };
+
+  const structure = orchestrator._fallbackProjectStructure(brief);
+  assert.deepEqual(structure, brief.deliveryArtifacts);
+  assert.ok(!structure.includes('vite.config.ts'), 'must not fall through to the unrelated React+Vite scaffold');
+  assert.ok(!structure.some(f => f.endsWith('.tsx')), 'must not introduce React/TypeScript files for an HTML5/JS brief');
+});
+
+test('fallback project structure still uses the appType heuristic when the brief has no deliveryArtifacts', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const brief = {
+    projectName: 'demo', goal: 'Build a brick breaker browser game with canvas and index.html.',
+    appType: 'game', targetPlatforms: [], chosenStack: [], coreFeatures: [], assumptions: [], nonGoals: [],
+    acceptanceCriteria: [], deliveryArtifacts: [], buildAndRunCommands: [], verificationCommands: [],
+  };
+  const structure = orchestrator._fallbackProjectStructure(brief);
+  assert.ok(structure.includes('index.html'));
+  assert.ok(structure.includes('src/logic.js'));
+});
+
 test('capability assessment detects web, file, and credential needs (EN + VI)', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);
@@ -961,6 +1926,73 @@ test('one-shot goals on missing personal data still stop honestly', async () => 
   );
 });
 
+test('refuses to build into this extension\'s own source tree unless explicitly allowed', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  // Reproduce the workspace shape from the real incident: the extension's own
+  // package.json plus its orchestrator source file present at the workspace root.
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'local-multi-agent-coder' }));
+  fs.mkdirSync(path.join(root, 'src', 'orchestrator'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'orchestrator', 'AgentOrchestrator.ts'), '// marker\n');
+
+  const goal = 'build a calculator that adds two numbers';
+  await assert.rejects(
+    () => orchestrator._preflightCapabilities(goal),
+    /own source tree/
+  );
+
+  // The escape hatch works for intentional self-modification.
+  orchestrator.modelConfig.allowSelfWorkspace = true;
+  await orchestrator._preflightCapabilities(goal);
+});
+
+test('does not guard a normal project workspace that merely has a package.json', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'some-users-app' }));
+
+  await orchestrator._preflightCapabilities('build a calculator that adds two numbers');
+});
+
+test('dependency install runs pip3 install for a Python artifact when pip3 is available', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  fs.writeFileSync(path.join(root, 'requirements.txt'), 'requests>=2,<3\n');
+  fs.writeFileSync(orchestrator.workspace.toolchainReportPath, JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    packageManager: 'npm',
+    checks: [{ name: 'pip3', command: 'pip3 --version', available: true, version: 'pip 24.0' }],
+    missing: [],
+    notes: [],
+  }));
+
+  await orchestrator._phaseDependencyInstall(makeState());
+
+  assert.ok(orchestrator.terminal.commands.includes('pip3 install -r requirements.txt'),
+    'expected pip3 install to run for a declared requirements.txt');
+});
+
+test('dependency install skips Python deps gracefully when pip3 is unavailable (no throw)', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  fs.writeFileSync(path.join(root, 'requirements.txt'), 'requests>=2,<3\n');
+  fs.writeFileSync(orchestrator.workspace.toolchainReportPath, JSON.stringify({
+    generatedAt: new Date().toISOString(),
+    packageManager: 'npm',
+    checks: [{ name: 'pip3', command: 'pip3 --version', available: false, error: 'not found' }],
+    missing: ['pip3'],
+    notes: [],
+  }));
+
+  await orchestrator._phaseDependencyInstall(makeState());
+
+  assert.ok(!orchestrator.terminal.commands.includes('pip3 install -r requirements.txt'));
+  assert.match(
+    fs.readFileSync(orchestrator.workspace.dependencyInstallLogPath, 'utf8'),
+    /pip3 is not available/
+  );
+});
+
 test('artifact verification flags missing deliverables and phantom README references', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);
@@ -976,6 +2008,31 @@ test('artifact verification flags missing deliverables and phantom README refere
   assert.ok(result.phantomReferences.includes('tests'));
   assert.ok(result.phantomReferences.includes('app/server.py'));
   assert.ok(!result.phantomReferences.some(r => r.includes('npm')));
+});
+
+test('completion artifact gate requires a valid manifest whose files still exist', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  fs.writeFileSync(path.join(root, 'README.md'), '# Product\n');
+  fs.writeFileSync(path.join(root, 'index.js'), 'module.exports = 1;\n');
+  orchestrator.workspace.writeFile(orchestrator.workspace.testResultLogPath, 'tests passed\n');
+  const brief = JSON.stringify({ deliveryArtifacts: ['source project', 'README instructions', 'verification log'] });
+
+  const missingManifest = orchestrator._runArtifactVerification(brief);
+  assert.equal(missingManifest.ok, false);
+  assert.match(missingManifest.summary, /manifest is missing/i);
+
+  orchestrator.workspace.writeFile(orchestrator.workspace.deliveryManifestPath, JSON.stringify({
+    filesIncluded: ['README.md', 'index.js'], archiveCreated: false,
+  }));
+  assert.equal(orchestrator._runArtifactVerification(brief).ok, true);
+
+  orchestrator.workspace.writeFile(orchestrator.workspace.deliveryManifestPath, JSON.stringify({
+    filesIncluded: ['README.md', 'missing.js'], archiveCreated: false,
+  }));
+  const stale = orchestrator._runArtifactVerification(brief);
+  assert.equal(stale.ok, false);
+  assert.match(stale.summary, /missing\.js/);
 });
 
 test('autonomous goal seeds the build pipeline with the dynamic team verdict and skips the fixed debate', async () => {
@@ -1156,6 +2213,72 @@ test('agent infers misspelled short Vietnamese Arkanoid prompt as a 10-level bro
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
 });
 
+test('deterministic Arkanoid recovery honors an explicit non-default level count', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt(
+    'Build a complete Arkanoid style brick breaker browser game called Mega Breaker with canvas, 30 levels, and node:test coverage.'
+  );
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-arkanoid-30-levels',
+    title: 'Implement Arkanoid game',
+    description: 'Implement paddle, ball, bricks, thirty levels, rendering, and tests.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/logic.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['Playable by opening index.html', '30 levels exist', 'npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = { tasks: [task], totalTasks: 1, estimatedComplexity: 'low', createdAt: now };
+
+  const brief = orchestrator._fallbackProjectBrief(orchestrator.workspace.readUserPrompt());
+  assert.ok(brief.coreFeatures.some(feature => /30 playable levels/.test(feature)));
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+  assert.ok(recovery);
+  const logic = fs.readFileSync(path.join(root, 'src/logic.js'), 'utf8');
+  assert.match(logic, /MAX_LEVEL = 30/);
+  assert.match(fs.readFileSync(path.join(root, 'README.md'), 'utf8'), /30 handcrafted difficulty levels/);
+
+  const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic Arkanoid recovery honors a level count with an adjective in between ("30 different levels")', async () => {
+  // Reproduces a real failure: a real 5-model run's actual prompt phrasing —
+  // "30 different levels" — silently missed the number-then-keyword-only
+  // extraction regex (which required the count to be immediately followed by
+  // "level(s)") and fell back to the default of 10, shipping a 10-level game
+  // for a goal that explicitly asked for 30.
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt(
+    'Build a brick breaker (Arkanoid-style) browser game with 30 different levels of increasing difficulty, playable directly in a web browser.'
+  );
+  assert.equal(orchestrator._extractRequestedLevelCount(orchestrator.workspace.readUserPrompt()), 30);
+
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-arkanoid-30-different-levels',
+    title: 'Implement Arkanoid game',
+    description: 'Implement paddle, ball, bricks, levels, rendering, and tests.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['src/logic.js'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['Playable by opening index.html', '30 levels exist', 'npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = { tasks: [task], totalTasks: 1, estimatedComplexity: 'low', createdAt: now };
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+  assert.ok(recovery);
+  assert.match(fs.readFileSync(path.join(root, 'src/logic.js'), 'utf8'), /MAX_LEVEL = 30/);
+});
+
 test('deterministic CLI recovery creates a verifiable local tool', async () => {
   const root = makeTempWorkspace();
   const orchestrator = await makeOrchestrator(root);
@@ -1188,6 +2311,41 @@ test('deterministic CLI recovery creates a verifiable local tool', async () => {
 
   const result = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+});
+
+test('deterministic CLI recovery honors an explicit greeting flag contract', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.workspace.writeUserPrompt('Create a dependency-free Node.js CLI tool called "greet" that accepts a --name flag and prints "Hello, <name>!" to stdout.');
+  orchestrator.workspace.writeFile(orchestrator.workspace.projectBriefPath, JSON.stringify({
+    projectName: 'greet',
+    deliveryArtifacts: ['greet.js', 'package.json', 'test.js'],
+  }));
+  const now = new Date().toISOString();
+  const task = {
+    id: 'task-greet-recovery',
+    title: 'Create project scaffold and scripts',
+    description: 'Implement the greet CLI contract.',
+    assignedAgent: 'codeWorker',
+    dependsOn: [],
+    allowedFiles: ['package.json', 'src/cli.js', 'test/cli.test.js', 'README.md'],
+    forbiddenActions: [],
+    acceptanceCriteria: ['--name Ada prints Hello, Ada!', 'npm test passes'],
+    status: 'in_progress',
+    createdAt: now,
+  };
+  const taskPlan = { tasks: [task], totalTasks: 1, estimatedComplexity: 'low', createdAt: now };
+
+  const recovery = await orchestrator._tryDeterministicTaskRecovery(task, makeState(), taskPlan);
+
+  assert.ok(recovery);
+  const reconciledBrief = JSON.parse(orchestrator.workspace.readFile(orchestrator.workspace.projectBriefPath));
+  assert.deepEqual(reconciledBrief.deliveryArtifacts, ['package.json', 'src/cli.js', 'test/cli.test.js', 'README.md']);
+  const cli = cp.spawnSync(process.execPath, ['src/cli.js', '--name', 'Ada'], { cwd: root, encoding: 'utf8' });
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.equal(cli.stdout.trim(), 'Hello, Ada!');
+  const tests = cp.spawnSync('npm', ['test'], { cwd: root, encoding: 'utf8' });
+  assert.equal(tests.status, 0, `${tests.stdout}\n${tests.stderr}`);
 });
 
 test('deterministic REST API recovery creates a verifiable API', async () => {

@@ -16,7 +16,10 @@ IMPORTANT RULES:
 - Do not suggest cloud services (AWS, GCP, Azure, OpenAI, etc.).
 - Do not ask the user follow-up questions. When requirements are ambiguous, choose sensible defaults and record them as assumptions.
 - Output only what is asked. No filler text or apologies.
+- Directory entries in file changes must end with / and have empty content. Never create a regular empty file in place of a directory. Parent directories are created automatically for real files.
 - Do not start your response with "Certainly!" or "Sure!" or any pleasantry.
+- If the goal requires a fixed collection count (levels, stages, pages, questions, or items), create acceptance.json with a collections array binding each label to the authoritative product data. Example: {"collections":[{"label":"levels","source":{"kind":"json-array","file":"src/levels.json","pointer":""}}]}. For procedural data use {"label":"levels","source":{"kind":"module-export","file":"src/levels.js","export":"levels"}} and export the actual materialized array from a Node-loadable data module used by the product. Never bind a dummy array or a claimed numeric count. Include this file in the task plan and deliverables. Verification reads and counts the actual collection independently; tests must also check behavior across the whole collection.
+- NEVER plan, require, or author binary asset files (images: .png/.jpg/.jpeg/.gif/.bmp/.webp/.ico/.tiff; audio: .mp3/.wav/.ogg/.m4a/.flac/.aac; video: .mp4/.mov/.webm; fonts: .ttf/.otf/.woff/.woff2). You can only write text. A binary file "authored" by you is always empty/corrupt garbage, not a real asset, and will fail review every time with no way to fix it. Instead, generate all visuals procedurally in code (e.g. Canvas/WebGL draw calls, a game engine's shape/graphics API such as Phaser's Graphics.generateTexture, or inline SVG) and all audio procedurally (e.g. WebAudio-generated tones) or omit audio. Text-based vector formats (.svg) are fine since they are plain text.
 `.trim();
 
 // -----------------------------------------------------------------------
@@ -220,10 +223,12 @@ You have received the final architecture plan. Your job:
 7. Do not put contradictions in a task: if a file is required by acceptance criteria, it must be in allowedFiles and must not appear in forbiddenActions.
 8. Plan a small development sprint, not a giant one-shot build. Prefer 2-5 vertical tasks that can each be coded, reviewed, and checked before the next task.
 9. Each sprint should move the product toward a runnable whole: setup, one core slice, tests, then polish/docs. Do not create many disconnected fragments.
+   Do not assign empty source files or empty test folders as completed implementation work. NEVER write an acceptance criterion that describes a file as "empty", "blank", or placeholder-only — every file any task creates must be reviewable as real, non-empty, working content (a stub is fine, e.g. a minimal function body or {}; a literally empty file is not, and is a leading cause of tasks becoming unfixable). The first task should provide a working entry point and a meaningful test; later tasks extend functioning modules. Keep build and test dependencies compatible and avoid redundant toolchains.
 10. COMPILABILITY RULE: Every task must leave the project in a compilable state. Never assign a task that creates a file referencing a symbol that won't exist until a later task. If a dependency is needed, declare it in dependsOn.
 11. For Swift/iOS/macOS projects WITHOUT xcodebuild (check toolchain report): task-001 MUST create a real, compilable Package.swift with all targets, plus stub source files for every target so that \`swift build\` succeeds immediately. NEVER create a placeholder .xcodeproj text file — that is non-functional. If xcodebuild IS available, task-001 may create .xcodeproj.
 12. For Swift projects, state the minimum deployment target (iOS 16+, macOS 13+) in Package.swift. Subsequent tasks add feature source files; each task must keep \`swift build\` passing.
 13. For Swift projects, allowedFiles for the first task must include "Package.swift" and stub .swift files for every declared target.
+14. SPECIALIST ASSIGNMENT: if a "# Specialist Team Roster" section is present in the context, this project was staffed by a bespoke team of specialist agents (each with their own domain and bound model) that already debated and chose this direction. For each task, set "specialistId" to the id of whichever roster specialist's specialty most closely matches that task's actual work (e.g. a UI/rendering task to a frontend-leaning builder, a data-modeling task to whoever owns architecture/backend). Leave "specialistId" out entirely for a task that does not clearly match any listed specialty — never invent an id that is not in the roster. If no roster section is present, omit "specialistId" from every task.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -234,6 +239,7 @@ IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
       "title": "Short task title",
       "description": "Detailed description of what to implement",
       "assignedAgent": "codeWorker",
+      "specialistId": "omit unless a Specialist Team Roster was given and a specialist clearly owns this task",
       "dependsOn": [],
       "allowedFiles": ["list of files this task is allowed to create or modify"],
       "forbiddenActions": ["e.g. do not modify package.json"],
@@ -484,6 +490,20 @@ Your job:
 4. Document any known limitations or outstanding issues.
 5. Suggest next steps the user should take.
 6. If a README update is needed, include it as a section.
+
+GROUNDING RULES (a prior real run's report claimed libraries the code never
+used, e.g. "requests/BeautifulSoup" when the actual file only imported
+urllib/html.parser — do not repeat this):
+- Only name a library, framework, or technique if it actually appears in the
+  "Changed Files" / task-result content you were given. Never state what a
+  file "uses" from general knowledge of what such a tool typically uses.
+- If the "Autonomous Assumptions" section reports that deterministic
+  self-healing or fallback recovery produced some or all of the deliverable
+  (instead of a full model-authored implementation), say so plainly in
+  "Known Limitations" — do not describe self-healed output as if it were
+  originally designed and reviewed end-to-end.
+- If you are not certain a claim is backed by the provided file content,
+  omit the claim rather than guess.
 
 ${COMMON_RULES}`;
 

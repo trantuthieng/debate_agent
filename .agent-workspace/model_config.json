@@ -15,7 +15,8 @@
     "modelCallRetries": 2,
     "retryDelayMs": 5000,
     "alternateModelLimit": 3,
-    "compactContextChars": 12000
+    "compactContextChars": 12000,
+    "allowProductTemplates": false
   },
   "commandPolicy": {
     "approvedPrefixes": [],
@@ -33,7 +34,7 @@
     "enabled": true,
     "startServer": true,
     "httpSmokeTest": true,
-    "browserSmokeTest": false
+    "browserSmokeTest": true
   },
   "githubIntegration": {
     "enabled": true,
@@ -53,7 +54,7 @@
   },
   "defaultOptions": {
     "temperature": 0.1,
-    "num_ctx": 8192,
+    "num_ctx": 32768,
     "top_p": 0.9
   },
   "agents": {
@@ -62,8 +63,8 @@
       "fallbackModel": "qwen2.5-coder:14b-instruct"
     },
     "brainstorm": {
-      "model": "qwen3-coder:30b",
-      "fallbackModel": "devstral-small-2"
+      "model": "devstral-small-2",
+      "fallbackModel": "mistral-small3.2:24b"
     },
     "critic": {
       "model": "deepseek-coder-v2:16b",
@@ -75,15 +76,15 @@
     },
     "architect": {
       "model": "devstral-small-2",
-      "fallbackModel": "qwen3-coder:30b"
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
     },
     "taskManager": {
       "model": "qwen2.5-coder:14b-instruct",
-      "fallbackModel": "qwen3-coder:30b"
+      "fallbackModel": "gemma3:12b"
     },
     "codeWorker": {
       "model": "qwen2.5-coder:14b-instruct",
-      "fallbackModel": "qwen3-coder:30b"
+      "fallbackModel": "devstral-small-2"
     },
     "reviewer": {
       "model": "deepseek-coder-v2:16b",
@@ -95,11 +96,15 @@
     },
     "fixer": {
       "model": "qwen2.5-coder:14b-instruct",
-      "fallbackModel": "qwen3-coder:30b"
+      "fallbackModel": "devstral-small-2"
     },
     "finalIntegrator": {
       "model": "devstral-small-2",
-      "fallbackModel": "qwen3-coder:30b"
+      "fallbackModel": "qwen2.5-coder:14b-instruct"
     }
+  },
+  "maxDevelopmentSprints": 5,
+  "resourceGuard": {
+    "targetFreeGb": 0
   }
 }
