@@ -61,13 +61,56 @@ const DEFAULT_SAFE_PREFIXES = [
   'dotnet test',
 ];
 
-const NETWORK_PATTERNS: RegExp[] = [
-  /\bcurl\b/i,
-  /\bwget\b/i,
-  /\bgh\b/i,
-  /\bgit\s+(clone|fetch|pull|push)\b/i,
-  /\b(npm|pnpm|yarn|pip|pip3|cargo|go)\s+(install|add|get)\b/i,
-];
+interface ShellToken { value: string; operator: boolean }
+
+// This is a conservative command classifier, not a shell parser or OS sandbox.
+// In particular, project scripts can themselves perform network I/O or writes.
+// Complex shell syntax and inline programs need explicit approval; ordinary
+// project scripts retain their existing execution path.
+function scanShell(command: string): { tokens: ShellToken[]; complex: boolean } {
+  const tokens: ShellToken[] = [];
+  let word = '';
+  let started = false;
+  let quote = '';
+  let complex = false;
+  const flush = (): void => {
+    if (started) { tokens.push({ value: word, operator: false }); }
+    word = ''; started = false;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (char === '\\' && quote !== "'") {
+      const next = command[++i];
+      if (next === undefined || /[\r\n]/.test(next)) { complex = true; }
+      else { word += next; started = true; }
+    } else if (quote) {
+      if (char === quote) { quote = ''; }
+      else {
+        if (quote === '"' && /[$`]/.test(char)) { complex = true; }
+        word += char;
+      }
+    } else if (char === "'" || char === '"') {
+      quote = char; started = true;
+    } else if (char === '#' && !started) {
+      // Stop at a comment, but still inspect any following command line.
+      while (i + 1 < command.length && !/[\r\n]/.test(command[i + 1])) { i++; }
+    } else if (/\s/.test(char)) {
+      flush();
+      if (/[\r\n]/.test(char)) { complex = true; }
+    } else if (/[;&|<>()]/.test(char)) {
+      flush();
+      const operator = /^(?:&>>|&>|>>|>\||>&|<>|<<|<&|&&|\|\||[;&|<>()])/.exec(command.slice(i))![0];
+      tokens.push({ value: operator, operator: true });
+      if (!['>', '>>', '>|', '&>', '&>>', '>&', '<', '<&', '<>'].includes(operator)) { complex = true; }
+      i += operator.length - 1;
+    } else {
+      if (/[$`{}~]/.test(char)) { complex = true; }
+      word += char; started = true;
+    }
+  }
+  flush();
+  return { tokens, complex: complex || quote !== '' };
+}
 
 export class CommandPolicy {
   private readonly safePrefixes: string[];
@@ -95,8 +138,10 @@ export class CommandPolicy {
   evaluate(command: string, workspaceRoot?: string): CommandPolicyDecision {
     const trimmed = command.trim();
     const lower = trimmed.toLowerCase();
+    const shell = scanShell(trimmed);
+    const argv = shell.tokens.filter(token => !token.operator).map(token => token.value);
 
-    const dangerous = DEFAULT_DANGEROUS_PATTERNS.find(pattern => pattern.test(trimmed));
+    const dangerous = DEFAULT_DANGEROUS_PATTERNS.find(pattern => pattern.test(trimmed) || pattern.test(argv.join(' ')));
     if (dangerous) {
       return {
         risk: 'needs_approval',
@@ -107,27 +152,32 @@ export class CommandPolicy {
 
     // An external-write redirection must always require approval, even when the
     // command otherwise matches a safe prefix (e.g. `node app.js 2>/etc/passwd`).
-    if (workspaceRoot && this.config.requireApprovalForExternalWrites && this._looksLikeExternalWrite(trimmed, workspaceRoot)) {
+    if (this.config.requireApprovalForExternalWrites && this._looksLikeExternalWrite(shell.tokens, argv, workspaceRoot)) {
       return {
         risk: 'needs_approval',
         reason: 'Command appears to write outside the workspace.',
       };
     }
 
-    const safePrefix = this.safePrefixes.find(prefix => this._matchesSafePrefix(lower, prefix));
-    if (safePrefix && !this._hasShellControlOperator(trimmed)) {
-      return { risk: 'safe', reason: 'Command matches an approved safe prefix.', matchedRule: safePrefix };
+    if (this.config.requireApprovalForNetwork && this._looksLikeNetworkCommand(argv)) {
+      return {
+        risk: 'needs_approval',
+        reason: 'Command may access the network or external package registries.',
+      };
     }
 
-    if (this.config.requireApprovalForNetwork) {
-      const network = NETWORK_PATTERNS.find(pattern => pattern.test(trimmed));
-      if (network) {
-        return {
-          risk: 'needs_approval',
-          reason: 'Command may access the network or external package registries.',
-          matchedRule: network.source,
-        };
-      }
+    if (shell.complex || this._hasInlineProgram(argv)) {
+      return {
+        risk: 'needs_approval',
+        reason: 'Compound shell syntax, expansions, or inline programs require explicit approval.',
+      };
+    }
+
+    // Prefix approval never disables the network/external-write flags, or
+    // grants arbitrary extra commands appended to an approved command.
+    const safePrefix = this.safePrefixes.find(prefix => this._matchesSafePrefix(lower, prefix));
+    if (safePrefix) {
+      return { risk: 'safe', reason: 'Command matches an approved safe prefix.', matchedRule: safePrefix };
     }
 
     return {
@@ -136,17 +186,69 @@ export class CommandPolicy {
     };
   }
 
-  private _looksLikeExternalWrite(command: string, workspaceRoot: string): boolean {
-    // Catch stdout/stderr/combined redirections: `>`, `>>`, `2>`, `2>>`, `&>`, `&>>`.
-    const redirectionPattern = /(?:^|\s)(?:\d*&?>|>>|\d+>>)\s*([^\s]+)/g;
-    let match: RegExpExecArray | null;
-    while ((match = redirectionPattern.exec(command)) !== null) {
-      const target = match[1].replace(/^['"]|['"]$/g, '');
-      if (!path.isAbsolute(target)) { continue; }
-      const relative = path.relative(workspaceRoot, target);
-      if (relative.startsWith('..') || path.isAbsolute(relative)) { return true; }
+  private _looksLikeExternalWrite(tokens: ShellToken[], argv: string[], workspaceRoot?: string): boolean {
+    const outside = (target: string): boolean => {
+      if (!workspaceRoot || !target || /[*?\[\]]/.test(target)) { return true; }
+      const relative = path.relative(path.resolve(workspaceRoot), path.resolve(workspaceRoot, target));
+      return relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    };
+    for (let i = 0; i < tokens.length; i++) {
+      if (!tokens[i].operator || !['>', '>>', '>|', '&>', '&>>', '>&', '<>'].includes(tokens[i].value)) { continue; }
+      const target = tokens[i + 1];
+      if (!target || target.operator) { return true; }
+      if (tokens[i].value === '>&' && /^(?:\d+|-)$/.test(target.value)) { continue; }
+      if (outside(target.value)) { return true; }
+    }
+    const executable = path.basename(argv[0] ?? '').toLowerCase().replace(/\.exe$/, '');
+    const writesOperands = /^(?:cp|mv|install|mkdir|touch|tee|truncate|dd|ln|rm|rmdir)$/.test(executable);
+    for (let i = 1; i < argv.length; i++) {
+      const arg = argv[i];
+      // Global package installation writes beyond the project even without a
+      // literal path argument. Prefix/output options can redirect approved tools.
+      if (/^(?:npm|pnpm|yarn|pip|pip3)$/.test(executable) && /^(?:-g|--global|--user)(?:=|$)|^--location=global$/.test(arg)) { return true; }
+      const option = /^(--(?:prefix|cwd|dir|directory|target|root|output|out-dir|cache|store-dir)|-[Cot])(?:=(.*))?$/.exec(arg);
+      if (option && outside(option[2] ?? argv[i + 1] ?? '')) { return true; }
+      const attached = /^(?:-[Cot]|of=)(.+)$/.exec(arg);
+      if (attached && outside(attached[1])) { return true; }
+      if (writesOperands && !arg.startsWith('-') && outside(arg)) { return true; }
     }
     return false;
+  }
+
+  private _looksLikeNetworkCommand(argv: string[]): boolean {
+    return argv.some((arg, index) => {
+      const executable = path.basename(arg).toLowerCase().replace(/\.exe$/, '');
+      const rest = argv.slice(index + 1);
+      if (/^(?:curl|wget|gh|npx)$/.test(executable)) { return true; }
+      if (executable === 'git') { return rest.some(value => /^(?:clone|fetch|pull|push|ls-remote)$/.test(value)); }
+      if (/^(?:npm|pnpm|yarn|pip|pip3|cargo|go)$/.test(executable)) {
+        return (executable === 'yarn' && rest.length === 0) ||
+          rest.some(value => /^(?:install|i|ci|add|get|update|upgrade|exec|dlx|download)$/.test(value));
+      }
+      return false;
+    });
+  }
+
+  private _hasInlineProgram(argv: string[]): boolean {
+    if (/^[A-Za-z_]\w*=/.test(argv[0] ?? '')) { return true; }
+    return argv.some((arg, index) => {
+      const executable = path.basename(arg).toLowerCase().replace(/\.exe$/, '');
+      const rest = argv.slice(index + 1);
+      if (/^(?:sh|bash|zsh|dash|ksh|fish|cmd|powershell|pwsh)$/.test(executable) ||
+          (index === 0 && /^(?:eval|source|\.|env|command|exec|xargs)$/.test(executable))) {
+        return !(rest.length === 1 && rest[0] === '--version');
+      }
+      if (/^(?:node|nodejs)$/.test(executable)) {
+        return rest.some(value => value === '-' || /^(?:-[epr]|--(?:eval|print|require|import|loader)(?:=|$))/.test(value));
+      }
+      if (/^python\d*(?:\.\d+)?$/.test(executable)) {
+        return rest.some(value => value === '-' || value.startsWith('-c'));
+      }
+      if (/^(?:ruby|perl)$/.test(executable)) {
+        return rest.some(value => value === '-' || /^-[er]/.test(value));
+      }
+      return false;
+    });
   }
 
   private _matchesSafePrefix(lowerCommand: string, prefix: string): boolean {
@@ -155,9 +257,5 @@ export class CommandPolicy {
     if (lowerPrefix.endsWith(' ')) { return true; }
     const next = lowerCommand[lowerPrefix.length];
     return next === undefined || /\s/.test(next);
-  }
-
-  private _hasShellControlOperator(command: string): boolean {
-    return /(?:&&|\|\||[;|`]|[$]\(|\r|\n)/.test(command);
   }
 }
