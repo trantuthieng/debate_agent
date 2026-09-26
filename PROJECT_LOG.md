@@ -487,3 +487,12 @@ Chạy `node test/brick_breaker_e2e.js` nền (`nohup ... & disown`, PID 43873),
 - `test/brick_breaker_e2e.js`: `report()` (gọi mỗi 60s từ heartbeat) giờ bắt lỗi ghi file và chỉ log `[warn]` — trước đây 1 lỗi ghi tạm thời (EACCES như lần 4) ném exception trong `setInterval` và giết cả run nhiều giờ.
 - `npm run check`: 363/363 pass. RAM: memory_pressure 87% free.
 - Chạy lại benchmark: PID 54822, log `/private/tmp/debate-brick20-20260926-055153.log`.
+
+### 2026-09-26 (tiếp) — Kết quả run 4 (chạy lại) + sửa lỗi mới + chạy run 5
+
+**Run 4 (PID 54822, `demo/brick-breaker-20-2026-09-25T22-51-53-153Z`), ~2h40m, dừng chủ động:**
+- Tích cực: không lỗi môi trường; 4 vòng debate đủ; lần đầu task-manager gán `specialistId` cho task (002–005); planning routing đúng; **fix #2 (`815ff86`) xác nhận live**: `Repeated repair of "sprint-01-task-003" is being escalated from qwen2.5-coder:14b-instruct to devstral-small-2`.
+- Lỗi mới: task-003 gộp 21 file (`level1..20.js` + `index.js`). Mọi call 14B/devstral cho task này timeout 600s; chỉ retry compact-context bằng 7B thành công nhưng viết "add more…" → review chặn đúng → không bao giờ pass. Thêm: quality-audit đòi tạo đủ level1..20.js dù đó chỉ là file *được phép*.
+- Sửa (`724d904`): `_splitOversizedTasks` (tất định, gọi sau `_normalizeTaskItem`) chia task >6 file thành các phần tuần tự (part cuối giữ id gốc + acceptance criteria gốc + file aggregator `index/main/app.*`); rule 2 `TASK_MANAGER_SYSTEM`: tối đa 6 file/task, nhiều item giống nhau gom vào 1 file dữ liệu; prompt quality-audit: allowed files là "được phép", không phải "bắt buộc". `npm run check` 364/364.
+- Dừng run 4 (SIGTERM) vì tiến trình chạy code cũ, task-003 chắc chắn fail. Chạy run 5: PID 69856, log `/private/tmp/debate-brick20-20260926-083148.log`.
+- Fix #1 (off-stack `Package.swift`) vẫn chưa được kiểm chứng live (chỉ xuất hiện ở pha testing).
