@@ -7365,9 +7365,11 @@ export class AgentOrchestrator {
         ...task.allowedFiles.filter(file => !isAggregator(file)),
         ...task.allowedFiles.filter(isAggregator),
       ];
+      // Balanced parts (7 files → 4+3, not 6+1).
+      const chunkSize = Math.ceil(ordered.length / Math.ceil(ordered.length / MAX_FILES_PER_TASK));
       const chunks: string[][] = [];
-      for (let i = 0; i < ordered.length; i += MAX_FILES_PER_TASK) {
-        chunks.push(ordered.slice(i, i + MAX_FILES_PER_TASK));
+      for (let i = 0; i < ordered.length; i += chunkSize) {
+        chunks.push(ordered.slice(i, i + chunkSize));
       }
       const total = chunks.length;
       const partId = (k: number) => (k === total ? task.id : `${task.id}-part-${k}`);

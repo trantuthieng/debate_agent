@@ -2626,3 +2626,15 @@ test('task planning splits a task with more files than one model call can author
   assert.deepEqual(split[4], tasks[1]);
   assert.match(orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '', /split it into 4 sequential parts/);
 });
+
+test('oversized task parts are balanced rather than leaving a one-file tail', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const files = ['a.js', 'b.js', 'c.js', 'd.js', 'e.js', 'f.js', 'src/main.js'];
+  const split = orchestrator._splitOversizedTasks([
+    { id: 'task-001', title: 'Setup', description: 'd', dependsOn: [], allowedFiles: files, forbiddenActions: [], acceptanceCriteria: ['runs'] },
+  ]);
+
+  assert.deepEqual(split.map(t => t.allowedFiles.length), [4, 3]);
+  assert.ok(split[1].allowedFiles.includes('src/main.js'));
+});
