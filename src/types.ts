@@ -177,6 +177,12 @@ export interface ModelConfig {
   maxDevelopmentSprints?: number;
   maxFixRetries: number;
   autoInstallDependencies: boolean;
+  /**
+   * Install dependencies as soon as package.json exists and run the real
+   * build/test/browser checks after every task, feeding failures in that
+   * task's files back into its review. Default true.
+   */
+  perTaskVerification?: boolean;
   artifactDir: string;
   createFinalArchive: boolean;
   requireVerificationScripts: boolean;

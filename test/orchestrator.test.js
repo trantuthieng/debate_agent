@@ -2738,3 +2738,68 @@ test('test-fix focus picks the first failing file cluster and only its diagnosti
   assert.doesNotMatch(focus.diagnostics, /unrelated/);
   assert.equal(orchestrator._verificationErrorScore({ failedCommands: ['npm run build'], output }), 1006, 'one failed command + six error lines');
 });
+
+async function runtimeHarness({ scripts, results }) {
+  const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ scripts }));
+  const orchestrator = await makeOrchestrator(root);
+  orchestrator.modelConfig = { ...orchestrator.modelConfig, perTaskVerification: true, autoInstallDependencies: true, appVerification: { enabled: false } };
+  const commands = [];
+  const reply = (command) => {
+    commands.push(command);
+    const [success, output = ''] = results[command] ?? [true];
+    if (command === 'npm install' && success) { fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true }); }
+    return { command, success, exitCode: success ? 0 : 1, stdout: output, stderr: '', durationMs: 1 };
+  };
+  orchestrator.terminal.runSafeCommand = async command => reply(command);
+  orchestrator.terminal.runTests = async () => reply('npm test');
+  orchestrator.terminal.detectPackageManager = () => 'npm';
+  orchestrator.terminal.hasPackageScript = name => typeof scripts[name] === 'string';
+  const task = { id: 'task-003', title: 't', description: 'd', dependsOn: [], allowedFiles: ['src/ball.js'], forbiddenActions: [], acceptanceCriteria: ['ok'] };
+  return { root, orchestrator, commands, task };
+}
+
+test('per-task verification installs dependencies, then reports build errors in the task\'s own files only', async () => {
+  const { orchestrator, commands, task } = await runtimeHarness({
+    scripts: { build: 'vite build', test: 'vitest run' },
+    results: { 'npm run build': [false, 'ERROR in src/ball.js:3\n  Unexpected token\nERROR in src/other.js:1\n  bad'] },
+  });
+
+  const issues = await orchestrator._taskRuntimeIssues(task, ['src/ball.js']);
+
+  assert.deepEqual(commands, ['npm install', 'npm run build', 'npm test']);
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /npm run build` fails in this task's files:\nERROR in src\/ball\.js:3\n  Unexpected token$/);
+  assert.equal((await orchestrator._taskRuntimeIssues(task, ['src/unrelated.js'])).length, 0, 'failures elsewhere are not this task\'s');
+  assert.ok(!commands.slice(3).includes('npm install'), 'an unchanged manifest is not reinstalled');
+});
+
+test('per-task verification blames failing tests on the task that wrote them, and skips placeholder test scripts', async () => {
+  const { orchestrator, task } = await runtimeHarness({
+    scripts: { test: 'vitest run' },
+    results: { 'npm test': [false, 'FAIL  expected 3 to be 4'] },
+  });
+  const issues = await orchestrator._taskRuntimeIssues(task, ['tests/ball.test.js']);
+  assert.match(issues[0], /npm test` fails after this task changed the tests/);
+
+  const placeholder = await runtimeHarness({ scripts: { test: "echo 'No tests yet.'" }, results: {} });
+  await placeholder.orchestrator._taskRuntimeIssues(placeholder.task, ['tests/ball.test.js']);
+  assert.deepEqual(placeholder.commands, ['npm install']);
+});
+
+test('a failed install is reported only when the task changed package.json, and stops further checks', async () => {
+  const { orchestrator, commands, task } = await runtimeHarness({
+    scripts: { build: 'vite build' },
+    results: { 'npm install': [false, 'ERESOLVE could not resolve'] },
+  });
+  assert.match((await orchestrator._taskRuntimeIssues(task, ['package.json']))[0], /npm install` fails after this task's package.json change/);
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['src/ball.js']), []);
+  assert.ok(!commands.includes('npm run build'));
+});
+
+test('per-task verification can be turned off', async () => {
+  const { orchestrator, commands, task } = await runtimeHarness({ scripts: { build: 'vite build' }, results: {} });
+  orchestrator.modelConfig.perTaskVerification = false;
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['src/ball.js']), []);
+  assert.deepEqual(commands, []);
+});

@@ -69,7 +69,7 @@ import type { SecretVault } from '../connectors/SecretVault';
 import { ConnectorManager } from '../connectors/ConnectorManager';
 import { findTypeScriptTaskIssues } from '../utils/typeScriptGate';
 import { findBrowserDeliveryIssues } from '../utils/browserDelivery';
-import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports } from '../utils/testTaskContracts';
+import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports, isPlaceholderScript } from '../utils/testTaskContracts';
 import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
 interface ImprovementConsensus {
@@ -209,6 +209,10 @@ export class AgentOrchestrator {
   // Per-run state for effort control and mid-task context injection
   private _taskPlanComplexity: 'low' | 'medium' | 'high' = 'medium';
   private _lastMicroCheckSummary = '';
+  /** Dependency manifests last installed by per-task verification. */
+  private _taskInstalledFingerprint = '';
+  /** Whether the browser smoke check passed at the previous per-task verification (null = not run yet). */
+  private _lastTaskSmokePassed: boolean | null = null;
   /** Focused diagnostics for a test-fix attempt, shown to the fixer instead of the whole verification log. */
   private readonly _testFixFocusText = new Map<string, string>();
 
@@ -2656,6 +2660,8 @@ export class AgentOrchestrator {
   }
 
   private async _runMicroSprintChecks(task: TaskItem, _state: ProjectState): Promise<void> {
+    // Per-task verification already ran the real checks during review.
+    if (this.modelConfig.perTaskVerification !== false && this.fileManager.fileExists('package.json')) { return; }
     const hasPackageChecks =
       this.terminal.hasPackageScript('compile') ||
       this.terminal.hasPackageScript('build') ||
@@ -3926,6 +3932,119 @@ export class AgentOrchestrator {
     return [...files].sort();
   }
 
+  /** Lines of a command output that mention any of the files (plus up to 3 continuation lines). */
+  private _diagnosticLinesFor(output: string, files: string[], maxLines = 40): string[] {
+    const root = this.workspace.rootDir.replace(/\\/g, '/');
+    const folder = path.posix.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const lines = output.split(`${root}/`).join('').replace(new RegExp(`/[^\\s'"()]*/${folder}/`, 'g'), '').split(/\r?\n/);
+    const startsError = /^\s*(\[\w+\]\s*)?(ERROR|✖|✗|FAIL)\b/i;
+    const picked: string[] = [];
+    lines.forEach((line, index) => {
+      if (!files.some(file => line.includes(file))) { return; }
+      picked.push(line);
+      for (const next of lines.slice(index + 1, index + 4)) {
+        if (startsError.test(next) && !files.some(file => next.includes(file))) { break; }
+        picked.push(next);
+      }
+    });
+    return [...new Set(picked)].slice(0, maxLines);
+  }
+
+  /**
+   * Real build / test / browser checks after one task, attributed to that task.
+   * Dependencies are installed whenever the manifests changed. A failure counts
+   * against the task only when its output names the task's files, the task
+   * wrote the tests that fail, the task changed the build setup, or (browser)
+   * the page broke right after this task changed web files.
+   */
+  private async _taskRuntimeIssues(task: TaskItem, changedPaths: string[]): Promise<string[]> {
+    if (this.modelConfig.perTaskVerification === false || !this.fileManager.fileExists('package.json')) { return []; }
+    const pm = this.terminal.detectPackageManager();
+    const tail = (text: string, lines = 30) => text.split(/\r?\n/).filter(Boolean).slice(-lines).join('\n');
+    const outputOf = (result: TerminalRunResult) => `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+    const run = async (command: string, timeoutMs: number): Promise<TerminalRunResult> => {
+      try { return await this.terminal.runSafeCommand(command, timeoutMs); } catch (err) {
+        if (err instanceof UserAbortError) { throw err; }
+        return { command, exitCode: -1, stdout: '', stderr: formatError(err), durationMs: 0, success: false };
+      }
+    };
+    const issues: string[] = [];
+    const summary: string[] = [];
+
+    const fingerprint = this._dependencyManifestFingerprint();
+    const nodeModules = fs.existsSync(path.join(this.workspace.rootDir, 'node_modules'));
+    if (this.modelConfig.autoInstallDependencies && (!nodeModules || fingerprint !== this._taskInstalledFingerprint)) {
+      const command = pm === 'yarn' ? 'yarn install' : pm === 'pnpm' ? 'pnpm install' : 'npm install';
+      this._emit('log', `Per-task verification for ${task.id}: installing dependencies.`, 'info');
+      const install = await run(command, 600_000);
+      summary.push(`${command}: ${install.success ? 'ok' : 'FAILED'}`);
+      if (!install.success) {
+        if (changedPaths.includes('package.json')) {
+          issues.push(`[runtime] \`${command}\` fails after this task's package.json change:\n${tail(outputOf(install))}`);
+        }
+        this._recordTaskRuntimeSummary(task, summary);
+        return issues; // nothing else can run without dependencies
+      }
+      this._taskInstalledFingerprint = fingerprint;
+    }
+
+    const buildSetupChanged = changedPaths.some(file =>
+      /^(package\.json|tsconfig[^/]*\.json|(webpack|vite|rollup|babel)\.config\.[cm]?[jt]s|\.babelrc)$/.test(file));
+    const buildScript = this.terminal.hasPackageScript('build') ? 'build' : this.terminal.hasPackageScript('compile') ? 'compile' : null;
+    if (buildScript) {
+      const command = this._packageScriptCommand(pm, buildScript);
+      const build = await run(command, 300_000);
+      summary.push(`${command}: ${build.success ? 'ok' : 'FAILED'}`);
+      if (!build.success) {
+        const own = this._diagnosticLinesFor(outputOf(build), changedPaths);
+        if (own.length > 0) { issues.push(`[runtime] \`${command}\` fails in this task's files:\n${own.join('\n')}`); }
+        else if (buildSetupChanged) { issues.push(`[runtime] \`${command}\` fails after this task changed the build setup:\n${tail(outputOf(build))}`); }
+      }
+    }
+
+    const testScript = this._packageTestScript();
+    if (testScript && !isPlaceholderScript(testScript)) {
+      const test = await this.terminal.runTests(pm);
+      summary.push(`${pm} test: ${test.success ? 'ok' : 'FAILED'}`);
+      if (!test.success) {
+        const wroteTests = changedPaths.some(file => TEST_FILE.test(file));
+        const own = this._diagnosticLinesFor(outputOf(test), changedPaths);
+        if (own.length > 0) { issues.push(`[runtime] \`${pm} test\` fails in this task's files:\n${own.join('\n')}`); }
+        else if (wroteTests || changedPaths.includes('package.json')) { issues.push(`[runtime] \`${pm} test\` fails after this task changed the tests or their setup:\n${tail(outputOf(test))}`); }
+      }
+    }
+
+    const webChanged = changedPaths.some(file => /\.(html?|m?[jt]sx?|css)$/.test(file) && !TEST_FILE.test(file));
+    const isWeb = ['index.html', 'public/index.html', 'src/index.html'].some(entry => this.fileManager.fileExists(entry));
+    if (webChanged && isWeb && this.modelConfig.appVerification?.enabled !== false) {
+      const smoke = await new AppVerificationService(this.workspace.rootDir, this.terminal, this.terminalSessions, this.modelConfig.appVerification).verify();
+      summary.push(`browser smoke: ${smoke.failed ? 'FAILED' : 'ok'}`);
+      const regression = smoke.failed && (this._lastTaskSmokePassed !== false || changedPaths.some(file => /\.html?$/.test(file)));
+      if (regression) {
+        const evidence = smoke.checks.filter(check => !check.success)
+          .map(check => `${check.command}: ${tail(outputOf(check), 8)}`).join('\n');
+        issues.push(`[runtime] The page fails in a real browser after this task:\n${evidence || smoke.summary}`);
+      }
+      this._lastTaskSmokePassed = !smoke.failed;
+    }
+
+    this._recordTaskRuntimeSummary(task, summary);
+    return issues;
+  }
+
+  private _packageTestScript(): string | null {
+    try {
+      const pkg = JSON.parse(this.fileManager.readWorkspaceFile('package.json') ?? '') as { scripts?: Record<string, string> };
+      return typeof pkg.scripts?.test === 'string' ? pkg.scripts.test : null;
+    } catch { return null; }
+  }
+
+  private _recordTaskRuntimeSummary(task: TaskItem, summary: string[]): void {
+    if (summary.length === 0) { return; }
+    this._lastMicroCheckSummary = `## Real checks after ${task.id} (${new Date().toISOString()})\n${summary.join('\n')}`;
+    this.workspace.appendFile(this.workspace.testResultLogPath, `\n\n---\n\n## Per-Task Verification: ${task.id}\n\n${summary.join('\n')}\n`);
+  }
+
   /**
    * Lower is better: failed commands dominate, then the number of error-looking
    * lines. Used to tell whether a test-fix attempt improved the project.
@@ -4702,6 +4821,20 @@ export class AgentOrchestrator {
         task.allowedFiles.push('package.json');
         this.workspace.appendAssumption('reviewer', `Task ${task.id} may now edit package.json to declare the dependencies/test runner its files need.`);
       }
+    }
+
+    // Run the real build/test/browser checks now instead of only after every
+    // task is written (benchmark runs 3–8: errors piled up for the final
+    // test-fix loop, which could not untangle them).
+    const runtimeIssues = await this._taskRuntimeIssues(task, changedPaths);
+    if (runtimeIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...runtimeIssues];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Fix the failures reported by the real build/test/browser run above; they come from this task\'s files.',
+      ];
     }
 
     // Same reasoning, for the stub-comment and invalid-JSON heuristics: these

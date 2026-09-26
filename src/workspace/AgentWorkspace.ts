@@ -18,6 +18,7 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
   maxDevelopmentSprints: 5,
   maxFixRetries: 8,
   autoInstallDependencies: true,
+  perTaskVerification: true,
   artifactDir: 'dist',
   createFinalArchive: true,
   requireVerificationScripts: true,
