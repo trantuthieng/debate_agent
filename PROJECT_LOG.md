@@ -524,3 +524,24 @@ Run 7 (`dist/local-runs/20260926-115038.log`, workspace `demo/brick-breaker-20-2
 - **Lỗ hổng 1 — script test giả:** `"test": "echo \"Tests will be implemented in a later step\" && exit 0"` → `npm test` pass mà không chạy test nào. **Sửa (`7daa8be`)**: `VerificationPlanner._isPlaceholderScript` — script chỉ gồm echo/exit 0/true là blocking issue.
 - **Lỗ hổng 2 — không biên dịch giữa các task:** mọi task qua review LLM, cuối cùng `npm run build` 161 lỗi TS (`main.ts` dùng scene không import; test import named export không tồn tại). **Sửa (`07cb01c`)**: `src/utils/typeScriptGate.ts` — reviewer type-check in-memory các file .ts task vừa đổi (không cần node_modules), chỉ báo lỗi cú pháp / tên chưa khai báo / import-export tương đối sai; bỏ qua lỗi do thiếu @types, globals jest/Node. Chạy trên workspace run 7: bắt đúng 5 lỗi thật, ~0.5s. Hạn chế: `typescript` là devDependency → trong VSIX đóng gói gate tự bỏ qua.
 - `npm run check` 372/372. Chạy run 8.
+
+### 2026-09-26 (tiếp) — Run 8: test lại fail → DỪNG theo yêu cầu boss; phân tích + cách giải quyết (CHƯA CODE)
+
+Run 8 (`dist/local-runs/20260926-150139.log`, workspace `demo/brick-breaker-20-2026-09-26T08-01-53-588Z`), ~2h. Project JS thuần (không TypeScript). Task 001–006 hoàn thành; task-007 ("Create automated tests") fail → task-008 bị skip; test-fix 1/8 bắt đầu thì dừng theo yêu cầu boss ("nếu test lỗi tiếp, dừng lại và ghi cách giải quyết").
+
+**Fix mới hoạt động live:** `typeScriptGate` bắt đúng `tests/game.test.ts` import default không tồn tại (TS1192); `VerificationPlanner` chặn đúng script test giả `"echo 'No tests yet.'"`.
+
+**Bằng chứng fail:**
+1. Browser smoke: `SyntaxError: Cannot use import statement outside a module` — `src/index.html` dùng `<script src="scripts/main.js">` (không `type="module"`), còn `main.js` dùng `import Phaser from 'phaser'` (bare specifier) mà không có bundler/importmap. Cùng họ lỗi với run 6 → không phải lỗi 1 file mà là **kiến trúc giao hàng cho trình duyệt không nhất quán** (ESM + gói npm + không bundler), không ai kiểm tra cho tới smoke test cuối.
+2. Task-007: code worker (gemma3:12b) viết `tests/game.test.ts` (TypeScript trong project JS, dùng chai nhưng không khai báo dependency, test placeholder "Add assertions here"); fixer muốn sửa `main.js`/`index.html`/`styles.css` (ngoài allowedFiles) → "unsafe file changes" → task bị đánh fail NGAY ở lần sửa 1 nhưng log ghi "could not be fixed after 8 attempts" (sai, gây hiểu lầm).
+3. `package.json` không có test runner/devDependency nào; `"test": "echo 'No tests yet.'"`.
+
+**Nguyên nhân gốc chung (tổng hợp run 3–8):** code chỉ được chạy thật 1 lần, sau khi viết xong MỌI task. Review từng task là LLM đọc code, nên lỗi tích tụ (run 7: 161 lỗi TS) và vòng test-fix (model 14–24B, toàn bộ log + 12+ file, viết lại cả file) không hội tụ (161 → 167).
+
+**Cách giải quyết (theo thứ tự ưu tiên, chưa triển khai):**
+1. **Chốt "delivery contract" cho web ngay từ brief/architecture, kiểm tra tất định mỗi task.** Brief phải chọn 1 trong 2: (a) static không build — `<script type="module">`, chỉ import tương đối, thư viện lấy qua CDN/importmap; hoặc (b) bundler (Vite) — `index.html` ở gốc, `npm run build`/`dev` có sẵn từ task-001. Check tất định (không LLM) sau mỗi task: file JS được HTML nạp mà có `import/export` thì thẻ `<script>` phải `type="module"`; bare specifier (`'phaser'`) chỉ hợp lệ khi có bundler hoặc importmap. Lỗi này (run 6 + run 8) sẽ bị bắt ở task-001 thay vì ở cuối.
+2. **Chạy thật sớm, sau từng task.** Cài dependency ngay khi task tạo/sửa `package.json`; sau mỗi task chạy build + test + (nếu web) browser smoke; lỗi thuộc file của task được đưa vào review như deterministic issue. Lỗi được sửa khi còn ít và còn đúng ngữ cảnh.
+3. **JS gate tương đương TypeScript gate.** Mở rộng `typeScriptGate` cho `.js` (checkJs, cùng bộ lọc mã lỗi: cú pháp, tên chưa khai báo, import/export tương đối sai), cẩn thận global nạp qua `<script>` CDN (ví dụ `Phaser`).
+4. **Test task phải khớp stack + có runner thật.** Task viết test luôn được phép sửa `package.json` (thêm runner như vitest/jest + script `test` thật); chặn tất định file test sai ngôn ngữ (`.ts` trong project JS không có tsconfig); acceptance criteria yêu cầu `npm test` chạy được và có assertion thật.
+5. **Fixer ra file ngoài allowedFiles: không giết task ngay.** Bỏ riêng các file đó (như `_dropOffStackToolchainMarkers`), ghi assumption, cho các lần sửa còn lại; nếu nguyên nhân thật nằm ở file của task trước, mở rộng allowedFiles có kiểm soát (file đã tồn tại, cùng stack). Sửa log "after 8 attempts" cho đúng số lần thật.
+6. **Test-fix theo cụm nhỏ.** Mỗi lần chỉ đưa lỗi đầu tiên (cụm theo file) + ≤3 file liên quan, không phải toàn bộ log + mọi file; dừng sớm nếu số lỗi tăng 2 lần liên tiếp và quay lại bản tốt nhất (rollback theo số lỗi).
