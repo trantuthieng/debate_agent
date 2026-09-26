@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { findBrowserDeliveryIssues } from '../utils/browserDelivery';
 import * as path from 'path';
 import type { VerificationCommand, VerificationPlan, VerificationStack } from '../types';
 
@@ -116,6 +117,10 @@ export class VerificationPlanner {
       if (this._looksLikePlaceholderTest(testFile, content)) {
         blockingIssues.push(`Placeholder or assertion-free test detected: ${testFile}.`);
       }
+    }
+
+    for (const issue of findBrowserDeliveryIssues(this.rootDir)) {
+      blockingIssues.push(issue.message);
     }
 
     if (!files.includes('package.json') && files.some(file => /(^|\/)index\.html$/i.test(file))) {

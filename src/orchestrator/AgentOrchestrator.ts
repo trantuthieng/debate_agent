@@ -68,6 +68,7 @@ import { finalizeCompletedState } from './workflowState';
 import type { SecretVault } from '../connectors/SecretVault';
 import { ConnectorManager } from '../connectors/ConnectorManager';
 import { findTypeScriptTaskIssues } from '../utils/typeScriptGate';
+import { findBrowserDeliveryIssues } from '../utils/browserDelivery';
 import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
 interface ImprovementConsensus {
@@ -4508,6 +4509,23 @@ export class AgentOrchestrator {
       review.fixSuggestions = [
         ...review.fixSuggestions,
         'Fix the TypeScript/JavaScript errors above: import every name you use, import only files that exist, and import only names the target module actually exports (named vs default).',
+      ];
+    }
+
+    // A page that cannot load its own code (classic <script> for an ES module,
+    // bare npm imports without a bundler) used to surface only at the final
+    // browser smoke test, as an error naming no file (benchmark runs 6 and 8).
+    const deliveryIssues = findBrowserDeliveryIssues(
+      this.workspace.rootDir,
+      workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path))
+    );
+    if (deliveryIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...deliveryIssues.map(issue => `[browser] ${issue.message}`)];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Make the page loadable as the architecture decided: either no build (<script type="module">, relative imports, libraries from a CDN or import map) or a bundler such as Vite.',
       ];
     }
 

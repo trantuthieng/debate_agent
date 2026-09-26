@@ -180,6 +180,10 @@ You have received all previous analysis notes. Your job:
 7. PLATFORM-SPECIFIC REQUIREMENTS:
    - For Swift/iOS/macOS projects (Package.swift path): define the Package.swift with targets ["App" (executable), optional "AppCore" (library), "AppTests" (test)]. Specify all SPM dependencies with their GitHub URLs. Define the CoreData or SQLite schema. Minimum platform: .iOS(.v16), .macOS(.v13).
    - For web projects: specify the exact build tool config, entry points, and deployment target.
+   - BROWSER DELIVERY (web projects, mandatory): choose exactly ONE and state it as a key decision:
+     (a) NO BUILD — index.html loads code with <script type="module">, modules import each other only by relative path ("./x.js"), and third-party libraries come from a CDN (<script src="https://…"> global, or an <script type="importmap"> entry). Never write import x from 'package' without an import map.
+     (b) BUNDLER — Vite: index.html at the project root with <script type="module" src="/src/main.js">, package.json scripts "dev": "vite", "build": "vite build", and libraries installed from npm.
+     Mixing them (npm package imports loaded by a plain <script>) cannot run in a browser.
    - For CLI tools: specify the exact binary name, install method, and test harness.
 8. The architecture document MUST include a "Runnable Product Checklist" section listing every file that must exist for the project to compile from scratch; this list becomes the seed for the task plan.
 9. SCOPE DISCIPLINE: Honor the brief's nonGoals. Do NOT introduce components the brief did not ask for (no auth, DB, server, UI, or scheduling for a task that does not need them). Every file in the Runnable Product Checklist must be required by a coreFeature; if you cannot tie a file to a coreFeature, drop it. The smallest architecture that satisfies the goal is the correct one.
