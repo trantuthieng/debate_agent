@@ -215,7 +215,7 @@ const TASK_MANAGER_SYSTEM = `You are a senior engineering lead creating a detail
 
 You have received the final architecture plan. Your job:
 1. Break the project into small, focused coding tasks.
-2. Each task should be completable by a code writing agent in a single pass.
+2. Each task should be completable by a code writing agent in a single pass: at most 6 files per task. Put many similar items (levels, records, config entries) in ONE data file rather than one file per item.
 3. Respect task dependencies (do not code a feature before its dependencies).
 4. Be specific about which files each task is allowed to modify.
 5. Define clear acceptance criteria for each task.

@@ -2601,3 +2601,28 @@ test('a fixer stuck on identical issues escalates before the scheduled attempt',
   const captured = await captureFixerModels({ fixRetryCount: 1, stuck: true });
   assert.equal(captured.model, 'fixer-strong');
 });
+
+test('task planning splits a task with more files than one model call can author into sequential parts', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const levelFiles = Array.from({ length: 20 }, (_, i) => `src/levels/level${i + 1}.js`);
+  const tasks = [
+    { id: 'task-003', title: 'Levels', description: 'd', dependsOn: ['task-002'], allowedFiles: ['src/levels/index.js', ...levelFiles], forbiddenActions: [], acceptanceCriteria: ['index exports 20 levels'], specialistId: 'designer' },
+    { id: 'task-004', title: 'Gameplay', description: 'd', dependsOn: ['task-003'], allowedFiles: ['src/game.js'], forbiddenActions: [], acceptanceCriteria: ['works'] },
+  ];
+
+  const split = orchestrator._splitOversizedTasks(tasks);
+
+  assert.deepEqual(split.map(t => t.id), ['task-003-part-1', 'task-003-part-2', 'task-003-part-3', 'task-003', 'task-004']);
+  assert.ok(split.every(t => t.allowedFiles.length <= 6));
+  assert.deepEqual(split.slice(0, 4).flatMap(t => t.allowedFiles).sort(), ['src/levels/index.js', ...levelFiles].sort());
+  assert.deepEqual(split[0].dependsOn, ['task-002']);
+  assert.deepEqual(split[1].dependsOn, ['task-003-part-1']);
+  assert.deepEqual(split[3].dependsOn, ['task-003-part-3']);
+  assert.ok(split[3].allowedFiles.includes('src/levels/index.js'), 'aggregator is written in the last part');
+  assert.deepEqual(split[3].acceptanceCriteria, ['index exports 20 levels']);
+  assert.doesNotMatch(split[0].acceptanceCriteria.join(' '), /20 levels/);
+  assert.ok(split.slice(0, 4).every(t => t.specialistId === 'designer'));
+  assert.deepEqual(split[4], tasks[1]);
+  assert.match(orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '', /split it into 4 sequential parts/);
+});

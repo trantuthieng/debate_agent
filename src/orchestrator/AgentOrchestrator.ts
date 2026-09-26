@@ -1943,7 +1943,9 @@ export class AgentOrchestrator {
         throw new Error('Task plan contains no tasks.');
       }
       const validSpecialistIds = new Set((teamPlan?.agents ?? []).map(a => a.id));
-      taskPlan.tasks = taskPlan.tasks.map((t, index) => this._normalizeTaskItem(t, index, now, validSpecialistIds));
+      taskPlan.tasks = this._splitOversizedTasks(
+        taskPlan.tasks.map((t, index) => this._normalizeTaskItem(t, index, now, validSpecialistIds))
+      );
       taskPlan.totalTasks = taskPlan.tasks.length;
       taskPlan.createdAt = taskPlan.createdAt || now;
     } catch (err) {
@@ -4556,6 +4558,8 @@ export class AgentOrchestrator {
           'Judge ONLY whether THIS task\'s changes satisfy THIS task\'s own acceptance criteria.',
           'Files or behavior that other, still-pending tasks are scheduled to implement are NOT defects of this task —',
           'do NOT flag a file as "incomplete/stub/missing" if a later task owns and will complete it.',
+          'The task\'s allowed files are files it MAY create, not files it must create: never flag a missing allowed file',
+          'unless an acceptance criterion requires it (e.g. 20 levels in one data file satisfies "20 levels").',
           incrementalContext,
           'Respond only with valid JSON.',
         ].filter(Boolean).join('\n'),
@@ -7337,6 +7341,65 @@ export class AgentOrchestrator {
       createdAt: task.createdAt || now,
       status: 'pending',
     };
+  }
+
+  /**
+   * Real failure mode (benchmark run 4, 2026-09-26): the task manager put 21
+   * files (level1.js…level20.js + index.js) into ONE task. Every 14B/24B
+   * code-worker and fixer call for it hit the 10-minute request timeout; only
+   * the compact-context 7B retry finished, and it wrote an "add more…"
+   * placeholder that review correctly rejected — so the task could never pass.
+   * A single model call cannot author that much output on this hardware, so a
+   * task with more than MAX_FILES_PER_TASK files is split deterministically
+   * into sequential parts. The last part keeps the original id (so existing
+   * dependsOn references still hold), the original acceptance criteria, and
+   * the aggregator files (index.*), which are written after the parts they
+   * import already exist.
+   */
+  private _splitOversizedTasks(tasks: TaskItem[]): TaskItem[] {
+    const MAX_FILES_PER_TASK = 6;
+    const isAggregator = (file: string) => /(^|\/)(index|main|app)\.[^/]+$/i.test(file);
+    return tasks.flatMap(task => {
+      if (task.allowedFiles.length <= MAX_FILES_PER_TASK) { return [task]; }
+      const ordered = [
+        ...task.allowedFiles.filter(file => !isAggregator(file)),
+        ...task.allowedFiles.filter(isAggregator),
+      ];
+      const chunks: string[][] = [];
+      for (let i = 0; i < ordered.length; i += MAX_FILES_PER_TASK) {
+        chunks.push(ordered.slice(i, i + MAX_FILES_PER_TASK));
+      }
+      const total = chunks.length;
+      const partId = (k: number) => (k === total ? task.id : `${task.id}-part-${k}`);
+      this.workspace.appendAssumption(
+        'taskManager',
+        `Task ${task.id} listed ${task.allowedFiles.length} files, more than one model call can author reliably; split it into ${total} sequential parts of at most ${MAX_FILES_PER_TASK} files.`
+      );
+      this._emit('log', `Task "${task.id}" split into ${total} parts (${task.allowedFiles.length} files).`, 'info');
+      return chunks.map((files, index): TaskItem => {
+        const k = index + 1;
+        const isLast = k === total;
+        const scope = [
+          `This is part ${k} of ${total} of "${task.title}". Write ONLY these files, each complete (no placeholders or "add more" comments): ${files.join(', ')}.`,
+          k > 1 ? `Files from earlier parts already exist: ${chunks.slice(0, index).flat().join(', ')}.` : '',
+          isLast ? '' : `Later parts will write: ${chunks.slice(index + 1).flat().join(', ')}. Do not import from those files yet.`,
+        ].filter(Boolean).join(' ');
+        return {
+          ...task,
+          id: partId(k),
+          title: `${task.title} (part ${k}/${total})`,
+          description: `${task.description}\n\n${scope}`,
+          dependsOn: k === 1 ? task.dependsOn : [partId(k - 1)],
+          allowedFiles: files,
+          acceptanceCriteria: isLast
+            ? task.acceptanceCriteria
+            : [
+                `Each of ${files.join(', ')} is fully implemented with real content that serves this goal: ${task.title}.`,
+                'No file contains placeholder, TODO, or "add more / and so on" content.',
+              ],
+        };
+      });
+    });
   }
 
   /**
