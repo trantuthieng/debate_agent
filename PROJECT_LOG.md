@@ -606,3 +606,14 @@ Run 10 (`dist/local-runs/20260926-194727.log`, workspace `demo/brick-breaker-20-
 4. **Per-task `npm test` khi dự án chưa có file test nào:** coi "No tests found" (jest) / "No test files found" (vitest) / "no test specified" là **không chặn** nếu không có file test nào trên đĩa. Việc viết test là của task test sau. Chỉ chặn khi task hiện tại có viết test.
 5. **Giảm thiệt hại dây chuyền:** trước khi skip mọi task phụ thuộc vì 1 task setup fail, thử deterministic recovery / 1 lần sửa với phạm vi hẹp; hoặc cho task độc lập về file chạy tiếp (dependsOn hiện là chuỗi tuyến tính 001→002→…→010 dù nhiều task không cần nhau).
 6. (phụ) Browser delivery / app verification: script `start` trỏ tới file không tồn tại (`node server.js`) nên là issue tất định ngay ở task tạo `package.json`.
+
+### 2026-09-26 (tiếp) — Triển khai 6 cách giải quyết của mục "Run 10" (boss: "làm 6 mục, chưa run 11") — `07302e6`
+
+1. **Patch bị chặn một phần không giết task:** `_dropConflictingChanges` (xung đột baseline) + `_dropOutOfScopeChanges` áp dụng cho code worker, fixer và test-fix; phần hợp lệ vẫn được áp dụng, lý do đưa vào review (`[scope]`) cho lần sửa sau. Code worker ra file ngoài phạm vi cũng không còn fail task ngay.
+2. **Self-heal không nhận file của task khác trong plan** (task synthesized như `test-fix-*` vẫn được phép).
+3. **File tạo lại với nội dung y hệt = no-op**; mô tả part sau của task bị chia: "đã tồn tại, KHÔNG được trả lại/viết lại, chỉ import".
+4. **Per-task `npm test`: "No tests found"/"No test files found" không chặn** khi dự án chưa có file test nào.
+5. **Task tiền đề fail được chạy lại 1 lần** (fixer mạnh, giữ file đã viết) trước khi skip dây chuyền các task phụ thuộc.
+6. **`findMissingScriptTargets`**: script package.json chạy file không tồn tại (`node server.js`) → issue trong review (task đổi package.json/file đích) và blocking issue trong VerificationPlanner. Quét `demo/`: 2 phát hiện, đều là lỗi thật (run 3 `src/main.js`, run 10 `server.js`).
+
+Test mới gồm 1 test tích hợp `_phaseCoding` tái hiện đúng run 10 (part 2 tạo lại file của part 1 → task vẫn xong, sprint tiếp tục, file part 1 không bị đổi, allowedFiles không bị nới) và 1 test "chạy lại tiền đề 1 lần". `npm run check` **407/407**, lint sạch. **Chưa chạy run 11** theo yêu cầu boss.
