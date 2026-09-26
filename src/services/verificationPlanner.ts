@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import { findBrowserDeliveryIssues } from '../utils/browserDelivery';
+import { findBrowserDeliveryIssues, findMissingScriptTargets } from '../utils/browserDelivery';
 import { isPlaceholderScript } from '../utils/testTaskContracts';
 import * as path from 'path';
 import type { VerificationCommand, VerificationPlan, VerificationStack } from '../types';
@@ -120,7 +120,7 @@ export class VerificationPlanner {
       }
     }
 
-    for (const issue of findBrowserDeliveryIssues(this.rootDir)) {
+    for (const issue of [...findBrowserDeliveryIssues(this.rootDir), ...findMissingScriptTargets(this.rootDir)]) {
       blockingIssues.push(issue.message);
     }
 

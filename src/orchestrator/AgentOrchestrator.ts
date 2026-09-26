@@ -68,7 +68,7 @@ import { finalizeCompletedState } from './workflowState';
 import type { SecretVault } from '../connectors/SecretVault';
 import { ConnectorManager } from '../connectors/ConnectorManager';
 import { findTypeScriptTaskIssues } from '../utils/typeScriptGate';
-import { findBrowserDeliveryIssues } from '../utils/browserDelivery';
+import { findBrowserDeliveryIssues, findMissingScriptTargets } from '../utils/browserDelivery';
 import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports, isPlaceholderScript } from '../utils/testTaskContracts';
 import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
@@ -170,6 +170,8 @@ export class AgentOrchestrator {
   private static readonly FIX_ESCALATION_ATTEMPT = 3;
   /** Tasks whose fixer was escalated early because it stopped making progress. */
   private readonly escalatedFixTasks = new Set<string>();
+  /** Failed tasks already re-run once because dependents were about to be skipped. */
+  private readonly _secondChanceTasks = new Set<string>();
   private readonly workspace: AgentWorkspace;
   private readonly fileManager: FileManager;
   private readonly gitReader: GitRepositoryReader;
@@ -2060,6 +2062,34 @@ export class AgentOrchestrator {
           continue;
         }
 
+        // Before cascading a skip through every dependent (benchmark run 10:
+        // one failed setup task skipped all 10 others), re-run each failed
+        // prerequisite once, from the files it already wrote, with the stronger
+        // fixer model.
+        const retryable = failedDeps.filter(dep => state.failedTasks.includes(dep) && !this._secondChanceTasks.has(dep));
+        if (retryable.length > 0) {
+          for (const dep of retryable) {
+            const depTask = taskPlan.tasks.find(t => t.id === dep);
+            if (!depTask) { continue; }
+            this._secondChanceTasks.add(dep);
+            this.escalatedFixTasks.add(dep);
+            state.failedTasks = state.failedTasks.filter(id => id !== dep);
+            if (!state.activeTasks.includes(dep)) { state.activeTasks.push(dep); }
+            const previousError = depTask.error ?? 'unknown error';
+            depTask.status = 'pending';
+            depTask.error = undefined;
+            terminalIds.delete(dep);
+            if (!wave.includes(depTask)) { wave.push(depTask); }
+            this._emit('log', `Task "${dep}" failed but ${task.id} depends on it; retrying it once with the stronger fixer before skipping dependents.`, 'warn');
+            this.workspace.appendAssumption('codeWorker', `Task ${dep} got one retry (stronger fixer, existing files kept) because dependents were about to be skipped. Previous failure: ${previousError.slice(0, 300)}`);
+          }
+          task.status = 'pending';
+          this.workspace.writeProjectState(state);
+          this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+          this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+          continue;
+        }
+
         // A prerequisite hard-failed (failed or skipped). Running this task now
         // would build on missing foundations (e.g. importing modules a failed
         // task never created), producing a broken shell that wastes the rest of
@@ -2163,6 +2193,7 @@ export class AgentOrchestrator {
           throw new WaitForUserError(questions);
         }
 
+        let scopeNote = '';
         if (!workerResultAlreadyApplied && workerResult.files.length === 0) {
           const existing = this._existingTaskReviewOutput(task, workerResult);
           if (existing) {
@@ -2178,6 +2209,16 @@ export class AgentOrchestrator {
           if (expandedAllowedFiles.length > 0) {
             this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
             this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+          }
+          // Benchmark run 10: part 2 of a split task re-emitted part 1's five
+          // files as "create"; the baseline guard then blocked the WHOLE patch
+          // and the task failed without a fix loop, skipping 10 dependents.
+          // Keep the applicable changes and hand the rest to review/fix.
+          const droppedScope = this._dropOutOfScopeChanges(task, workerResult);
+          const droppedConflicts = this._dropConflictingChanges(task, workerResult, 'codeWorker');
+          if (droppedScope.length + droppedConflicts.length > 0) {
+            scopeNote = `[scope] The code worker also returned ${[...droppedScope, ...droppedConflicts].join(', ')}, which belong to other tasks or already exist; those changes were ignored. Write only this task's files (${task.allowedFiles.join(', ')}) and adapt them to the existing files as they are.`;
+            if (workerResult.files.length === 0) { workerResultAlreadyApplied = true; }
           }
           const validationErrors = this._validateTaskFileChanges(task, workerResult);
           if (validationErrors.length > 0) {
@@ -2251,6 +2292,10 @@ export class AgentOrchestrator {
           files: workerResult.files.map(file => file.path),
         });
         let review = await this._executeReviewer(task, workerResult, state);
+        if (scopeNote) {
+          review.issues = [...review.issues, scopeNote];
+          if (workerResult.files.length === 0) { review.needsFix = true; review.approved = false; }
+        }
 
         if (review.needsFix) {
           // Try to fix
@@ -2304,6 +2349,14 @@ export class AgentOrchestrator {
                   `Solve the problem inside this task's own files (${task.allowedFiles.join(', ')}), adapting them to the other modules as they are.`,
                 ];
                 if (fixResult.files.length === 0) { continue; }
+              }
+              const conflicts = this._dropConflictingChanges(task, fixResult, 'fixer');
+              if (conflicts.length > 0 && fixResult.files.length === 0) {
+                review.issues = [
+                  ...review.issues.filter(issue => !issue.startsWith('[scope] ')),
+                  `[scope] The previous fix only re-created existing files (${conflicts.join(', ')}). Modify this task's files instead.`,
+                ];
+                continue;
               }
               const patchId = `${task.id}-fix-${attempt}-${Date.now()}`;
               const applied = await this._applyCodeChanges(patchId, fixResult, state);
@@ -2867,6 +2920,11 @@ export class AgentOrchestrator {
               this.workspace.testerPath,
               `\n\n---\n\n## Fix Attempt ${attempt} Produced Unsafe File Changes\n\n${validationErrors.join('\n')}\n\nThe proposed patch was discarded (not applied) and the workflow will retry with a fresh fix attempt.\n`
             );
+            continue;
+          }
+          this._dropConflictingChanges(fakeTask, fixResult, 'fixer');
+          if (fixResult.files.length === 0) {
+            repairFeedback = 'The previous repair only re-created files that already exist. Modify the files in scope with complete content.';
             continue;
           }
           const patchId = `test-fix-${attempt}-${Date.now()}`;
@@ -4034,7 +4092,14 @@ export class AgentOrchestrator {
     if (testScript && !isPlaceholderScript(testScript)) {
       const test = await this.terminal.runTests(pm);
       summary.push(`${pm} test: ${test.success ? 'ok' : 'FAILED'}`);
-      if (!test.success) {
+      // A runner with nothing to run yet ("No tests found") is not a defect of
+      // this task when the project has no test files: a later task writes them
+      // (benchmark run 10 blamed the setup task for exactly this).
+      const noTestsYet = /No tests found|No test files found|no test specified|No test suite found/i.test(outputOf(test))
+        && !this.fileManager.listWorkspaceFiles('').some(file => TEST_FILE.test(file) && /\.(m?[jt]sx?|cjs)$/.test(file)
+          && !/(^|\/)(node_modules|\.agent-workspace)\//.test(file));
+      if (!test.success && noTestsYet) { summary.push('(no test files yet — not blocking)'); }
+      if (!test.success && !noTestsYet) {
         const wroteTests = changedPaths.some(file => TEST_FILE.test(file));
         const own = this._diagnosticLinesFor(outputOf(test), changedPaths);
         if (own.length > 0) { issues.push(`[runtime] \`${pm} test\` fails in this task's files:\n${own.join('\n')}`); }
@@ -4832,10 +4897,11 @@ export class AgentOrchestrator {
     // A page that cannot load its own code (classic <script> for an ES module,
     // bare npm imports without a bundler) used to surface only at the final
     // browser smoke test, as an error naming no file (benchmark runs 6 and 8).
-    const deliveryIssues = findBrowserDeliveryIssues(
-      this.workspace.rootDir,
-      workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path))
-    );
+    const deliveryPaths = workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path));
+    const deliveryIssues = [
+      ...findBrowserDeliveryIssues(this.workspace.rootDir, deliveryPaths),
+      ...findMissingScriptTargets(this.workspace.rootDir, deliveryPaths),
+    ];
     if (deliveryIssues.length > 0) {
       review.needsFix = true;
       review.approved = false;
@@ -7840,7 +7906,7 @@ export class AgentOrchestrator {
         const isLast = k === total;
         const scope = [
           `This is part ${k} of ${total} of "${task.title}". Write ONLY these files, each complete (no placeholders or "add more" comments): ${files.join(', ')}.`,
-          k > 1 ? `Files from earlier parts already exist: ${chunks.slice(0, index).flat().join(', ')}.` : '',
+          k > 1 ? `Files from earlier parts already exist and must NOT be returned or rewritten: ${chunks.slice(0, index).flat().join(', ')}. Only import from them.` : '',
           isLast ? '' : `Later parts will write: ${chunks.slice(index + 1).flat().join(', ')}. Do not import from those files yet.`,
         ].filter(Boolean).join(' ');
         return {
@@ -9209,6 +9275,35 @@ export class AgentOrchestrator {
     return /\bpython\b/.test(text) && !/\b(javascript|typescript|node(\.js)?|npm|browser|html)\b/.test(text);
   }
 
+  /**
+   * Remove changes that the baseline guard would reject (an existing file the
+   * agent "creates" without having read it, or a file changed since it was
+   * read), so one bad file no longer blocks the whole patch. A re-created file
+   * whose content is identical to the current file is a harmless no-op and is
+   * dropped silently. Returns the paths of the real conflicts.
+   */
+  private _dropConflictingChanges(task: TaskItem, output: CodeWorkerOutput, role: 'codeWorker' | 'fixer'): string[] {
+    const baseline = this._changeBaselines.get(output);
+    const conflicts: string[] = [];
+    const keep = output.files.filter(change => {
+      if (this.fileManager.detectConflictingChanges([change], baseline).length === 0) { return true; }
+      const normalized = this._normalizeRelativePath(change.path);
+      const current = this.fileManager.readWorkspaceFile(normalized);
+      if (change.action === 'create' && current !== null && typeof change.content === 'string' && change.content === current) {
+        return false; // identical re-creation: nothing to do
+      }
+      conflicts.push(normalized);
+      return false;
+    });
+    output.files = keep;
+    if (conflicts.length > 0) {
+      const detail = `Task ${task.id}: ignored ${role} change(s) to existing files it had not read or that changed since: ${conflicts.join(', ')}`;
+      this._emit('log', `${detail}; kept ${keep.length} other change(s).`, 'warn');
+      this.workspace.appendAssumption(role, `${detail}.`);
+    }
+    return conflicts;
+  }
+
   /** Remove changes outside the task's allowedFiles from a fixer's output; returns their paths. */
   private _dropOutOfScopeChanges(task: TaskItem, output: CodeWorkerOutput): string[] {
     if (task.allowedFiles.length === 0) { return []; }
@@ -9276,6 +9371,15 @@ export class AgentOrchestrator {
     this._dropOffStackToolchainMarkers(task, output, role);
     if (!this._selfHealingConfig().enabled || task.allowedFiles.length === 0) { return []; }
 
+    // Files another planned task owns are never self-healed into this task
+    // (benchmark run 10: part 2 of a split task absorbed part 1's files because
+    // its description names them). Synthesized tasks (test-fix-*) are not in the
+    // plan and may still reach any project file.
+    const plan = this._loadTaskPlan();
+    const ownedElsewhere = new Set(plan?.tasks.some(t => t.id === task.id)
+      ? plan.tasks.filter(t => t.id !== task.id)
+        .flatMap(t => t.allowedFiles.filter(f => !f.endsWith('/') && !f.includes('*')).map(f => this._normalizeRelativePath(f)))
+      : []);
     const added: string[] = [];
     for (const change of output.files) {
       if (path.isAbsolute(change.path) || path.win32.isAbsolute(change.path)) {
@@ -9284,6 +9388,7 @@ export class AgentOrchestrator {
       const normalized = this._normalizeRelativePath(change.path);
       if (
         this._matchesAllowedPath(normalized, task.allowedFiles) ||
+        ownedElsewhere.has(normalized) ||
         !this._isSelfHealSafeFileChange(task, normalized, change.action)
       ) {
         continue;

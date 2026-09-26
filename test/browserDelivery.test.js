@@ -64,3 +64,17 @@ test('TypeScript loaded directly by a page without a bundler is reported', t => 
   });
   assert.match(findBrowserDeliveryIssues(root)[0].message, /cannot run TypeScript without a build step/);
 });
+
+const { findMissingScriptTargets } = require('../out/utils/browserDelivery');
+
+test('a package.json script that runs a missing file is reported (run 10: node server.js)', t => {
+  const root = project(t, {
+    'package.json': JSON.stringify({ scripts: { start: 'node server.js', dev: 'nodemon --watch src ./src/app.js', build: 'vite build', test: 'jest', serve: 'node --inspect tools/run.mjs' } }),
+    'src/app.js': '',
+  });
+  const messages = findMissingScriptTargets(root).map(issue => issue.message);
+  assert.equal(messages.length, 2, messages.join('\n'));
+  assert.match(messages[0], /"start" runs server\.js, which does not exist/);
+  assert.match(messages[1], /"serve" runs tools\/run\.mjs/);
+  assert.equal(findMissingScriptTargets(root, ['src/game.js']).length, 0, 'per task: only when package.json or the target changed');
+});

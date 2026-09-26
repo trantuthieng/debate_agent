@@ -148,3 +148,29 @@ export function findBrowserDeliveryIssues(root: string, changedFiles?: string[])
   const changed = new Set(changedFiles);
   return issues.filter(issue => issue.files.some(file => changed.has(file)));
 }
+
+/**
+ * package.json scripts that run a project file which does not exist
+ * (benchmark run 10: "start": "node server.js" with no server.js), so the app
+ * can never start. Only direct runtime invocations are checked
+ * (node / nodemon / ts-node / tsx / bun <file>); tool CLIs are left alone.
+ */
+export function findMissingScriptTargets(root: string, changedFiles?: string[]): BrowserDeliveryIssue[] {
+  const raw = read(root, 'package.json');
+  if (!raw) { return []; }
+  let scripts: Record<string, string> = {};
+  try { scripts = (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts ?? {}; } catch { return []; }
+  const issues: BrowserDeliveryIssue[] = [];
+  for (const [name, command] of Object.entries(scripts)) {
+    if (typeof command !== 'string') { continue; }
+    for (const match of command.matchAll(/(?:^|[;&|]\s*|\s)(?:node|nodemon|ts-node|tsx|bun)\s+(?:--?[\w-]+(?:=\S+)?\s+)*([\w./-]+\.(?:m?[jt]s|cjs|tsx?))\b/g)) {
+      const target = path.posix.normalize(match[1].replace(/^\.\//, ''));
+      if (target.startsWith('..') || fs.existsSync(path.join(root, target))) { continue; }
+      issues.push({ files: ['package.json', target],
+        message: `package.json script "${name}" runs ${target}, which does not exist, so \`npm run ${name}\` can never work. Create ${target} or point the script at the real entry file.` });
+    }
+  }
+  if (!changedFiles) { return issues; }
+  const changed = new Set(changedFiles);
+  return issues.filter(issue => issue.files.some(file => changed.has(file)));
+}

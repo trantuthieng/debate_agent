@@ -2852,3 +2852,100 @@ test('directory and glob scopes do not count toward the task size limit and stay
   assert.deepEqual(split.map(t => t.allowedFiles.filter(f => !f.endsWith('/')).length), [4, 3]);
   assert.ok(split.every(t => t.allowedFiles.includes('src/levels/')));
 });
+
+// Benchmark run 10: part 2 of a split task re-emitted part 1's file as "create";
+// the whole patch was blocked and every dependent task was skipped.
+function approveAll(orchestrator) {
+  orchestrator._executeReviewer = async task => ({ taskId: task.id, approved: true, issues: [], suggestions: [], securityConcerns: [], needsFix: false, fixSuggestions: [], reviewedAt: new Date().toISOString() });
+  orchestrator._runMicroSprintChecks = async () => {};
+}
+
+test('a code worker re-creating an earlier part\'s file keeps its own changes and the sprint continues', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  approveAll(orchestrator);
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/game.js'), 'export const game = 1;\n');
+  const now = new Date().toISOString();
+  const base = { assignedAgent: 'codeWorker', forbiddenActions: [], acceptanceCriteria: ['ok'], createdAt: now };
+  const tasks = [
+    { ...base, id: 'task-001-part-1', title: 'Setup (part 1/2)', description: 'd', dependsOn: [], allowedFiles: ['src/game.js'], status: 'completed' },
+    { ...base, id: 'task-001', title: 'Setup (part 2/2)', description: 'Files from earlier parts already exist: src/game.js.', dependsOn: ['task-001-part-1'], allowedFiles: ['src/main.js'], status: 'pending' },
+    { ...base, id: 'task-002', title: 'Gameplay', description: 'd', dependsOn: ['task-001'], allowedFiles: ['src/play.js'], status: 'pending' },
+  ];
+  orchestrator.workspace.writeFile(orchestrator.workspace.taskPlanPath, JSON.stringify({ tasks, totalTasks: 3 }));
+  orchestrator._executeCodeWorker = async task => ({ reasoning: 'r', needUserInput: false, questions: [], files: task.id === 'task-001'
+    ? [{ path: 'src/game.js', action: 'create', content: 'export const game = 2;\n' }, { path: 'src/main.js', action: 'create', content: "import { game } from './game.js';\n" }]
+    : [{ path: 'src/play.js', action: 'create', content: 'export const play = true;\n' }] });
+
+  const state = makeState({ currentPhase: 'coding', completedTasks: ['task-001-part-1'], activeTasks: ['task-001', 'task-002'] });
+  await orchestrator._phaseCoding(state);
+
+  assert.deepEqual(state.failedTasks, []);
+  assert.deepEqual(state.completedTasks.sort(), ['task-001', 'task-001-part-1', 'task-002']);
+  assert.equal(fs.readFileSync(path.join(root, 'src/game.js'), 'utf8'), 'export const game = 1;\n', 'part 1\'s file is untouched');
+  assert.ok(fs.existsSync(path.join(root, 'src/main.js')));
+  const plan = JSON.parse(orchestrator.workspace.readFile(orchestrator.workspace.taskPlanPath));
+  assert.deepEqual(plan.tasks.find(t => t.id === 'task-001').allowedFiles, ['src/main.js'], 'self-heal did not absorb part 1\'s file');
+});
+
+test('a failed prerequisite is retried once with the stronger fixer before its dependents are skipped', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  approveAll(orchestrator);
+  const now = new Date().toISOString();
+  const base = { assignedAgent: 'codeWorker', forbiddenActions: [], acceptanceCriteria: ['ok'], createdAt: now, status: 'pending', description: 'd' };
+  const tasks = [
+    { ...base, id: 'task-001', title: 'Setup', dependsOn: [], allowedFiles: ['src/a.js'] },
+    { ...base, id: 'task-002', title: 'Next', dependsOn: ['task-001'], allowedFiles: ['src/b.js'] },
+  ];
+  orchestrator.workspace.writeFile(orchestrator.workspace.taskPlanPath, JSON.stringify({ tasks, totalTasks: 2 }));
+  const calls = [];
+  orchestrator._executeCodeWorker = async task => {
+    calls.push(task.id);
+    if (task.id === 'task-001' && calls.filter(id => id === 'task-001').length === 1) { throw new Error('model crashed'); }
+    return { reasoning: 'r', needUserInput: false, questions: [], files: [{ path: task.allowedFiles[0], action: 'create', content: 'export {};\n' }] };
+  };
+
+  const state = makeState({ currentPhase: 'coding', activeTasks: ['task-001', 'task-002'] });
+  await orchestrator._phaseCoding(state);
+
+  assert.deepEqual(calls, ['task-001', 'task-001', 'task-002']);
+  assert.deepEqual(state.completedTasks.sort(), ['task-001', 'task-002']);
+  assert.ok(orchestrator.escalatedFixTasks.has('task-001'));
+  assert.match(orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '', /got one retry/);
+});
+
+test('identical re-creations are silent no-ops; real conflicts are reported', async () => {
+  const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'same.js'), 'same\n');
+  fs.writeFileSync(path.join(root, 'other.js'), 'old\n');
+  const orchestrator = await makeOrchestrator(root);
+  const task = { id: 't', allowedFiles: ['same.js', 'other.js', 'new.js'] };
+  const output = { reasoning: 'r', files: [
+    { path: 'same.js', action: 'create', content: 'same\n' },
+    { path: 'other.js', action: 'create', content: 'new\n' },
+    { path: 'new.js', action: 'create', content: 'x\n' },
+  ] };
+  assert.deepEqual(orchestrator._dropConflictingChanges(task, output, 'codeWorker'), ['other.js']);
+  assert.deepEqual(output.files.map(f => f.path), ['new.js']);
+});
+
+test('later parts of a split task are told not to return earlier parts\' files', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const split = orchestrator._splitOversizedTasks([{ id: 'task-001', title: 'Setup', description: 'd', dependsOn: [], forbiddenActions: [], acceptanceCriteria: ['ok'],
+    allowedFiles: ['a.js', 'b.js', 'c.js', 'd.js', 'e.js', 'f.js', 'g.js'] }]);
+  assert.match(split[1].description, /already exist and must NOT be returned or rewritten: a\.js, b\.js, c\.js, d\.js/);
+});
+
+test('per-task verification does not block on "No tests found" before any test file exists', async () => {
+  const { root, orchestrator, task } = await runtimeHarness({
+    scripts: { test: 'jest' },
+    results: { 'npm test': [false, 'No tests found, exiting with code 1'] },
+  });
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['package.json']), []);
+  fs.mkdirSync(path.join(root, 'tests'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tests/a.test.js'), 'test("x", () => {});\n');
+  assert.equal((await orchestrator._taskRuntimeIssues(task, ['tests/a.test.js'])).length, 1, 'once tests exist, the runner must find them');
+});
