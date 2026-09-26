@@ -2254,8 +2254,10 @@ export class AgentOrchestrator {
           let lastIssueSignature = this._issueSignature(review);
           let noProgressStreak = 0;
           const maxNoProgress = 2;
+          let attemptsUsed = 0;
           for (let attempt = 1; attempt <= maxRetries; attempt++) {
             this._checkAborted();
+            attemptsUsed = attempt;
             this._emit('log', `Fix attempt ${attempt}/${maxRetries} for task "${task.id}"`, 'warn');
             this._setPhase(state, 'fixing', `Fixing task: ${task.title} (attempt ${attempt})`);
             this._recordActivity({
@@ -2282,10 +2284,18 @@ export class AgentOrchestrator {
                 this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
                 this.callbacks.onTaskUpdate?.(taskPlan.tasks);
               }
-              const validationErrors = this._validateTaskFileChanges(task, fixResult);
-              if (validationErrors.length > 0) {
-                this._emit('error', `Fixer produced unsafe file changes for task "${task.id}": ${validationErrors.join('; ')}`);
-                break;
+              // Benchmark run 8: a test-writing task's fixer also edited main.js,
+              // index.html and styles.css (another task's files); that used to
+              // fail the whole task on attempt 1. Drop only the out-of-scope
+              // changes, keep the rest, and tell the next attempt why.
+              const outOfScope = this._dropOutOfScopeChanges(task, fixResult);
+              if (outOfScope.length > 0) {
+                review.issues = [
+                  ...review.issues.filter(issue => !issue.startsWith('[scope] ')),
+                  `[scope] The previous fix tried to change ${outOfScope.join(', ')}, which this task may not modify. ` +
+                  `Solve the problem inside this task's own files (${task.allowedFiles.join(', ')}), adapting them to the other modules as they are.`,
+                ];
+                if (fixResult.files.length === 0) { continue; }
               }
               const patchId = `${task.id}-fix-${attempt}-${Date.now()}`;
               const applied = await this._applyCodeChanges(patchId, fixResult, state);
@@ -2353,9 +2363,9 @@ export class AgentOrchestrator {
                 reviewedAt: new Date().toISOString(),
               };
             } else {
-              this._emit('log', `Task "${task.id}" could not be fixed after ${maxRetries} attempts.`, 'warn');
+              this._emit('log', `Task "${task.id}" could not be fixed after ${attemptsUsed} of ${maxRetries} fix attempt(s).`, 'warn');
               task.status = 'failed';
-              task.error = `Failed after ${maxRetries} fix attempts. Last issues: ${review.issues.join('; ')}`;
+              task.error = `Failed after ${attemptsUsed} fix attempt(s). Last issues: ${review.issues.join('; ')}`;
               this._recordFailedTask(state, task.id);
               state.activeTasks = state.activeTasks.filter(id => id !== task.id);
               this.workspace.writeProjectState(state);
@@ -4485,7 +4495,8 @@ export class AgentOrchestrator {
     // Nothing compiles code between tasks, so TypeScript errors (a missing
     // import, a wrong named export) used to pass review and pile up for the
     // final test-fix loop — 161 of them in benchmark run 7. Type-check the
-    // changed files now, reporting only errors that missing @types cannot explain.
+    // changed files now (JavaScript too), reporting only errors that missing
+    // @types cannot explain.
     const typeScriptIssues = findTypeScriptTaskIssues(
       this.workspace.rootDir,
       workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path))
@@ -4496,7 +4507,7 @@ export class AgentOrchestrator {
       review.issues = [...review.issues, ...typeScriptIssues];
       review.fixSuggestions = [
         ...review.fixSuggestions,
-        'Fix the TypeScript errors above: import every name you use, and import only names the target module actually exports (named vs default).',
+        'Fix the TypeScript/JavaScript errors above: import every name you use, import only files that exist, and import only names the target module actually exports (named vs default).',
       ];
     }
 
@@ -8807,6 +8818,20 @@ export class AgentOrchestrator {
       return state.currentTaskId ? 'coding' : 'testing';
     }
     return state.currentPhase;
+  }
+
+  /** Remove changes outside the task's allowedFiles from a fixer's output; returns their paths. */
+  private _dropOutOfScopeChanges(task: TaskItem, output: CodeWorkerOutput): string[] {
+    if (task.allowedFiles.length === 0) { return []; }
+    const dropped = output.files
+      .filter(change => !this._matchesAllowedPath(change.path, task.allowedFiles))
+      .map(change => change.path);
+    if (dropped.length === 0) { return []; }
+    output.files = output.files.filter(change => this._matchesAllowedPath(change.path, task.allowedFiles));
+    const detail = `Task ${task.id}: ignored fixer change(s) outside the task scope: ${dropped.join(', ')}`;
+    this._emit('log', `${detail}; kept ${output.files.length} in-scope change(s).`, 'warn');
+    this.workspace.appendAssumption('fixer', `${detail}.`);
+    return dropped;
   }
 
   private _validateTaskFileChanges(task: TaskItem, output: CodeWorkerOutput): string[] {

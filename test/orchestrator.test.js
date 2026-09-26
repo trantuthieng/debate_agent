@@ -2680,3 +2680,20 @@ test('test fixers are always shown the served HTML entry page, even when no task
 
   assert.ok(files.includes('index.html'));
 });
+
+test('a fixer change outside the task scope is dropped while in-scope changes are kept', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = { id: 'task-007', title: 'Tests', description: 'd', dependsOn: [], allowedFiles: ['tests/game.test.js'], forbiddenActions: [], acceptanceCriteria: ['ok'] };
+  const output = { reasoning: 'r', files: [
+    { path: 'tests/game.test.js', action: 'modify', content: 'x' },
+    { path: 'src/scripts/main.js', action: 'modify', content: 'y' },
+    { path: 'src/index.html', action: 'modify', content: 'z' },
+  ] };
+
+  const dropped = orchestrator._dropOutOfScopeChanges(task, output);
+
+  assert.deepEqual(dropped, ['src/scripts/main.js', 'src/index.html']);
+  assert.deepEqual(output.files.map(file => file.path), ['tests/game.test.js']);
+  assert.match(orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '', /outside the task scope/);
+});
