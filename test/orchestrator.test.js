@@ -2638,3 +2638,34 @@ test('oversized task parts are balanced rather than leaving a one-file tail', as
   assert.deepEqual(split.map(t => t.allowedFiles.length), [4, 3]);
   assert.ok(split[1].allowedFiles.includes('src/main.js'));
 });
+
+test('task normalization hoists a new project manifest planned under src/ to the project root', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'task-001', title: 'Setup', description: 'Create src/package.json with Phaser.', assignedAgent: 'codeWorker',
+    dependsOn: [], allowedFiles: ['src/package.json', 'src/README.md', 'src/game/main.js'], forbiddenActions: [],
+    acceptanceCriteria: ['src/package.json lists phaser'], status: 'pending', createdAt: '',
+  };
+
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString());
+
+  assert.deepEqual(normalized.allowedFiles, ['package.json', 'README.md', 'src/game/main.js']);
+  assert.equal(normalized.description, 'Create package.json with Phaser.');
+  assert.ok(normalized.acceptanceCriteria.includes('package.json lists phaser'));
+  assert.match(orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '', /moved it to the project root/);
+});
+
+test('task normalization keeps an existing src/package.json (the user\'s real layout)', async () => {
+  const root = makeTempWorkspace();
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'package.json'), '{}');
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'task-001', title: 'Setup', description: 'd', assignedAgent: 'codeWorker',
+    dependsOn: [], allowedFiles: ['src/package.json'], forbiddenActions: [],
+    acceptanceCriteria: ['ok'], status: 'pending', createdAt: '',
+  };
+
+  assert.deepEqual(orchestrator._normalizeTaskItem(task, 0, new Date().toISOString()).allowedFiles, ['src/package.json']);
+});

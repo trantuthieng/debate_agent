@@ -7291,6 +7291,17 @@ export class AgentOrchestrator {
       ? task.allowedFiles.map(file => this._normalizeRelativePath(String(file))).filter(Boolean)
       : [];
     const taskId = task.id || `task-${String(index + 1).padStart(3, '0')}`;
+    const hoisted = this._hoistMisplacedRootManifests(taskId, normalizedAllowedFiles);
+    if (hoisted.size > 0) {
+      const rewrite = (text: string) => [...hoisted].reduce((acc, [from, to]) => acc.split(from).join(to), text);
+      task = {
+        ...task,
+        description: rewrite(String(task.description ?? '')),
+        acceptanceCriteria: Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria.map(c => rewrite(String(c))) : task.acceptanceCriteria,
+      };
+      normalizedAllowedFiles.splice(0, normalizedAllowedFiles.length,
+        ...[...new Set(normalizedAllowedFiles.map(file => hoisted.get(file) ?? file))]);
+    }
     const allowedFiles = normalizedAllowedFiles.filter(file => {
       if (this._isOffStackToolchainMarker(file)) {
         this.workspace.appendAssumption(
@@ -7341,6 +7352,29 @@ export class AgentOrchestrator {
       createdAt: task.createdAt || now,
       status: 'pending',
     };
+  }
+
+  /**
+   * Real failure mode (benchmark run 6, 2026-09-26): the task manager planned
+   * "src/package.json" and "src/README.md" for a new project. The manifest's
+   * content was a root manifest ("main": "src/game/main.js"), but at src/ the
+   * dependency-install phase found no package.json, Phaser was never
+   * installed, and the page failed on its bare import. A project manifest
+   * directly under a top-level src/ of a new project is hoisted to the root.
+   * Files that already exist (the user's real layout) are left alone.
+   */
+  private _hoistMisplacedRootManifests(taskId: string, files: string[]): Map<string, string> {
+    const hoisted = new Map<string, string>();
+    for (const file of files) {
+      const match = /^src\/(package\.json|README\.md|requirements\.txt|pyproject\.toml)$/i.exec(file);
+      if (!match || this.fileManager.fileExists(file) || this.fileManager.fileExists(match[1])) { continue; }
+      hoisted.set(file, match[1]);
+      this.workspace.appendAssumption(
+        'taskManager',
+        `Task ${taskId} planned project manifest "${file}" under src/; moved it to the project root as "${match[1]}" so install, run and test tooling can find it.`
+      );
+    }
+    return hoisted;
   }
 
   /**
