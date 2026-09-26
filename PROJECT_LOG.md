@@ -515,3 +515,12 @@ Run 6 chạy qua `scripts/run-on-internal-disk.sh`: ~2h35m, không lỗi môi tr
 - **Cải tiến (`b379b07`)**: chia task cân bằng (7 → 4+3, không phải 6+1).
 - Ghi chú: sprint 1 chỉ có 6 task (không có 20 level) — sprint sau phải lo; chưa kiểm chứng.
 - `npm run check` 369/369. Chạy run 7.
+
+### 2026-09-26 (tiếp) — Run 7: 13/13 task sprint 1 (có đủ 20 level), fail ở build → 2 fix mới
+
+Run 7 (`dist/local-runs/20260926-115038.log`, workspace `demo/brick-breaker-20-2026-09-26T04-50-50-476Z`), ~3h10m, dừng chủ động ở test-fix 3/8 (lỗi build tăng 161 → 167, không hội tụ). Dừng giữa chừng + copy-back qua script hoạt động đúng.
+
+- **Xác nhận live:** chia task (task level 22 file → 4 phần, cả 4 xong — chính task đã timeout ở run 4); `package.json` ở gốc → dependency install chạy thật; 13/13 task sprint 1 hoàn thành.
+- **Lỗ hổng 1 — script test giả:** `"test": "echo \"Tests will be implemented in a later step\" && exit 0"` → `npm test` pass mà không chạy test nào. **Sửa (`7daa8be`)**: `VerificationPlanner._isPlaceholderScript` — script chỉ gồm echo/exit 0/true là blocking issue.
+- **Lỗ hổng 2 — không biên dịch giữa các task:** mọi task qua review LLM, cuối cùng `npm run build` 161 lỗi TS (`main.ts` dùng scene không import; test import named export không tồn tại). **Sửa (`07cb01c`)**: `src/utils/typeScriptGate.ts` — reviewer type-check in-memory các file .ts task vừa đổi (không cần node_modules), chỉ báo lỗi cú pháp / tên chưa khai báo / import-export tương đối sai; bỏ qua lỗi do thiếu @types, globals jest/Node. Chạy trên workspace run 7: bắt đúng 5 lỗi thật, ~0.5s. Hạn chế: `typescript` là devDependency → trong VSIX đóng gói gate tự bỏ qua.
+- `npm run check` 372/372. Chạy run 8.
