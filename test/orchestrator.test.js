@@ -2803,3 +2803,24 @@ test('per-task verification can be turned off', async () => {
   assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['src/ball.js']), []);
   assert.deepEqual(commands, []);
 });
+
+test('per-task verification skips bundler module summaries and does not blame a setup change for other files\' errors', async () => {
+  const { root, orchestrator, task } = await runtimeHarness({
+    scripts: { build: 'webpack' },
+    results: { 'npm run build': [false, [
+      '  ./src/scenes/GameScene.ts 3.01 KiB [built] [code generated] [9 errors]',
+      '  ./src/ball.js 1 KiB [built] [code generated]',
+      'ERROR in src/scenes/GameScene.ts(2,1)',
+      '      TS6133: unused.',
+    ].join('\n')] },
+  });
+  fs.mkdirSync(path.join(root, 'src/scenes'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/scenes/GameScene.ts'), '');
+  fs.writeFileSync(path.join(root, 'src/ball.js'), '');
+
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['src/ball.js']), [], 'a module summary line is not an error of that file');
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['package.json']), [], 'errors inside another file are that file\'s');
+  const own = await orchestrator._taskRuntimeIssues(task, ['src/scenes/GameScene.ts']);
+  assert.match(own[0], /ERROR in src\/scenes\/GameScene\.ts\(2,1\)\n      TS6133/);
+  assert.doesNotMatch(own[0], /\[built\]/);
+});

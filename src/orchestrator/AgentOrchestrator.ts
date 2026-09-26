@@ -3933,21 +3933,42 @@ export class AgentOrchestrator {
   }
 
   /** Lines of a command output that mention any of the files (plus up to 3 continuation lines). */
-  private _diagnosticLinesFor(output: string, files: string[], maxLines = 40): string[] {
+  /** Output with absolute workspace paths (including those of a copy of this workspace) made relative. */
+  private _stripWorkspaceRoot(output: string): string {
     const root = this.workspace.rootDir.replace(/\\/g, '/');
     const folder = path.posix.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const lines = output.split(`${root}/`).join('').replace(new RegExp(`/[^\\s'"()]*/${folder}/`, 'g'), '').split(/\r?\n/);
-    const startsError = /^\s*(\[\w+\]\s*)?(ERROR|✖|✗|FAIL)\b/i;
+    return output.split(`${root}/`).join('').replace(new RegExp(`/[^\\s'"()]*/${folder}/`, 'g'), '');
+  }
+
+  /**
+   * Lines of a command output that name any of the files, plus up to 3
+   * continuation lines. Bundler module summaries ("./src/x.ts 3 KiB [built]
+   * [code generated] [9 errors]") list every module and are skipped; a
+   * continuation stops at a line naming a different source file.
+   */
+  private _diagnosticLinesFor(output: string, files: string[], maxLines = 40): string[] {
+    const lines = this._stripWorkspaceRoot(output).split(/\r?\n/);
+    const summary = /\[(built|code generated|cached)\]|orphan modules|modules by path/i;
+    const namesOtherFile = (line: string) => /[\w.-]+\/[\w./-]+\.(m?[jt]sx?|cjs|json|css|html?|vue|svelte)\b/.test(line)
+      && !files.some(file => line.includes(file));
     const picked: string[] = [];
     lines.forEach((line, index) => {
-      if (!files.some(file => line.includes(file))) { return; }
+      if (summary.test(line) || !files.some(file => line.includes(file))) { return; }
       picked.push(line);
       for (const next of lines.slice(index + 1, index + 4)) {
-        if (startsError.test(next) && !files.some(file => next.includes(file))) { break; }
+        if (summary.test(next) || namesOtherFile(next)) { break; }
         picked.push(next);
       }
     });
     return [...new Set(picked)].slice(0, maxLines);
+  }
+
+  /** The error-looking lines of an output (paths made relative), else its tail. */
+  private _errorEvidence(output: string, lines = 12): string {
+    const all = this._stripWorkspaceRoot(output).split(/\r?\n/).filter(line => line.trim());
+    const errors = all.filter(line => /\berror\b|exception|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|cannot|not found|undefined is not/i.test(line)
+      && !/\[(built|code generated|cached)\]/.test(line));
+    return (errors.length > 0 ? errors : all.slice(-lines)).slice(0, lines).join('\n');
   }
 
   /**
@@ -3958,9 +3979,12 @@ export class AgentOrchestrator {
    * the page broke right after this task changed web files.
    */
   private async _taskRuntimeIssues(task: TaskItem, changedPaths: string[]): Promise<string[]> {
-    if (this.modelConfig.perTaskVerification === false || !this.fileManager.fileExists('package.json')) { return []; }
+    if (this.modelConfig.perTaskVerification === false) { return []; }
     const pm = this.terminal.detectPackageManager();
-    const tail = (text: string, lines = 30) => text.split(/\r?\n/).filter(Boolean).slice(-lines).join('\n');
+    // A no-build static page may have no package.json at all; it still gets
+    // the browser check below.
+    const hasPackageJson = this.fileManager.fileExists('package.json');
+    const tail = (text: string, lines = 30) => this._stripWorkspaceRoot(text).split(/\r?\n/).filter(Boolean).slice(-lines).join('\n');
     const outputOf = (result: TerminalRunResult) => `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
     const run = async (command: string, timeoutMs: number): Promise<TerminalRunResult> => {
       try { return await this.terminal.runSafeCommand(command, timeoutMs); } catch (err) {
@@ -3973,7 +3997,7 @@ export class AgentOrchestrator {
 
     const fingerprint = this._dependencyManifestFingerprint();
     const nodeModules = fs.existsSync(path.join(this.workspace.rootDir, 'node_modules'));
-    if (this.modelConfig.autoInstallDependencies && (!nodeModules || fingerprint !== this._taskInstalledFingerprint)) {
+    if (hasPackageJson && this.modelConfig.autoInstallDependencies && (!nodeModules || fingerprint !== this._taskInstalledFingerprint)) {
       const command = pm === 'yarn' ? 'yarn install' : pm === 'pnpm' ? 'pnpm install' : 'npm install';
       this._emit('log', `Per-task verification for ${task.id}: installing dependencies.`, 'info');
       const install = await run(command, 600_000);
@@ -3990,19 +4014,23 @@ export class AgentOrchestrator {
 
     const buildSetupChanged = changedPaths.some(file =>
       /^(package\.json|tsconfig[^/]*\.json|(webpack|vite|rollup|babel)\.config\.[cm]?[jt]s|\.babelrc)$/.test(file));
-    const buildScript = this.terminal.hasPackageScript('build') ? 'build' : this.terminal.hasPackageScript('compile') ? 'compile' : null;
+    const buildScript = !hasPackageJson ? null
+      : this.terminal.hasPackageScript('build') ? 'build' : this.terminal.hasPackageScript('compile') ? 'compile' : null;
     if (buildScript) {
       const command = this._packageScriptCommand(pm, buildScript);
       const build = await run(command, 300_000);
       summary.push(`${command}: ${build.success ? 'ok' : 'FAILED'}`);
       if (!build.success) {
         const own = this._diagnosticLinesFor(outputOf(build), changedPaths);
+        // A setup change is blamed only for failures no source file explains
+        // (config/resolution errors), not for errors inside other tasks' files.
+        const otherFileErrors = this._diagnosticLinesFor(outputOf(build), this._projectSourceFiles().filter(file => !changedPaths.includes(file)), 1);
         if (own.length > 0) { issues.push(`[runtime] \`${command}\` fails in this task's files:\n${own.join('\n')}`); }
-        else if (buildSetupChanged) { issues.push(`[runtime] \`${command}\` fails after this task changed the build setup:\n${tail(outputOf(build))}`); }
+        else if (buildSetupChanged && otherFileErrors.length === 0) { issues.push(`[runtime] \`${command}\` fails after this task changed the build setup:\n${this._errorEvidence(outputOf(build), 30)}`); }
       }
     }
 
-    const testScript = this._packageTestScript();
+    const testScript = hasPackageJson ? this._packageTestScript() : null;
     if (testScript && !isPlaceholderScript(testScript)) {
       const test = await this.terminal.runTests(pm);
       summary.push(`${pm} test: ${test.success ? 'ok' : 'FAILED'}`);
@@ -4010,7 +4038,7 @@ export class AgentOrchestrator {
         const wroteTests = changedPaths.some(file => TEST_FILE.test(file));
         const own = this._diagnosticLinesFor(outputOf(test), changedPaths);
         if (own.length > 0) { issues.push(`[runtime] \`${pm} test\` fails in this task's files:\n${own.join('\n')}`); }
-        else if (wroteTests || changedPaths.includes('package.json')) { issues.push(`[runtime] \`${pm} test\` fails after this task changed the tests or their setup:\n${tail(outputOf(test))}`); }
+        else if (wroteTests || changedPaths.includes('package.json')) { issues.push(`[runtime] \`${pm} test\` fails after this task changed the tests or their setup:\n${this._errorEvidence(outputOf(test), 30)}`); }
       }
     }
 
@@ -4022,7 +4050,7 @@ export class AgentOrchestrator {
       const regression = smoke.failed && (this._lastTaskSmokePassed !== false || changedPaths.some(file => /\.html?$/.test(file)));
       if (regression) {
         const evidence = smoke.checks.filter(check => !check.success)
-          .map(check => `${check.command}: ${tail(outputOf(check), 8)}`).join('\n');
+          .map(check => `${check.command}:\n${this._errorEvidence(outputOf(check), 8)}`).join('\n');
         issues.push(`[runtime] The page fails in a real browser after this task:\n${evidence || smoke.summary}`);
       }
       this._lastTaskSmokePassed = !smoke.failed;
@@ -4030,6 +4058,11 @@ export class AgentOrchestrator {
 
     this._recordTaskRuntimeSummary(task, summary);
     return issues;
+  }
+
+  private _projectSourceFiles(): string[] {
+    return this.fileManager.listWorkspaceFiles('')
+      .filter(file => /\.(m?[jt]sx?|cjs|vue|svelte)$/.test(file) && !/(^|\/)(node_modules|dist|build|\.agent-workspace)\//.test(file));
   }
 
   private _packageTestScript(): string | null {
@@ -4071,10 +4104,7 @@ export class AgentOrchestrator {
    * diagnostics point there. Returns null when no project file is named.
    */
   private _testFixFocus(checks: ProjectCheckResults, candidates: string[]): { files: string[]; diagnostics: string } | null {
-    const root = this.workspace.rootDir.replace(/\\/g, '/');
-    // Strip absolute prefixes, including those of a copy of this workspace.
-    const folder = path.posix.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const output = checks.output.split(`${root}/`).join('').replace(new RegExp(`/[^\\s'"()]*/${folder}/`, 'g'), '');
+    const output = this._stripWorkspaceRoot(checks.output);
     const lines = output.split(/\r?\n/);
     const errorLine = /\berror\b|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|Exception|Cannot find|Blocking issues|^- /i;
     const ordered: string[] = [];
