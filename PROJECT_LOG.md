@@ -503,3 +503,15 @@ Chạy `node test/brick_breaker_e2e.js` nền (`nohup ... & disown`, PID 43873),
 - Sửa: `RunLock.heartbeat()` nuốt lỗi ghi (lỡ 1 nhịp chỉ làm lock trông stale sớm hơn, nhịp sau ghi lại). Test mới trong `test/autonomousResume.test.js`.
 - Theo đề xuất của boss: `scripts/run-on-internal-disk.sh` (`npm run test:e2e:brick-breaker:local`) — dữ liệu chính vẫn ở Data; khi chạy thì copy repo sang `~/.debate-agent-runs/<id>` (bỏ node_modules/out/demo/dist/.git), `npm ci` + compile, chạy job, sửa đường dẫn tuyệt đối trong report JSON, chờ thư mục Data khả dụng (tối đa 240 phút), copy `demo/` + `dist/` về (bỏ `node_modules` của project sinh ra), kiểm tra từng file bằng `cmp`, chỉ xoá bản ổ trong khi đã xác minh đủ. Log run: `dist/local-runs/<id>.log`.
 - `npm run check` 365/365.
+
+### 2026-09-26 (tiếp) — Run 6 (chạy trên ổ trong): sprint 1 xong 6/6 task lần đầu, fail ở smoke test → 3 fix mới
+
+Run 6 chạy qua `scripts/run-on-internal-disk.sh`: ~2h35m, không lỗi môi trường. Copy-back thành công: workspace `demo/brick-breaker-20-2026-09-26T02-15-54-990Z`, log `dist/local-runs/20260926-091547.log`, bản trên ổ trong đã xoá.
+
+- **Tích cực:** chia task chạy đúng trên model thật (task-001 7 file → 2 phần); **6/6 task sprint 1 hoàn thành** (lần đầu một sprint xong trọn vẹn); escalate sang devstral hoạt động ở cả pha fix task lẫn pha test-fix; không có `Package.swift`.
+- **Fail:** `app smoke verification` sau 8/8 lần test-fix — `SyntaxError: Cannot use import statement outside a module`.
+- **Nguyên nhân 1:** task-manager đặt `src/package.json` + `src/README.md` (nội dung là manifest gốc) → dependency install "No package.json found", Phaser không được cài. **Sửa (`182b073`)**: `_hoistMisplacedRootManifests` — manifest (`package.json`, `README.md`, `requirements.txt`, `pyproject.toml`) ngay dưới `src/` của project mới được chuyển lên gốc (kể cả trong mô tả/criteria); file đã có sẵn thì giữ nguyên.
+- **Nguyên nhân 2:** `index.html` (do test-fix-1 tạo, không task nào liệt kê) không bao giờ được đưa cho các fixer sau vì lỗi smoke không nêu tên file → 7 lần sửa file sai. **Sửa (`a78cd1e`)**: `_collectTestFixAllowedFiles` luôn gồm `index.html`/`public/index.html`/`src/index.html` nếu tồn tại.
+- **Cải tiến (`b379b07`)**: chia task cân bằng (7 → 4+3, không phải 6+1).
+- Ghi chú: sprint 1 chỉ có 6 task (không có 20 level) — sprint sau phải lo; chưa kiểm chứng.
+- `npm run check` 369/369. Chạy run 7.
