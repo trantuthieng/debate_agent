@@ -98,6 +98,7 @@
     "test:vscode": "node test/vscode/runTest.js",
     "test:e2e:ollama": "node test/e2e_run.js",
     "test:e2e:brick-breaker": "npm run compile && node test/brick_breaker_e2e.js",
+    "test:e2e:brick-breaker:local": "bash scripts/run-on-internal-disk.sh node test/brick_breaker_e2e.js",
     "test:e2e:word-addin": "npm run compile && node test/word_addin_e2e.js",
     "test:e2e:build:ollama": "node test/e2e_run.js --build-only",
     "resume:auto": "npm run compile && node scripts/run-with-auto-resume.js",

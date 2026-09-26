@@ -29,8 +29,16 @@ export class RunLock {
     this._write();
   }
 
+  /**
+   * Runs from a timer, so a throw here is an uncaught exception that kills
+   * the whole run (benchmark run 5: a sync client briefly revoked access to
+   * the workspace folder → EACCES). A missed heartbeat only makes the lock
+   * look stale sooner; the next tick rewrites it.
+   */
   heartbeat(): void {
-    this._write();
+    try {
+      this._write();
+    } catch { /* transient fs failure — retried on the next tick */ }
   }
 
   /** Only removes the lock if it still belongs to this process. */

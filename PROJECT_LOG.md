@@ -496,3 +496,10 @@ Chạy `node test/brick_breaker_e2e.js` nền (`nohup ... & disown`, PID 43873),
 - Sửa (`724d904`): `_splitOversizedTasks` (tất định, gọi sau `_normalizeTaskItem`) chia task >6 file thành các phần tuần tự (part cuối giữ id gốc + acceptance criteria gốc + file aggregator `index/main/app.*`); rule 2 `TASK_MANAGER_SYSTEM`: tối đa 6 file/task, nhiều item giống nhau gom vào 1 file dữ liệu; prompt quality-audit: allowed files là "được phép", không phải "bắt buộc". `npm run check` 364/364.
 - Dừng run 4 (SIGTERM) vì tiến trình chạy code cũ, task-003 chắc chắn fail. Chạy run 5: PID 69856, log `/private/tmp/debate-brick20-20260926-083148.log`.
 - Fix #1 (off-stack `Package.swift`) vẫn chưa được kiểm chứng live (chỉ xuất hiện ở pha testing).
+
+### 2026-09-26 (tiếp) — Run 5 chết vì OneDrive (dù đã dừng sync) → chạy benchmark trên ổ trong
+
+- Run 5 (`/private/tmp/debate-brick20-20260926-083148.log`) chết sau ~19 phút ở vòng debate 2: thư mục dự án lại biến mất → `EACCES` trong `RunLock.heartbeat` (gọi từ `setInterval`) → uncaught exception. Dừng sync là không đủ.
+- Sửa: `RunLock.heartbeat()` nuốt lỗi ghi (lỡ 1 nhịp chỉ làm lock trông stale sớm hơn, nhịp sau ghi lại). Test mới trong `test/autonomousResume.test.js`.
+- Theo đề xuất của boss: `scripts/run-on-internal-disk.sh` (`npm run test:e2e:brick-breaker:local`) — dữ liệu chính vẫn ở Data; khi chạy thì copy repo sang `~/.debate-agent-runs/<id>` (bỏ node_modules/out/demo/dist/.git), `npm ci` + compile, chạy job, sửa đường dẫn tuyệt đối trong report JSON, chờ thư mục Data khả dụng (tối đa 240 phút), copy `demo/` + `dist/` về (bỏ `node_modules` của project sinh ra), kiểm tra từng file bằng `cmp`, chỉ xoá bản ổ trong khi đã xác minh đủ. Log run: `dist/local-runs/<id>.log`.
+- `npm run check` 365/365.

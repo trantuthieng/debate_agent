@@ -308,3 +308,13 @@ test('coding resume resets failed/skipped work and canonical active IDs while pr
   assert.equal(run.state.currentPhase, 'coding');
   assert.equal(fs.readFileSync(path.join(root, 'user-source.js'), 'utf8'), 'preserve this code');
 });
+
+test('a run lock heartbeat that cannot write (folder briefly gone) does not throw from the timer', () => {
+  const { RunLock } = require('../out/workspace/RunLock');
+  const missing = path.join(os.tmpdir(), `runlock-missing-${process.pid}-${Date.now()}`, 'nested', 'run.lock');
+  fs.mkdirSync(path.dirname(path.dirname(missing)), { recursive: true });
+  fs.writeFileSync(path.dirname(missing), 'a file, so mkdir of this path fails');
+
+  assert.doesNotThrow(() => new RunLock(missing).heartbeat());
+  fs.rmSync(path.dirname(path.dirname(missing)), { recursive: true, force: true });
+});
