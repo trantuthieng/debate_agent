@@ -1,0 +1,39 @@
+{
+  "id": "brick-breaker-20",
+  "version": 1,
+  "goal": "Build a complete, polished Brick Breaker (Arkanoid-style) browser game with exactly 20 distinct playable levels of increasing difficulty. Include keyboard and pointer/touch controls, score and lives, pause/resume, restart, level progression, and a victory state after level 20. Deliver a runnable project with README instructions and meaningful automated tests verifying all 20 levels and core gameplay. For automated acceptance testing, expose a read-only window.__gameState updated every frame: { phase: 'menu'|'playing'|'paused'|'levelComplete'|'gameOver'|'victory', level, totalLevels, score, lives, paddle: { x }, ball: { x, y }, bricksRemaining }, and window.__gameTest = { completeLevel(), loseBall() } hooks that clear the current level / miss the ball through the game's own logic. Start with Enter or Space, move with ArrowLeft/ArrowRight, pause with P, restart with Enter or R.",
+  "requirements": [
+    {
+      "id": "B01",
+      "behavior": "Exactly 20 distinct playable levels; inspect level definitions and evidence of different layouts/increasing difficulty, not file count alone."
+    },
+    {
+      "id": "B02",
+      "behavior": "Start via real keyboard; keyboard and pointer/touch move paddle; ball travels and collides with paddle/walls/bricks. Actual brick removal increases score, not a hook or score change alone."
+    },
+    {
+      "id": "B03",
+      "behavior": "Pause freezes gameplay; resume continues; naturally missing ball removes a life; zero lives shows game over."
+    },
+    {
+      "id": "B04",
+      "behavior": "Clearing levels progresses in order to 20 then victory; deterministic hook checks supplement at least one natural transition/collision check."
+    },
+    {
+      "id": "B05",
+      "behavior": "Restart from victory and game-over resets level, score, lives and transient state; new run remains playable."
+    },
+    {
+      "id": "B06",
+      "behavior": "Contract read-only state matches rendered gameplay; hooks route through ordinary game logic, never independent artificial score/phase updates."
+    },
+    {
+      "id": "B07",
+      "behavior": "Responsive readable UI, instructions, keyboard/pointer/touch controls; screenshots plus actual input evidence on desktop/mobile."
+    },
+    {
+      "id": "B08",
+      "behavior": "Build and real automated tests pass; no fatal browser errors or missing resources; clean-copy install/run documented. Broken collision/input/victory/restart fixtures must fail relevant acceptance."
+    }
+  ]
+}

@@ -11,9 +11,8 @@ function orchestratorFor(t) {
   return new AgentOrchestrator(root);
 }
 
-// Read the literal without importing the benchmark, which would start real LLMs.
-const benchmarkSource = fs.readFileSync(path.join(__dirname, '..', 'brick_breaker_e2e.js'), 'utf8');
-const benchmarkPrompt = /^const prompt = '([^']+)';$/m.exec(benchmarkSource)?.[1];
+// Share the locked brief without importing the benchmark (which starts real models).
+const benchmarkPrompt = require('../../benchmarks/goals/brick-breaker.v1.json').goal;
 
 test('exact Brick Breaker benchmark prompt does not imply a CV or runtime file input', async t => {
   assert.equal(typeof benchmarkPrompt, 'string', 'Keep this regression tied to the actual benchmark prompt');

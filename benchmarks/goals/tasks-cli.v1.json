@@ -1,0 +1,15 @@
+{
+  "id": "tasks-cli",
+  "version": 1,
+  "goal": "Build a small Node.js task-manager CLI. The documented command must accept --data <file> to select a JSON data file and support add <title>, list, done <id>, and remove <id>. Tasks have unique stable IDs and a done flag. Support --json output for all commands. Preserve data across separate processes; a successful write must be atomic. Reject blank titles, unknown IDs, unknown commands, malformed existing data, and unwritable destinations with a nonzero exit code and a clear stderr message, without destroying valid existing data. Provide --help, README installation/usage instructions, and meaningful automated tests invoking the CLI in separate processes with temporary data files. Use only local filesystem storage and no external services.",
+  "requirements": [
+    {"id": "T01", "behavior": "--help exits zero and describes commands/flags; empty list emits valid empty JSON."},
+    {"id": "T02", "behavior": "Add two titles including Unicode and spaces in separate processes; IDs distinct and stable; list returns exactly both tasks not done."},
+    {"id": "T03", "behavior": "done changes only target flag; repeated done remains done; new process reads persisted state."},
+    {"id": "T04", "behavior": "remove deletes only chosen ID; other task unchanged; different --data files are isolated."},
+    {"id": "T05", "behavior": "Blank title, unknown ID/command, and malformed JSON each return nonzero with useful stderr and do not change existing bytes."},
+    {"id": "T06", "behavior": "Unwritable/invalid destination fails clearly; successful mutation leaves a complete parseable file. Inject failure before replacement and verify original data survives."},
+    {"id": "T07", "behavior": "All documented --json command outputs parse as JSON without progress text; success exit code is zero."},
+    {"id": "T08", "behavior": "Clean-copy installation and README commands work; actual subprocess tests assert results; intentionally broken persistence/error-code fixtures fail acceptance."}
+  ]
+}
