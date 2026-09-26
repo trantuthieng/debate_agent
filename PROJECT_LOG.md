@@ -1,6 +1,6 @@
 # Nhật ký triển khai — Debate Agent
 
-Ghi lại toàn bộ quá trình phát triển, kiểm thử thực tế (real-model smoke test) và các vấn đề còn tồn đọng. Cập nhật lần cuối: 2026-09-11.
+Ghi lại toàn bộ quá trình phát triển, kiểm thử thực tế (real-model smoke test) và các vấn đề còn tồn đọng. Cập nhật lần cuối: 2026-09-26.
 
 ## 1. Mục tiêu dự án (theo CLAUDE.MD)
 
@@ -545,3 +545,45 @@ Run 8 (`dist/local-runs/20260926-150139.log`, workspace `demo/brick-breaker-20-2
 4. **Test task phải khớp stack + có runner thật.** Task viết test luôn được phép sửa `package.json` (thêm runner như vitest/jest + script `test` thật); chặn tất định file test sai ngôn ngữ (`.ts` trong project JS không có tsconfig); acceptance criteria yêu cầu `npm test` chạy được và có assertion thật.
 5. **Fixer ra file ngoài allowedFiles: không giết task ngay.** Bỏ riêng các file đó (như `_dropOffStackToolchainMarkers`), ghi assumption, cho các lần sửa còn lại; nếu nguyên nhân thật nằm ở file của task trước, mở rộng allowedFiles có kiểm soát (file đã tồn tại, cùng stack). Sửa log "after 8 attempts" cho đúng số lần thật.
 6. **Test-fix theo cụm nhỏ.** Mỗi lần chỉ đưa lỗi đầu tiên (cụm theo file) + ≤3 file liên quan, không phải toàn bộ log + mọi file; dừng sớm nếu số lỗi tăng 2 lần liên tiếp và quay lại bản tốt nhất (rollback theo số lỗi).
+
+### 2026-09-26 — Benchmark kiểm chứng sau rà soát đề xuất: fail ở chấm điểm, phát hiện Resume không phục hồi
+
+- Theo yêu cầu chạy benchmark để kiểm tra lỗi: chạy mới toàn bộ `runAutonomousGoal()` với prompt Brick Breaker 20 level, cấu hình mặc định; chưa áp dụng 6 đề xuất cuối run 8. Source tại commit `9fd4f22`, working tree sạch khi bắt đầu.
+- Bắt đầu **17:13:49**, kết thúc **17:59:19 giờ Việt Nam**, mất **45 phút 30 giây**, exit 1. Chạy qua `scripts/run-on-internal-disk.sh`; outputs đã copy về và kiểm chứng trước khi xoá bản tạm trên ổ trong. Workspace: `demo/brick-breaker-20-2026-09-26T10-13-49-017Z`; log: `dist/local-runs/20260926-171335.log`; report riêng: `dist/benchmarks/brick-breaker-20-2026-09-26T10-13-49-017Z.json`. Tắt thông báo Telegram riêng cho invocation này.
+- `npm ci` và compile thành công; readiness đủ 5 model chính + 1 reserve. R1–R3 mỗi vòng đủ 6 phản hồi. R4 dừng với **`Debate scoring blocked: only 4 distinct models returned valid scorecards.`** Chưa sinh code, chưa chạy build/test/browser smoke hoặc kiểm đếm level; không kiểm chứng được 6 đề xuất sửa lỗi sản phẩm cuối run 8.
+- **Nguyên nhân trực tiếp đã xác nhận:** checkpoint chứa 30 phiếu, từ 5 vai nhưng chỉ 4 model khác nhau (tech-architect và ops-verifier cùng dùng qwen2.5-coder:14b). Vai game-designer / `deepseek-coder-v2:16b` không có phiếu hợp lệ sau 3 lần gọi. `ollama_calls.jsonl` ghi 37/37 call thành công; `chatJson()` đánh dấu thành công sau parse JSON, trước `_validateScorecard()`, nên số này không chứng minh scorecard hợp lệ. Không có bằng chứng timeout/crash Ollama hoặc lỗi OneDrive trong lượt này. Gate chặn dưới 5 model là đúng yêu cầu, không nên hạ gate để chạy tiếp.
+- **Bug Resume đã tái hiện từ checkpoint thật:** `DynamicTeam.ts` thêm judge vào `completedAgentIds` kể cả khi `_scoreWithModel()` trả `[]`. Checkpoint R4 đánh dấu cả 6 vai đã xong. Phát lại bằng `DynamicTeam.run(plan, {}, checkpoint)` với client đếm lời gọi: **0 model call**, lập tức ném cùng lỗi thiếu model. Resume hiện không thử sửa scorecard bị thiếu. Đây là kiểm tra điều khiển luồng bằng checkpoint thật, không phải một lượt model thật mới.
+- **Lỗ hổng log đã xác nhận:** `test/brick_breaker_e2e.js` không gọi `initLogger()`; cảnh báo retry/validation trong DynamicTeam dùng `logWarn()`, chỉ ghi khi logger đã được khởi tạo. Vì vậy không lưu được lỗi validation cụ thể hoặc raw scorecard của deepseek trong lượt này; chưa thể kết luận là thiếu proposal, sai tiêu chí hay sai kiểu dữ liệu.
+- **Hạn chế nghiên cứu:** agent báo thiếu/thất bại kết quả tìm kiếm rồi tiếp tục bằng kiến thức sẵn có. Team plan giao `search` (tìm trong workspace), không giao `web_search`; chưa có trace tool đầy đủ để kết luận nguyên nhân cụ thể.
+
+**Đề xuất xử lý trước benchmark tiếp theo (chưa sửa source):**
+1. Khởi tạo logger trong harness; lưu lý do scorecard bị từ chối và số lần thử theo judge/model, phân biệt thành công JSON với hợp lệ theo schema.
+2. Resume R4 phải xác định judge đã hoàn tất từ scorecard đầy đủ hợp lệ, gọi lại đúng model của judge còn thiếu; giữ nguyên phiếu hợp lệ và R1–R3. Không chỉ xoá judge lỗi khỏi danh sách rồi dùng độ dài làm con trỏ, vì judge lỗi có thể nằm giữa danh sách. Giữ gate tối thiểu 5 model.
+3. Bổ sung regression cho checkpoint R4 có judge đã đánh dấu completed nhưng không có phiếu, nhất là judge nằm giữa danh sách; kiểm tra không lặp hoặc nhân đôi phiếu của các judge đã đạt.
+4. Sau khi sửa, Resume bản sao checkpoint để kiểm chứng khả năng phục hồi trên model thật, rồi mới đánh giá các lỗi build/runtime cuối run 8. Không chạy lại toàn bộ debate chỉ để gặp lại checkpoint không thể phục hồi.
+
+**Kiểm tra bổ sung:** `node --test test/unit/dynamicAgents.test.js` **31/31 pass**; bộ test hiện có chưa bắt trường hợp Resume scorecard thất bại nêu trên. Chỉ cập nhật nhật ký, chưa thay đổi source hoặc sửa sản phẩm benchmark bằng tay.
+
+### 2026-09-26 — Sửa Resume R4, bổ sung diagnostics và kiểm chứng scorecard trên model thật
+
+- **Resume R4:** xác định judge hoàn tất từ scorecard đầy đủ hợp lệ, không dùng độ dài/thứ tự `completedAgentIds`. Kiểm tra lại phiếu trong checkpoint cũ; loại toàn bộ card thiếu/trùng/sai tiêu chí rồi gọi lại đúng model của judge đó. Giữ nguyên phiếu đạt, không chạy lại R1–R3, không nhân đôi phiếu. Judge hết retry vẫn chưa hoàn tất để lần Resume sau có thể thử lại. Checkpoint đã chuẩn hoá được lưu trước khi gọi model, kể cả nếu huỷ giữa chừng. Giữ yêu cầu tối thiểu 5 model khác nhau.
+- **Diagnostics:** harness Brick Breaker khởi tạo logger, ghi cả stdout và `logs/benchmark-<invocation>.log`; report chỉ rõ `diagnosticsLog`. Mỗi lần chấm ghi judge, model, số lần thử, accepted/rejected và phân biệt lỗi model/parse JSON với lỗi schema. Lần từ chối cuối cũng được ghi, không chỉ các lần có retry.
+- **Tái hiện thật sau sửa Resume, trước sửa prompt:** từ bản sao checkpoint benchmark 17:13, DeepSeek được gọi đúng 3 lần nhưng cả 3 đều thiếu phiếu cho `ops-verifier`. Diagnostics mới bắt được chính xác `Missing scores for proposals: ops-verifier.`; 30 phiếu cũ vẫn giữ nguyên. Lượt này 84 giây, fail đúng gate. Đây là bằng chứng của lượt replay; raw scorecard của benchmark gốc vẫn không có để xác nhận nó thiếu cùng trường hợp.
+- **Sửa prompt scorecard:** thay ví dụ một dòng `<id>` bằng template liệt kê đủ mọi proposal ID (6 dòng trong benchmark này). Tiêu chí để `null` và yêu cầu model tự điền số; template chưa điền vẫn bị validator từ chối, không tự gán điểm 0 hoặc hạ chuẩn kiểm tra.
+- **Replay model thật sau sửa prompt: PASS, 176874 ms (~2 phút 57 giây).** DeepSeek trả đủ 6/6 phiếu hợp lệ ngay lần 1; model reserve `mistral-small3.2:24b` được gọi để xử lý điểm gần hoà và trả đủ 6/6 phiếu ngay lần 1. Chỉ 2 model call; đã assert 30 phiếu cũ không thay đổi. Hoàn tất `DynamicTeam.run()` và có decision, không sửa checkpoint/workspace benchmark gốc bằng tay.
+- **Bằng chứng:** `dist/benchmarks/scoring-resume-20260926/` chứa report/checkpoint/diagnostics/call log của cả hai replay (`before-prompt-fix`, `after-prompt-fix`), SHA-256 compiled implementation từng lượt, script replay và log kiểm tra cuối.
+- **Regression:** thêm 8 test cho missing/partial/duplicate/invalid card giữa danh sách, completed flags cũ, giữ gate khi retry vẫn lỗi, thử lại ở invocation sau, cancellation, template chưa điền và log lần từ chối cuối. Nhóm dynamic đạt **39/39**. `npm run check` cuối trên working tree hiện tại: compile + lint sạch, **383/383 tests pass** ngoài sandbox; lượt trong sandbox bị EPERM khi listen localhost.
+- **Giới hạn xác nhận:** đã kiểm chứng phục hồi/chấm điểm trên model thật; chưa chạy tiếp toàn bộ build/test/gameplay 20 level. Lỗi nghiên cứu liên quan `search`/`web_search` và các đề xuất sửa sản phẩm cuối run 8 không thuộc bản sửa Resume/scorecard này.
+
+### 2026-09-26 (tiếp) — Triển khai 6 cách giải quyết của mục "Run 8" (boss: "làm các task này")
+
+Tất cả đều là check tất định (không phụ thuộc model), có test; `npm run check` **398/398**, lint sạch.
+
+1. **Delivery contract cho web (`3e20524`)** — `src/utils/browserDelivery.ts`: `<script>` thường nạp file có import/export → yêu cầu `type="module"`; không bundler mà import bare (`'phaser'`) không có import map → lỗi; trang nạp `.ts` không build → lỗi. Chạy trong reviewer (chỉ lỗi liên quan file task đổi) và trong `VerificationPlanner` (blocking issue có tên file cho vòng test-fix). Prompt architect: bắt buộc chọn 1 trong 2 mô hình (no-build module+CDN/importmap, hoặc Vite). Quét toàn bộ `demo/`: bắt đúng run 4, 6, 8; 0 báo nhầm ở các workspace khác (kể cả run 7 webpack).
+2. **Chạy thật sau mỗi task (`c1f44f4`)** — `_taskRuntimeIssues` trong reviewer: cài dependency ngay khi có/đổi `package.json`, chạy build/compile, `npm test` (bỏ qua script placeholder), browser smoke (web, khi task đổi file web). Chỉ quy lỗi cho task khi output nêu file của task, task viết test đang fail, task đổi cấu hình build, hoặc trang vừa hỏng sau thay đổi web của task. Cờ `perTaskVerification` (mặc định bật); micro-sprint check cũ (không chặn) bỏ qua khi bật.
+3. **JS gate (`108d428`)** — `typeScriptGate` mở rộng cho `.js/.mjs/.jsx` (checkJs), không báo "tên chưa khai báo" khi trang nạp script CDN/vendored (`*.min.js`, `node_modules/`). Quét `demo/`: chỉ ra lỗi thật (run 8 import `level6..20.json` không tồn tại; run 6 test import sai đường dẫn), không báo nhầm.
+4. **Test task (`5fef11a`)** — `src/utils/testTaskContracts.ts`: `.ts` trong project JS không tsconfig, import package không khai báo trong package.json (bỏ qua builtin, alias `@/`, import map), script test thiếu/placeholder khi task viết test → issue; khi cần, task được mở quyền sửa `package.json`. Lúc lập kế hoạch, task viết test JS/TS tự có `package.json` + acceptance criterion "test runner thật, test có assertion".
+5. **Fixer ra ngoài allowedFiles (`108d428`)** — `_dropOutOfScopeChanges`: bỏ riêng file ngoài phạm vi, giữ phần hợp lệ, báo lý do cho lần sửa sau (không còn fail task ngay lần 1); log ghi đúng số lần sửa thật.
+6. **Test-fix theo cụm + rollback (`692a7c5`)** — `_testFixFocus`: mỗi lần chỉ đưa cụm file lỗi đầu tiên (≤4 file + package.json/HTML khi chẩn đoán trỏ tới) và chỉ các dòng lỗi của cụm đó. `_verificationErrorScore` theo dõi điểm lỗi; 2 lần liên tiếp tệ hơn → khôi phục file về trạng thái tốt nhất (pre-image từng lần sửa), lần thứ 2 thì dừng; kết thúc thất bại thì để lại trạng thái tốt nhất trên đĩa.
+
+**Chưa kiểm chứng live** — cần chạy benchmark (run 9).
