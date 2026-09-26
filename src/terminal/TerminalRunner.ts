@@ -6,12 +6,15 @@ import { CommandPolicy, type CommandPolicyDecision } from './CommandPolicy';
 import { DangerousCommandError, UserAbortError } from '../utils/errors';
 import { logInfo, logWarn, logError } from '../utils/logging';
 
+const MAX_OUTPUT_CHARS = 1_000_000;
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+const TERMINATION_GRACE_MS = 1_000;
+
 export class TerminalRunner {
   private readonly workspaceRoot: string;
   private readonly terminalLogPath: string;
   private readonly commandPolicy: CommandPolicy;
-  private readonly activeProcesses = new Set<cp.ChildProcess>();
-  private cancellationRequested = false;
+  private readonly activeProcesses = new Map<cp.ChildProcess, () => void>();
 
   constructor(workspaceRoot: string, terminalLogPath: string, commandPolicyConfig?: Partial<CommandPolicyConfig>) {
     this.workspaceRoot = workspaceRoot;
@@ -72,11 +75,7 @@ export class TerminalRunner {
    * break out of long installs, tests, or native build probes quickly.
    */
   cancelActiveCommands(): void {
-    if (this.activeProcesses.size === 0) { return; }
-    this.cancellationRequested = true;
-    for (const proc of this.activeProcesses) {
-      try { proc.kill(); } catch { /* ignore */ }
-    }
+    for (const cancel of this.activeProcesses.values()) { cancel(); }
   }
 
   /**
@@ -132,24 +131,50 @@ export class TerminalRunner {
       const startTime = Date.now();
       logInfo(`Terminal: ${command}`);
 
-      const proc = cp.exec(command, {
+      // A distinct process group lets Stop/timeout reach the shell's children
+      // (npm, test runners, servers), including those that ignore SIGTERM.
+      const proc = cp.spawn(command, {
         cwd: this.workspaceRoot,
-        timeout: timeoutMs,
-        maxBuffer: 10 * 1024 * 1024, // 10 MB
+        shell: true,
+        detached: process.platform !== 'win32',
+        windowsHide: true,
       });
-      this.activeProcesses.add(proc);
 
       let stdout = '';
       let stderr = '';
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
       let settled = false;
+      let closed = false;
+      let exitCode: number | null = null;
+      let processError: string | undefined;
+      let termination: 'cancelled' | 'timeout' | undefined;
+      let cleanupComplete = false;
+      let timeout: NodeJS.Timeout | undefined;
+      let escalation: NodeJS.Timeout | undefined;
+      let cleanupDeadline: NodeJS.Timeout | undefined;
 
-      const finish = (result: TerminalRunResult) => {
+      const finish = (): void => {
         if (settled) { return; }
+        if (termination && !cleanupComplete) { return; }
+        if (!closed && !processError) { return; }
         settled = true;
+        clearTimeout(timeout);
+        clearTimeout(escalation);
+        clearTimeout(cleanupDeadline);
         this.activeProcesses.delete(proc);
-        if (this.activeProcesses.size === 0) {
-          this.cancellationRequested = false;
-        }
+        const output = (value: string, truncated: boolean): string => truncated
+          ? '[Output truncated; showing the final output.]\n' + value : value;
+        const result: TerminalRunResult = {
+          command,
+          exitCode: termination === 'timeout' ? 124 : termination ? -1 : exitCode ?? -1,
+          stdout: output(stdout, stdoutTruncated),
+          stderr: output(stderr, stderrTruncated),
+          durationMs: Date.now() - startTime,
+          success: !termination && !processError && exitCode === 0,
+          error: termination === 'cancelled' ? 'Command cancelled by user.'
+            : termination === 'timeout' ? `Command timed out after ${timeoutMs}ms.` : processError,
+        };
 
         if (!result.success) {
           logWarn(`Command failed (exit ${result.exitCode}): ${command}`);
@@ -163,42 +188,65 @@ export class TerminalRunner {
         resolve(result);
       };
 
-      proc.stdout?.on('data', (chunk: string) => { stdout += chunk; });
-      proc.stderr?.on('data', (chunk: string) => { stderr += chunk; });
+      const signalTree = (signal: NodeJS.Signals): void => {
+        if (!proc.pid) { return; }
+        if (process.platform === 'win32') {
+          // taskkill owns the tree traversal on Windows; /F also handles a
+          // child that will not cooperate with a graceful termination request.
+          const killer = cp.spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true });
+          killer.on('error', () => { try { proc.kill(signal); } catch { /* already exited */ } });
+          killer.unref();
+        } else {
+          try { process.kill(-proc.pid, signal); } catch { /* owned group already exited */ }
+        }
+      };
+      const terminate = (reason: 'cancelled' | 'timeout'): void => {
+        if (settled || termination) { return; }
+        termination = reason;
+        clearTimeout(timeout);
+        signalTree('SIGTERM');
+        // Do not settle on shell close until the escalation has reached its
+        // descendants too: some children close their pipes and ignore TERM.
+        escalation = setTimeout(() => {
+          signalTree('SIGKILL');
+          cleanupComplete = true;
+          finish();
+          if (!settled) {
+            cleanupDeadline = setTimeout(() => {
+              // Bound completion even if a separately detached descendant has
+              // inherited the pipes. Only our owned group is signalled above.
+              proc.stdout?.destroy();
+              proc.stderr?.destroy();
+              closed = true;
+              finish();
+            }, TERMINATION_GRACE_MS);
+          }
+        }, TERMINATION_GRACE_MS);
+      };
+      this.activeProcesses.set(proc, () => terminate('cancelled'));
+      if (timeoutMs > 0) { timeout = setTimeout(() => terminate('timeout'), timeoutMs); }
 
-      proc.on('close', (exitCode: number | null, signal: NodeJS.Signals | null) => {
-        const durationMs = Date.now() - startTime;
-        const code = exitCode ?? -1;
-        const cancelled = this.cancellationRequested && signal !== null;
-        const success = code === 0 && !cancelled;
+      proc.stdout?.setEncoding('utf8');
+      proc.stderr?.setEncoding('utf8');
+      proc.stdout?.on('data', (chunk: string) => {
+        stdoutTruncated ||= stdout.length + chunk.length > MAX_OUTPUT_CHARS;
+        stdout = (stdout + chunk).slice(-MAX_OUTPUT_CHARS);
+      });
+      proc.stderr?.on('data', (chunk: string) => {
+        stderrTruncated ||= stderr.length + chunk.length > MAX_OUTPUT_CHARS;
+        stderr = (stderr + chunk).slice(-MAX_OUTPUT_CHARS);
+      });
 
-        const result: TerminalRunResult = {
-          command,
-          exitCode: code,
-          stdout,
-          stderr,
-          durationMs,
-          success,
-          error: cancelled ? 'Command cancelled by user.' : undefined,
-        };
-
-        finish(result);
+      proc.on('close', (code: number | null) => {
+        closed = true;
+        exitCode = code;
+        finish();
       });
 
       proc.on('error', (err: Error) => {
-        const durationMs = Date.now() - startTime;
-        const result: TerminalRunResult = {
-          command,
-          exitCode: -1,
-          stdout,
-          stderr,
-          durationMs,
-          success: false,
-          error: err.message,
-        };
-
+        processError = err.message;
         logError(`Terminal error: ${err.message}`);
-        finish(result);
+        finish();
       });
     });
   }
@@ -219,7 +267,15 @@ export class TerminalRunner {
 
       const logDir = path.dirname(this.terminalLogPath);
       if (!fs.existsSync(logDir)) { fs.mkdirSync(logDir, { recursive: true }); }
-      fs.appendFileSync(this.terminalLogPath, entry, 'utf8');
+      const bytes = Buffer.from(entry, 'utf8');
+      const currentSize = fs.existsSync(this.terminalLogPath) ? fs.statSync(this.terminalLogPath).size : 0;
+      if (currentSize + bytes.length > MAX_LOG_BYTES) {
+        // Rotate in place rather than growing a second, unbounded history.
+        const marker = Buffer.from('[Earlier terminal log output truncated.]\n');
+        fs.writeFileSync(this.terminalLogPath, Buffer.concat([marker, bytes.subarray(-MAX_LOG_BYTES + marker.length)]));
+      } else {
+        fs.appendFileSync(this.terminalLogPath, bytes);
+      }
     } catch {
       // Non-fatal
     }
