@@ -6,7 +6,7 @@ import type {
   OllamaMessage,
 } from '../types';
 import { DynamicAgent, type DynamicToolRunner } from './DynamicAgent';
-import { logWarn } from '../utils/logging';
+import { logInfo, logWarn } from '../utils/logging';
 import { UserAbortError } from '../utils/errors';
 import { retryWithBackoff, type RetryPolicy } from '../utils/retry';
 
@@ -204,13 +204,33 @@ export class DynamicTeam {
     // ---- Round 4: each agent scores every refined proposal ----
     events.onRound?.(4, 'Scoring & vote');
     const history: DebateHistory = { originals, critiques };
-    const completed4: string[] = valid && resume!.round === 4 ? [...resume!.completedAgentIds] : [];
-    const mainJudgesDone = completed4.filter(id => id !== 'tie-breaker').length;
-    for (let idx = mainJudgesDone; idx < plan.agents.length; idx++) {
-      const spec = plan.agents[idx];
+    // Older checkpoints marked failed judges completed too. Recover by scorecard
+    // evidence, never by the number/order of completed IDs (holes are valid).
+    const completed4: string[] = [];
+    const restoredScores: DynamicAgentScore[] = [];
+    const judgingIds = plan.agents.map(agent => agent.id);
+    if (tieBreakerModel && !plan.agents.some(agent =>
+      this._normalizeModel(agent.model) === this._normalizeModel(tieBreakerModel!))) {
+      judgingIds.push('tie-breaker');
+    }
+    for (const judgeId of judgingIds) {
+      const saved = scores.filter(score => score.judgeId === judgeId);
+      if (saved.length === 0) { continue; }
+      try {
+        restoredScores.push(...this._validateScorecard({ scores: saved }, proposals, judgeId));
+        completed4.push(judgeId);
+      } catch (err) {
+        logWarn(`Discarding invalid checkpoint scorecard for "${judgeId}": ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    scores.splice(0, scores.length, ...restoredScores);
+    if (!completed4.includes('tie-breaker')) { tieBreakerModel = undefined; }
+    if (valid && resume!.round === 4) { events.onCheckpoint?.(snapshot(4, completed4)); }
+    for (const spec of plan.agents) {
+      if (completed4.includes(spec.id)) { continue; }
       const judgeScores = await this._scoreWithModel(spec.model, proposals, goal, spec.id, spec.name, spec.fallbackModel, history);
       scores.push(...judgeScores);
-      completed4.push(spec.id);
+      if (judgeScores.length === proposals.length) { completed4.push(spec.id); }
       events.onCheckpoint?.(snapshot(4, completed4));
     }
     const successfulJudges = new Set(scores.map(score => score.judgeId));
@@ -294,6 +314,14 @@ export class DynamicTeam {
       history ? 0.4 : 0.72,
       '###'
     );
+    // Spell out every row. A one-row "<id>" example repeatedly produced only
+    // five rows for a six-role team on deepseek-coder-v2. Nulls are deliberate:
+    // an unfilled template must fail validation, never count as zero-score votes.
+    const scorecardTemplate = JSON.stringify({ scores: proposals.map(proposal => ({
+      proposalId: proposal.agentId,
+      criteria: { feasibility: null, completeness: null, safety: null, resourceCost: null, testability: null },
+      reason: '',
+    })) });
     const messages: OllamaMessage[] = [
       { role: 'system', content: `You are ${judgeName}, independently judging the team's proposals. Consider the original ideas, cross-critiques and revisions, then score every refined proposal. Score every criterion honestly from 0-10. Respond with ONLY valid JSON.` },
       { role: 'user', content: [
@@ -303,7 +331,7 @@ export class DynamicTeam {
         `\n# Round 3 — Refined proposals\n${proposalsBlock}`,
         '\nWeights: feasibility 25%, completeness 25%, safety 20%, resourceCost 10% (10 means resource-efficient), testability 20%.',
         `Return exactly one score entry for each proposal ID: ${proposals.map(proposal => proposal.agentId).join(', ')}. No duplicates or omissions. All five criteria must be JSON numbers from 0 through 10.`,
-        '\nReturn exactly: {"scores":[{"proposalId":"<id>","criteria":{"feasibility":0,"completeness":0,"safety":0,"resourceCost":0,"testability":0},"reason":"max 20 words"}]}',
+        `\nComplete ALL ${proposals.length} rows in this JSON template. Replace EVERY null with your own numeric assessment and each empty reason with at most 20 words. Keep every proposalId exactly as shown; do not omit rows:\n${scorecardTemplate}`,
       ].filter(Boolean).join('\n') },
     ];
     const judgeOptions = {
@@ -311,23 +339,28 @@ export class DynamicTeam {
       num_predict: Math.max(this.modelOptions.num_predict ?? 768, 1_024),
       temperature: 0.1,
     };
+    let attempt = 0;
+    const totalAttempts = Math.max(0, this.retryPolicy.retries) + 1;
     try {
       return await retryWithBackoff(async () => {
+        attempt += 1;
+        let stage = 'model/JSON';
         try {
           const raw = this.client.chatJson
             ? await this.client.chatJson<unknown>(model, messages, `dynamic-judge:${judgeId}`, judgeOptions)
             : await this.client.callWithFallbackJson<unknown>(model, fallbackModel, messages, `dynamic-judge:${judgeId}`, judgeOptions);
-          return this._validateScorecard(raw, proposals, judgeId);
+          stage = 'schema validation';
+          const validated = this._validateScorecard(raw, proposals, judgeId);
+          logInfo(`Dynamic judge "${judgeId}" (${model}) scorecard accepted (attempt ${attempt}/${totalAttempts}): ${validated.length}/${proposals.length} proposals with all five numeric criteria.`);
+          return validated;
         } catch (err) {
           if (err instanceof UserAbortError) { throw err; }
+          logWarn(`Dynamic judge "${judgeId}" (${model}) scorecard rejected at ${stage} (attempt ${attempt}/${totalAttempts}): ${err instanceof Error ? err.message : String(err)}${attempt < totalAttempts ? ' Retrying the same model...' : ' Retry budget exhausted; judge remains incomplete.'}`);
           // Keep one bounded correction instead of accumulating failed outputs.
           messages[2] = { role: 'user', content: `Your previous scorecard attempt failed: ${String(err instanceof Error ? err.message : err).slice(0, 800)}. Return the complete corrected JSON scorecard using the schema and proposal IDs above. Do not replace missing scores with guessed defaults.` };
           throw err;
         }
-      }, this.retryPolicy, (attempt, totalAttempts, err) => logWarn(
-        `Dynamic judge "${judgeId}" (${model}) scorecard failed (attempt ${attempt}/${totalAttempts}): ` +
-        `${err instanceof Error ? err.message : String(err)}. Retrying the same model...`
-      ));
+      }, this.retryPolicy);
     } catch (err) {
       if (err instanceof UserAbortError) { throw err; }
       logWarn(`Dynamic judge "${judgeId}" failed to provide a complete scorecard: ${err instanceof Error ? err.message : String(err)}`);
