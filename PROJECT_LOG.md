@@ -587,3 +587,22 @@ Tất cả đều là check tất định (không phụ thuộc model), có test
 6. **Test-fix theo cụm + rollback (`692a7c5`)** — `_testFixFocus`: mỗi lần chỉ đưa cụm file lỗi đầu tiên (≤4 file + package.json/HTML khi chẩn đoán trỏ tới) và chỉ các dòng lỗi của cụm đó. `_verificationErrorScore` theo dõi điểm lỗi; 2 lần liên tiếp tệ hơn → khôi phục file về trạng thái tốt nhất (pre-image từng lần sửa), lần thứ 2 thì dừng; kết thúc thất bại thì để lại trạng thái tốt nhất trên đĩa.
 
 **Chưa kiểm chứng live** — cần chạy benchmark (run 9).
+
+### 2026-09-26 (tiếp) — Run 10: fail sau ~70 phút vì bản vá task-001 phần 2 bị chặn toàn bộ → DỪNG theo quy tắc boss; phân tích + cách giải quyết (CHƯA CODE)
+
+Trước run 10 (không dùng model): replay per-task verification trên bản copy run 6/7/8 → **3–9 giây/review**; siết cách quy lỗi (`0f6d1ad`), lỗi trình duyệt kèm vị trí + map URL→file (`9fd417a`), mục thư mục không tính vào giới hạn chia task (`700ef7b`). `npm run check` 401/401.
+
+Run 10 (`dist/local-runs/20260926-194727.log`, workspace `demo/brick-breaker-20-2026-09-26T12-47-40-075Z`), code tới `700ef7b` + thay đổi chưa commit của agent kia (DynamicTeam R4). Debate 4 vòng OK, không có scorecard bị từ chối. Kế hoạch 11 task; task-001 (9 file) chia 2 phần; task test tự có `package.json`.
+
+**Diễn biến:**
+1. Part-1 (`package.json`, README, `styles.css`, `game.js`, `levels.js`): per-task verification cài dependency (~20s) rồi chạy `npm test` → `jest: No tests found` → quy lỗi cho part-1 vì part-1 đổi `package.json`. Test file thuộc part-2 nên đây là **quy lỗi sai**. Fixer vẫn qua được sau 1 lần sửa, part-1 completed.
+2. Part-2 (`src/tests/*`, `src/index.html`, `src/main.js`): code worker (deepseek-coder-v2:16b) trả lại **cả 5 file của part-1** với action `create`. Self-heal **mở rộng allowedFiles** thêm 5 file đó (khớp "intent" vì mô tả part-2 liệt kê "Files from earlier parts already exist: …"). Sau đó `_applyCodeChanges` → `detectConflictingChanges`: "already exists but the agent planned to create it without a baseline" → **chặn TOÀN BỘ patch**, kể cả file hợp lệ của part-2 → task fail ngay (`File changes were not applied.`, không qua vòng fix) → **10 task còn lại bị skip dây chuyền** → testing fail (`npm test`: No tests found). Dừng run theo quy tắc.
+3. Quan sát phụ: `package.json` có `"start": "node server.js"` nhưng không có `server.js`.
+
+**Cách giải quyết (theo thứ tự ưu tiên, chưa triển khai):**
+1. **Patch bị chặn một phần thì không được giết task.** Trong coding phase (`_applyCodeChanges` trả false ở vòng code worker đầu, `AgentOrchestrator.ts` ~dòng 2203): tách các file xung đột baseline ("already exists … without a baseline", "changed after the agent read it") ra khỏi output, áp dụng phần còn lại, ghi assumption. Nếu còn thiếu thì đưa task vào vòng fix với issue rõ ràng ("không tạo lại file X của task trước; chỉ sửa file của bạn"), không fail ngay. Áp dụng tương tự cho fixer (~dòng 2309: hiện `break`).
+2. **Self-heal không được mở rộng sang file của task khác.** `_isSelfHealSafeFileChange`/`_selfHealAllowedFiles`: loại mọi file đã nằm trong `allowedFiles` của task **khác** trong plan (đặc biệt các part trước của task bị chia), hoặc đã được task completed tạo ra. Nguyên nhân khớp nhầm: `_pathMatchesTaskIntent` so tên file với mô tả task, mà mô tả part-2 liệt kê tên file của part-1.
+3. **Prompt/đầu vào cho part sau của task bị chia:** nói rõ "các file này đã tồn tại, KHÔNG trả lại chúng"; cân nhắc chuẩn hoá output: file đã tồn tại mà model ghi `create` với nội dung y hệt → bỏ qua (no-op) thay vì xung đột.
+4. **Per-task `npm test` khi dự án chưa có file test nào:** coi "No tests found" (jest) / "No test files found" (vitest) / "no test specified" là **không chặn** nếu không có file test nào trên đĩa. Việc viết test là của task test sau. Chỉ chặn khi task hiện tại có viết test.
+5. **Giảm thiệt hại dây chuyền:** trước khi skip mọi task phụ thuộc vì 1 task setup fail, thử deterministic recovery / 1 lần sửa với phạm vi hẹp; hoặc cho task độc lập về file chạy tiếp (dependsOn hiện là chuỗi tuyến tính 001→002→…→010 dù nhiều task không cần nhau).
+6. (phụ) Browser delivery / app verification: script `start` trỏ tới file không tồn tại (`node server.js`) nên là issue tất định ngay ở task tạo `package.json`.
