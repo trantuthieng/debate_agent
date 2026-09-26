@@ -410,3 +410,24 @@ test('testing refreshes the package manager after a lockfile repair', async t =>
   assert.deepEqual(order, ['checks:npm', 'yarn install', 'checks:yarn']);
   assert.equal(orchestrator.workspace.readProjectState().sprintStage, 'testing');
 });
+
+test('test repairs that make things worse twice in a row are rolled back to the best state', async t => {
+  const { root, orchestrator, state } = await setup(t, { maxFixRetries: 4, manifest: null });
+  fs.writeFileSync(path.join(root, 'source.js'), 'v0');
+  const errorsFor = { v0: 1, v1: 1, v2: 5, v3: 9, v4: 9 };
+  const logs = [];
+  orchestrator.setCallbacks({ onLog: message => logs.push(message) });
+  orchestrator._runProjectChecks = async () => {
+    const version = fs.readFileSync(path.join(root, 'source.js'), 'utf8');
+    return { failed: true, failedCommands: ['npm test'], output: Array.from({ length: errorsFor[version] }, (_, i) => `error ${i} in source.js`).join('\n') };
+  };
+  orchestrator._analyzeProjectChecks = async () => ({ passed: false, testsRun: 1, errors: ['Source error'], warnings: [], needsFix: true });
+  orchestrator._collectTestFixAllowedFiles = () => ['source.js'];
+  let attempt = 0;
+  orchestrator._executeFixer = async () => fixFile(orchestrator, 'source.js', `v${++attempt}`);
+
+  await assert.rejects(() => orchestrator._phaseTesting(state), /still fail/);
+
+  assert.equal(fs.readFileSync(path.join(root, 'source.js'), 'utf8'), 'v0', 'the best (initial) state is left on disk');
+  assert.ok(logs.some(message => /rolled back to the best state/.test(message)), logs.join('\n'));
+});

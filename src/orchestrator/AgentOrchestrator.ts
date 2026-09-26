@@ -209,6 +209,8 @@ export class AgentOrchestrator {
   // Per-run state for effort control and mid-task context injection
   private _taskPlanComplexity: 'low' | 'medium' | 'high' = 'medium';
   private _lastMicroCheckSummary = '';
+  /** Focused diagnostics for a test-fix attempt, shown to the fixer instead of the whole verification log. */
+  private readonly _testFixFocusText = new Map<string, string>();
 
   // Pending approvals (patch / command / RAM optimization) resolved via user interaction
   private _pendingPatchResolvers = new Map<string, (approved: boolean) => void>();
@@ -2716,6 +2718,37 @@ export class AgentOrchestrator {
       let passedAfterFix = !checks.failed;
       let fixerUnavailable = false;
       let repairFeedback = '';
+      // Benchmark run 7: each full-log, all-files repair made things worse
+      // (161 → 167 errors). Track an error score, keep pre-images of every
+      // applied repair, and roll back to the best state when repairs keep
+      // making it worse.
+      let bestScore = this._verificationErrorScore(checks);
+      let previousScore = bestScore;
+      let bestAttempt = 0;
+      let worseningStreak = 0;
+      let rollbacks = 0;
+      const preImages = new Map<number, Map<string, string | null>>();
+      const rollBackTo = (target: number, fromAttempt: number): void => {
+        for (let i = fromAttempt; i > target; i--) {
+          for (const [file, content] of preImages.get(i) ?? []) { this._restoreWorkspaceFile(file, content); }
+          preImages.delete(i);
+        }
+      };
+      const recheck = async (): Promise<void> => {
+        if (this._dependencyManifestFingerprint() !== installedDependencies) {
+          // A restart during this nested phase must repeat installation before
+          // tests; a fresh in-memory fingerprint alone cannot prove it finished.
+          state.sprintStage = 'dependency_install';
+          this.workspace.writeProjectState(state);
+          await this._phaseDependencyInstall(state);
+          installedDependencies = this._dependencyManifestFingerprint();
+          pm = this.terminal.detectPackageManager();
+          state.sprintStage = 'testing';
+          this._setPhase(state, 'testing', 'Rechecking the project after dependency changes...');
+        }
+        checks = await this._runProjectChecks(pm);
+        this.workspace.writeFile(this.workspace.testResultLogPath, checks.output);
+      };
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         this._checkAborted();
@@ -2748,17 +2781,23 @@ export class AgentOrchestrator {
           continue;
         }
 
+        // Small local models cannot repair a whole log across 12+ files at
+        // once; give each attempt only the first failing file cluster.
+        const focus = this._testFixFocus(checks, allowedFiles);
+        const fakeTaskId = `test-fix-${attempt}`;
+        if (focus) { this._testFixFocusText.set(fakeTaskId, focus.diagnostics); }
         const fakeTask: TaskItem = {
-          id: `test-fix-${attempt}`,
+          id: fakeTaskId,
           title: 'Fix test failures',
           description:
+            (focus ? `Fix ONLY the errors below in this attempt; later attempts handle the rest. Files in scope: ${focus.files.join(', ')}.\n\n` : '') +
             `${testerOutput.fixDescription ?? 'Fix all test and compile errors'}\n\n` +
             'Preserve the original user requirements, package scripts, and real test coverage. ' +
             'Do not replace failing tests with placeholders or unrelated examples. ' +
             'Return full corrected file contents in content; omit patch/diff fields. Resolve relative imports from the importing file directory, not from the workspace root.',
           assignedAgent: 'fixer',
           dependsOn: [],
-          allowedFiles,
+          allowedFiles: focus?.files ?? allowedFiles,
           forbiddenActions: [],
           acceptanceCriteria: [
             'All configured compile/build/test commands pass',
@@ -2799,6 +2838,15 @@ export class AgentOrchestrator {
 
         if (fixResult.files.length > 0) {
           this._selfHealAllowedFiles(fakeTask, fixResult, 'fixer');
+          const outOfScope = this._dropOutOfScopeChanges(fakeTask, fixResult);
+          if (outOfScope.length > 0 && fixResult.files.length === 0) {
+            repairFeedback = `The previous repair only changed files outside this attempt's scope (${outOfScope.join(', ')}). Fix the listed errors inside: ${fakeTask.allowedFiles.join(', ')}.`;
+            this.workspace.appendFile(
+              this.workspace.testerPath,
+              `\n\n---\n\n## Fix Attempt ${attempt} Produced Unsafe File Changes\n\nEvery proposed change was outside the attempt's scope (${outOfScope.join(', ')}); nothing was applied and the workflow will retry.\n`
+            );
+            continue;
+          }
           const validationErrors = this._validateTaskFileChanges(fakeTask, fixResult);
           if (validationErrors.length > 0) {
             repairFeedback = `Previous repair was rejected: ${validationErrors.join('; ')}. Correct the full file contents within the allowed scope.`;
@@ -2816,7 +2864,12 @@ export class AgentOrchestrator {
             continue;
           }
           const patchId = `test-fix-${attempt}-${Date.now()}`;
+          const preImage = new Map(fixResult.files.map(file => {
+            const normalized = this._normalizeRelativePath(file.path);
+            return [normalized, this.fileManager.readWorkspaceFile(normalized)] as [string, string | null];
+          }));
           const applied = await this._applyCodeChanges(patchId, fixResult, state);
+          if (applied) { preImages.set(attempt, preImage); }
           if (!applied) {
             repairFeedback = `Previous repair for ${fixResult.files.map(file => file.path).join(', ')} could not be applied. Return complete file contents in content, with no patch field.`;
             // A real run hit exactly this: the fixer's only proposed change was a
@@ -2835,19 +2888,7 @@ export class AgentOrchestrator {
           }
         }
 
-        if (this._dependencyManifestFingerprint() !== installedDependencies) {
-          // A restart during this nested phase must repeat installation before
-          // tests; a fresh in-memory fingerprint alone cannot prove it finished.
-          state.sprintStage = 'dependency_install';
-          this.workspace.writeProjectState(state);
-          await this._phaseDependencyInstall(state);
-          installedDependencies = this._dependencyManifestFingerprint();
-          pm = this.terminal.detectPackageManager();
-          state.sprintStage = 'testing';
-          this._setPhase(state, 'testing', 'Rechecking the project after dependency changes...');
-        }
-        checks = await this._runProjectChecks(pm);
-        this.workspace.writeFile(this.workspace.testResultLogPath, checks.output);
+        await recheck();
         this.workspace.appendFile(
           this.workspace.testerPath,
           `\n\n---\n\n## Verification After Fix Attempt ${attempt}\n\n${checks.output}\n`
@@ -2860,8 +2901,31 @@ export class AgentOrchestrator {
           break;
         }
 
+        const score = this._verificationErrorScore(checks);
+        this._emit('log', `Test fix attempt ${attempt}: error score ${previousScore} → ${score} (best ${bestScore}).`, 'info');
+        worseningStreak = score > previousScore ? worseningStreak + 1 : 0;
+        previousScore = score;
+        if (score < bestScore) { bestScore = score; bestAttempt = attempt; }
+        let rolledBack = false;
+        if (worseningStreak >= 2) {
+          rollBackTo(bestAttempt, attempt);
+          rollbacks += 1;
+          worseningStreak = 0;
+          rolledBack = true;
+          this._emit('log', `Test repairs made things worse twice in a row; rolled back to the best state (after attempt ${bestAttempt}, score ${bestScore}).`, 'warn');
+          this._journal('warn', 'Test-fix rollback', `Two consecutive repairs raised the error score; restored the state after attempt ${bestAttempt}.`);
+          await recheck();
+          previousScore = this._verificationErrorScore(checks);
+          if (rollbacks >= 2) {
+            this._emit('log', 'Test repairs kept making things worse after a rollback; stopping test-fix attempts at the best state.', 'warn');
+            break;
+          }
+        }
+
         testerOutput = await this._analyzeProjectChecks(checks);
-        repairFeedback = `The previous repair to ${fixResult.files.map(file => file.path).join(', ') || '(no files)'} was insufficient. The checks still fail: ${checks.failedCommands.join(', ')}. Do not repeat the same change; use the current file contents and exact resolved-path diagnostics below.`;
+        repairFeedback = rolledBack
+          ? `The last two repairs made the project worse and were rolled back. Take a different, smaller approach: fix only the first error below.`
+          : `The previous repair to ${fixResult.files.map(file => file.path).join(', ') || '(no files)'} was insufficient. The checks still fail: ${checks.failedCommands.join(', ')}. Do not repeat the same change; use the current file contents and exact resolved-path diagnostics below.`;
         this.workspace.appendFile(
           this.workspace.testerPath,
           `\n\n## Tester Analysis After Fix Attempt ${attempt}\n\n${prettyJson(testerOutput)}\n`
@@ -2872,6 +2936,12 @@ export class AgentOrchestrator {
         }
       }
 
+      if (!passedAfterFix && this._verificationErrorScore(checks) > bestScore) {
+        // Leave the best state on disk, not the last (worse) repair.
+        rollBackTo(bestAttempt, maxRetries);
+        await recheck();
+        this._emit('log', `Restored the best test-fix state (after attempt ${bestAttempt}).`, 'warn');
+      }
       if (!passedAfterFix) {
         const fixerNote = fixerUnavailable ? ' The fixer model produced no usable output.' : '';
         throw new WorkflowError(
@@ -3856,6 +3926,89 @@ export class AgentOrchestrator {
     return [...files].sort();
   }
 
+  /**
+   * Lower is better: failed commands dominate, then the number of error-looking
+   * lines. Used to tell whether a test-fix attempt improved the project.
+   */
+  private _verificationErrorScore(checks: ProjectCheckResults): number {
+    const errorLines = checks.output.split(/\r?\n/)
+      .filter(line => /\berror\b|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|Exception|Cannot find/i.test(line)).length;
+    return checks.failedCommands.length * 1000 + Math.min(errorLines, 999);
+  }
+
+  private _restoreWorkspaceFile(file: string, content: string | null): void {
+    if (!this._isSafeWorkspaceRelativePath(file)) { return; }
+    if (content === null) {
+      try { fs.rmSync(path.join(this.workspace.rootDir, file), { force: true }); } catch { /* already gone */ }
+    } else {
+      this.fileManager.writeWorkspaceFile(file, content);
+    }
+  }
+
+  /**
+   * The first failing file cluster of a verification run: the first project
+   * file the diagnostics mention, the next one, and the first file's relative
+   * imports (≤ 4 files), plus package.json / the HTML entry only when the
+   * diagnostics point there. Returns null when no project file is named.
+   */
+  private _testFixFocus(checks: ProjectCheckResults, candidates: string[]): { files: string[]; diagnostics: string } | null {
+    const root = this.workspace.rootDir.replace(/\\/g, '/');
+    // Strip absolute prefixes, including those of a copy of this workspace.
+    const folder = path.posix.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const output = checks.output.split(`${root}/`).join('').replace(new RegExp(`/[^\\s'"()]*/${folder}/`, 'g'), '');
+    const lines = output.split(/\r?\n/);
+    const errorLine = /\berror\b|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|Exception|Cannot find|Blocking issues|^- /i;
+    const ordered: string[] = [];
+    for (const line of lines) {
+      if (!errorLine.test(line)) { continue; }
+      for (const file of this._extractWorkspaceFileMentions(line)) {
+        if (!ordered.includes(file) && this.fileManager.fileExists(file) && file !== 'package.json'
+          && !/(^|\/)node_modules\//.test(file) && !file.startsWith('.agent-workspace/')) {
+          ordered.push(file);
+        }
+      }
+    }
+    if (ordered.length === 0) { return null; }
+
+    const files = ordered.slice(0, 2);
+    const first = ordered[0];
+    const importPattern = /(?:from\s*|import\s*\(?\s*|require\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g;
+    for (const match of (this.fileManager.readWorkspaceFile(first) ?? '').matchAll(importPattern)) {
+      if (files.length >= 4) { break; }
+      const base = path.posix.normalize(path.posix.join(path.posix.dirname(first), match[1]));
+      const resolved = [base, `${base}.js`, `${base}.ts`, `${base}.tsx`, `${base}/index.js`, `${base}/index.ts`]
+        .find(candidate => this.fileManager.fileExists(candidate));
+      if (resolved && !files.includes(resolved)) { files.push(resolved); }
+    }
+    if (this.fileManager.fileExists('package.json')
+      && /package\.json|Cannot find module '[^.\/]|npm ERR|Missing script|command not found|not found:/i.test(output)) {
+      files.push('package.json');
+    }
+    if (checks.failedCommands.includes('app smoke verification')) {
+      for (const entry of ['index.html', 'public/index.html', 'src/index.html']) {
+        if (this.fileManager.fileExists(entry) && !files.includes(entry)) { files.push(entry); }
+      }
+    }
+    const inScope = files.filter(file => candidates.includes(file) || this.fileManager.fileExists(file));
+
+    const picked: string[] = [];
+    const startsError = /^\s*(\[\w+\]\s*)?(ERROR|✖|✗|FAIL)\b/i;
+    lines.forEach((line, index) => {
+      if (!inScope.some(file => line.includes(file)) || !errorLine.test(line)) { return; }
+      picked.push(line);
+      for (const next of lines.slice(index + 1, index + 4)) {
+        if (startsError.test(next) && !inScope.some(file => next.includes(file))) { break; }
+        picked.push(next);
+      }
+    });
+    const diagnostics = [
+      `Failed checks: ${checks.failedCommands.join(', ')}`,
+      '',
+      ...[...new Set(picked)].slice(0, 80),
+    ].join('\n');
+    return { files: inScope, diagnostics };
+  }
+
   private _extractWorkspaceFileMentions(text: string): string[] {
     const files = new Set<string>();
     const pattern = /(?:^|[\s('"`])((?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|plist|storyboard|swift|ts|tsx|txt|xcconfig|xib|xml|yml|yaml))/g;
@@ -4831,7 +4984,7 @@ export class AgentOrchestrator {
     const skillContext = this.workspace.readFile(this.workspace.skillContextPath) ?? '';
     const planContext = this.workspace.readFile(this.workspace.planControllerPath) ?? '';
     const toolManifest = this.toolRegistry.manifestForPrompt();
-    const latestTestOutput = this.workspace.readFile(this.workspace.testResultLogPath) ?? '';
+    const latestTestOutput = this._testFixFocusText.get(task.id) ?? this.workspace.readFile(this.workspace.testResultLogPath) ?? '';
     const diagnosticBundle = this._latestVerificationDiagnosticBundle(errorContext);
     const structuredMemory = this._structuredMemoryContext();
 

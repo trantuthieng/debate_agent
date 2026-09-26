@@ -2715,3 +2715,26 @@ test('a task that writes JS tests may edit package.json and must leave a runnabl
   const plain = orchestrator._normalizeTaskItem({ ...task, allowedFiles: ['src/game.js'], acceptanceCriteria: ['ok'] }, 0, new Date().toISOString());
   assert.deepEqual(plain.allowedFiles, ['src/game.js']);
 });
+
+test('test-fix focus picks the first failing file cluster and only its diagnostics', async () => {
+  const root = makeTempWorkspace();
+  fs.mkdirSync(path.join(root, 'src/scenes'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/main.ts'), "import MenuScene from './scenes/MenuScene';\n");
+  fs.writeFileSync(path.join(root, 'src/scenes/MenuScene.ts'), 'export default class MenuScene {}\n');
+  fs.writeFileSync(path.join(root, 'src/other.ts'), '');
+  fs.writeFileSync(path.join(root, 'src/unrelated.ts'), '');
+  const orchestrator = await makeOrchestrator(root);
+  const output = [
+    '## Compile / Build', 'Command: npm run build', 'Exit: 1',
+    `ERROR in /somewhere/copy/${path.basename(root)}/src/main.ts(8,10)`, '  TS2304: Cannot find name GameScene.',
+    'ERROR in ./src/other.ts', '  TS1005: ; expected.',
+    'ERROR in ./src/unrelated.ts', '  TS1005: ; expected.',
+  ].join('\n');
+
+  const focus = orchestrator._testFixFocus({ failed: true, failedCommands: ['npm run build'], output }, []);
+
+  assert.deepEqual(focus.files, ['src/main.ts', 'src/other.ts', 'src/scenes/MenuScene.ts']);
+  assert.match(focus.diagnostics, /Cannot find name GameScene/);
+  assert.doesNotMatch(focus.diagnostics, /unrelated/);
+  assert.equal(orchestrator._verificationErrorScore({ failedCommands: ['npm run build'], output }), 1006, 'one failed command + six error lines');
+});
