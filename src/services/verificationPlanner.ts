@@ -57,6 +57,11 @@ export class VerificationPlanner {
           }
         }
         if (!scripts.test) { blockingIssues.push('Node artifact has no package.json test script.'); }
+        else if (typeof scripts.test === 'string' && this._isPlaceholderScript(scripts.test)) {
+          // Benchmark run 7: "echo \"Tests will be implemented in a later step\" && exit 0"
+          // made npm test pass while real test files sat unrun.
+          blockingIssues.push(`package.json test script is a placeholder ("${scripts.test}"); it must run the project's real tests.`);
+        }
       }
     }
 
@@ -153,6 +158,12 @@ export class VerificationPlanner {
     return files.filter(file =>
       /(^|\/)(tests?|__tests__)\/|\.(test|spec)\.[cm]?[jt]sx?$|(^|\/)test_.*\.py$|_test\.py$/i.test(file)
     );
+  }
+
+  /** A script made only of echo / exit 0 / true segments runs nothing. */
+  private _isPlaceholderScript(script: string): boolean {
+    const segments = script.split(/&&|\|\||;/).map(part => part.trim()).filter(Boolean);
+    return segments.length > 0 && segments.every(part => /^(echo\b.*|exit\s+0|true|:)$/i.test(part));
   }
 
   private _looksLikePlaceholderTest(file: string, content: string): boolean {

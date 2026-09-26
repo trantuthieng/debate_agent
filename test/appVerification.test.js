@@ -207,3 +207,11 @@ test('terminal session stop terminates the server child as well as its shell', {
   }
   assert.equal(alive, false, 'Owned server child survived session.stop');
 });
+
+test('a placeholder npm test script is a blocking issue, a real one is not', t => {
+  const pkg = test => JSON.stringify({ name: 'g', scripts: { test } });
+  const placeholder = fixture(t, { 'package.json': pkg('echo "Tests will be implemented in a later step" && exit 0') });
+  assert.ok(new VerificationPlanner(placeholder).plan().blockingIssues.some(issue => /test script is a placeholder/.test(issue)));
+  const real = fixture(t, { 'package.json': pkg('echo "running" && jest') });
+  assert.ok(!new VerificationPlanner(real).plan().blockingIssues.some(issue => /placeholder/.test(issue)));
+});
