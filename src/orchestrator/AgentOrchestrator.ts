@@ -3815,6 +3815,17 @@ export class AgentOrchestrator {
       files.add('package.json');
     }
 
+    // The browser smoke check loads the served page, but its failures
+    // ("Cannot use import statement outside a module") never name the HTML
+    // file — so a page the planner never listed (benchmark run 6: index.html
+    // created by the first test fixer) was hidden from every later fixer,
+    // which then spent 4+ attempts editing the wrong files.
+    for (const entry of ['index.html', 'public/index.html', 'src/index.html']) {
+      if (this.fileManager.fileExists(entry)) {
+        files.add(entry);
+      }
+    }
+
     const text = [
       checks.output,
       testerOutput.rawOutput ?? '',

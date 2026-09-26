@@ -2669,3 +2669,14 @@ test('task normalization keeps an existing src/package.json (the user\'s real la
 
   assert.deepEqual(orchestrator._normalizeTaskItem(task, 0, new Date().toISOString()).allowedFiles, ['src/package.json']);
 });
+
+test('test fixers are always shown the served HTML entry page, even when no task listed it', async () => {
+  const root = makeTempWorkspace();
+  fs.writeFileSync(path.join(root, 'index.html'), '<script src="src/main.js"></script>');
+  const orchestrator = await makeOrchestrator(root);
+  const checks = { failed: true, failedCommands: ['Browser smoke http://127.0.0.1:1'], output: 'JavaScript exception: SyntaxError: Cannot use import statement outside a module' };
+
+  const files = orchestrator._collectTestFixAllowedFiles(checks, { errors: [], warnings: [] });
+
+  assert.ok(files.includes('index.html'));
+});
