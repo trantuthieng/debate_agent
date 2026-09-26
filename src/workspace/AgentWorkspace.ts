@@ -3,7 +3,8 @@ import * as path from 'path';
 import type { ModelConfig, ProjectState, StructuredMemoryEvent } from '../types';
 import { prettyJson } from '../utils/json';
 import { logInfo } from '../utils/logging';
-import { withFsRetry, writeFileAtomic } from '../utils/atomicFile';
+import { withFsRetry } from '../utils/atomicFile';
+import { FileManager } from './FileManager';
 
 // -----------------------------------------------------------------------
 // Default model configuration
@@ -160,12 +161,14 @@ function createDefaultProjectState(): ProjectState {
 // AgentWorkspace: manages the .agent-workspace/ folder structure
 // -----------------------------------------------------------------------
 export class AgentWorkspace {
+  private readonly fileManager: FileManager;
   readonly rootDir: string;       // Workspace root (e.g. /home/user/myproject)
   readonly agentDir: string;      // .agent-workspace/
 
   constructor(workspaceRoot: string) {
-    this.rootDir = workspaceRoot;
-    this.agentDir = path.join(workspaceRoot, '.agent-workspace');
+    this.rootDir = path.resolve(workspaceRoot);
+    this.agentDir = path.join(this.rootDir, '.agent-workspace');
+    this.fileManager = new FileManager(workspaceRoot);
   }
 
   // ------------------------------------------------------------------
@@ -255,24 +258,21 @@ export class AgentWorkspace {
     ];
 
     for (const dir of dirs) {
-      if (!fs.existsSync(dir)) {
-        withFsRetry(() => fs.mkdirSync(dir, { recursive: true }));
-        logInfo(`Created directory: ${dir}`);
-      }
+      withFsRetry(() => this.fileManager.ensureDirectory(dir));
     }
 
     // Create default model_config.json only if it doesn't exist
-    if (!fs.existsSync(this.modelConfigPath)) {
-      withFsRetry(() => fs.writeFileSync(this.modelConfigPath, prettyJson(DEFAULT_MODEL_CONFIG), 'utf8'));
+    if (!this.fileExists(this.modelConfigPath)) {
+      this.writeFile(this.modelConfigPath, prettyJson(DEFAULT_MODEL_CONFIG));
       logInfo('Created default model_config.json');
     } else {
-      withFsRetry(() => fs.writeFileSync(this.modelConfigPath, prettyJson(this.readModelConfig()), 'utf8'));
+      this.writeFile(this.modelConfigPath, prettyJson(this.readModelConfig()));
       logInfo('Updated model_config.json with current defaults');
     }
 
     // Create default project_state.json only if it doesn't exist
-    if (!fs.existsSync(this.projectStatePath)) {
-      withFsRetry(() => fs.writeFileSync(this.projectStatePath, prettyJson(createDefaultProjectState()), 'utf8'));
+    if (!this.fileExists(this.projectStatePath)) {
+      this.writeFile(this.projectStatePath, prettyJson(createDefaultProjectState()));
       logInfo('Created default project_state.json');
     }
 
@@ -286,8 +286,8 @@ export class AgentWorkspace {
     ];
 
     for (const [filePath, content] of memoryFiles) {
-      if (!fs.existsSync(filePath)) {
-        withFsRetry(() => fs.writeFileSync(filePath, content, 'utf8'));
+      if (!this.fileExists(filePath)) {
+        this.writeFile(filePath, content);
       }
     }
 
@@ -299,11 +299,11 @@ export class AgentWorkspace {
   // ------------------------------------------------------------------
 
   readProjectState(): ProjectState {
-    if (!fs.existsSync(this.projectStatePath)) {
+    if (!this.fileExists(this.projectStatePath)) {
       return createDefaultProjectState();
     }
     try {
-      const raw = fs.readFileSync(this.projectStatePath, 'utf8');
+      const raw = this.readFile(this.projectStatePath) ?? '';
       return JSON.parse(raw) as ProjectState;
     } catch {
       return createDefaultProjectState();
@@ -312,7 +312,7 @@ export class AgentWorkspace {
 
   writeProjectState(state: ProjectState): void {
     state.updatedAt = new Date().toISOString();
-    writeFileAtomic(this.projectStatePath, prettyJson(state));
+    this.writeFile(this.projectStatePath, prettyJson(state));
   }
 
   // ------------------------------------------------------------------
@@ -321,11 +321,11 @@ export class AgentWorkspace {
 
   readModelConfig(): ModelConfig {
     const defaults = JSON.parse(JSON.stringify(DEFAULT_MODEL_CONFIG)) as ModelConfig;
-    if (!fs.existsSync(this.modelConfigPath)) {
+    if (!this.fileExists(this.modelConfigPath)) {
       return defaults;
     }
     try {
-      const raw = fs.readFileSync(this.modelConfigPath, 'utf8');
+      const raw = this.readFile(this.modelConfigPath) ?? '';
       const parsed = JSON.parse(raw) as Partial<ModelConfig>;
       // Merge with defaults so new fields are always present
       const merged: ModelConfig = {
@@ -378,29 +378,24 @@ export class AgentWorkspace {
   // ------------------------------------------------------------------
 
   readFile(filePath: string): string | null {
-    if (!fs.existsSync(filePath)) { return null; }
-    try { return fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+    return this.fileManager.readWorkspaceFile(filePath);
   }
 
   writeFile(filePath: string, content: string): void {
-    writeFileAtomic(filePath, content);
+    withFsRetry(() => this.fileManager.writeWorkspaceFileAtomic(filePath, content));
   }
 
   appendFile(filePath: string, content: string): void {
-    withFsRetry(() => {
-      const dir = path.dirname(filePath);
-      if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
-      fs.appendFileSync(filePath, content, 'utf8');
-    });
+    withFsRetry(() => this.fileManager.appendWorkspaceFile(filePath, content));
   }
 
   fileExists(filePath: string): boolean {
-    return fs.existsSync(filePath);
+    return this.fileManager.fileExists(filePath);
   }
 
   /** Best-effort delete — a checkpoint superseded by a completed artifact is not worth failing the run over. */
   deleteFile(filePath: string): void {
-    try { fs.unlinkSync(filePath); } catch { /* already gone, or never existed */ }
+    try { this.fileManager.deleteWorkspaceFile(filePath); } catch { /* rejected unsafe path or already gone */ }
   }
 
   /**
@@ -448,7 +443,7 @@ export class AgentWorkspace {
    * when the file does not yet exist).
    */
   initializeJournal(goal: string): void {
-    if (fs.existsSync(this.journalPath)) {
+    if (this.fileExists(this.journalPath)) {
       this.appendJournal('🔄', 'system', 'Workflow resumed / new session', goal ? `Goal: ${goal}` : undefined);
       return;
     }
@@ -509,7 +504,7 @@ export class AgentWorkspace {
    * List all files in a directory (relative paths from workspace root).
    */
   listDir(dirPath: string): string[] {
-    if (!fs.existsSync(dirPath)) { return []; }
+    if (!this.fileExists(dirPath)) { return []; }
     try {
       return fs.readdirSync(dirPath).map(f => path.join(dirPath, f));
     } catch { return []; }

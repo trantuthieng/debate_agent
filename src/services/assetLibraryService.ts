@@ -1,6 +1,6 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import type { AssetLibraryConfig } from '../types';
+import { FileManager } from '../workspace/FileManager';
 
 const OPENVERSE_API = 'https://api.openverse.org/v1/images/';
 const MAX_BYTES_HARD_CAP = 10_000_000;
@@ -75,11 +75,14 @@ export interface AssetFetchResult {
  * both methods return an empty/clear result instead of reaching out.
  */
 export class AssetLibraryService {
+  private readonly fileManager: FileManager;
   constructor(
     private readonly workspaceRoot: string,
     private readonly config: AssetLibraryConfig,
     private readonly request: typeof fetch = fetch
-  ) {}
+  ) {
+    this.fileManager = new FileManager(workspaceRoot);
+  }
 
   get enabled(): boolean {
     return this.config.enabled === true;
@@ -156,6 +159,8 @@ export class AssetLibraryService {
       return { success: false, error: 'Destination path must stay inside the workspace.' };
     }
     try {
+      this.fileManager.fileExists(dest);
+      this.fileManager.fileExists('ASSET_LICENSES.md');
       const response = await this.request(imageUrl);
       if (!response.ok) {
         return { success: false, error: `Image download failed: HTTP ${response.status}` };
@@ -171,8 +176,9 @@ export class AssetLibraryService {
       if (buffer.length > this.maxBytes) {
         return { success: false, error: `Image exceeds the ${this.maxBytes}-byte limit (${buffer.length} bytes).` };
       }
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.writeFileSync(dest, buffer);
+      // Revalidate after network I/O, which gives other processes time to alter paths.
+      this.fileManager.fileExists('ASSET_LICENSES.md');
+      this.fileManager.writeWorkspaceFile(dest, buffer);
       this._recordAttribution(destRelativePath, attribution, imageUrl);
       return { success: true, savedPath: destRelativePath, bytes: buffer.length };
     } catch (err) {
@@ -201,12 +207,12 @@ export class AssetLibraryService {
     if (!relativePath || path.isAbsolute(relativePath)) { return null; }
     const full = path.resolve(this.workspaceRoot, relativePath);
     const relative = path.relative(this.workspaceRoot, full);
-    if (relative.startsWith('..')) { return null; }
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) { return null; }
     return full;
   }
 
   private _recordAttribution(savedPath: string, attribution: AssetAttribution, imageUrl: string): void {
-    const manifestPath = path.join(this.workspaceRoot, 'ASSET_LICENSES.md');
+    const manifestPath = 'ASSET_LICENSES.md';
     const entry = [
       `## ${savedPath}`,
       `- Title: ${attribution.title}`,
@@ -218,14 +224,14 @@ export class AssetLibraryService {
       `- Retrieved: ${new Date().toISOString()}`,
       '',
     ].join('\n');
-    if (!fs.existsSync(manifestPath)) {
-      fs.writeFileSync(
+    if (!this.fileManager.fileExists(manifestPath)) {
+      this.fileManager.writeWorkspaceFile(
         manifestPath,
         '# Asset Licenses\n\nEvery image fetched through the asset-library tool is recorded here for ' +
           'attribution and license compliance. Review before shipping or publishing.\n\n' + entry
       );
     } else {
-      fs.appendFileSync(manifestPath, entry);
+      this.fileManager.appendWorkspaceFile(manifestPath, entry);
     }
   }
 }

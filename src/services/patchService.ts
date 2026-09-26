@@ -1,6 +1,6 @@
-import * as fs from 'fs';
 import * as path from 'path';
 import type { FileChange, PatchResult } from '../types';
+import { FileManager } from '../workspace/FileManager';
 
 interface ParsedPatchFile {
   path: string;
@@ -16,7 +16,11 @@ interface ParsedHunk {
 }
 
 export class PatchService {
-  constructor(private readonly workspaceRoot: string) {}
+  private readonly fileManager: FileManager;
+
+  constructor(private readonly workspaceRoot: string) {
+    this.fileManager = new FileManager(workspaceRoot);
+  }
 
   hasUnifiedPatch(changes: FileChange[]): boolean {
     return changes.some(change => typeof change.patch === 'string' && change.patch.trim().length > 0);
@@ -35,8 +39,8 @@ export class PatchService {
     }
 
     // Compute every resulting file in memory first. Only commit to disk if ALL
-    // patches apply cleanly, so a failure mid-way never leaves a half-patched
-    // working tree.
+    // patches apply cleanly. Filesystem failures while committing can still leave
+    // a partially written batch; this is not a multi-file atomic transaction.
     const errors: string[] = [];
     const pendingWrites = new Map<string, string>();
     for (const change of patchChanges) {
@@ -53,11 +57,11 @@ export class PatchService {
 
     if (errors.length === 0) {
       for (const [fullPath, content] of pendingWrites) {
-        const dir = path.dirname(fullPath);
-        if (!fs.existsSync(dir)) {
-          fs.mkdirSync(dir, { recursive: true });
+        try { this.fileManager.writeWorkspaceFile(fullPath, content); }
+        catch (err) {
+          errors.push(`${fullPath}: ${err instanceof Error ? err.message : String(err)}`);
+          break;
         }
-        fs.writeFileSync(fullPath, content, 'utf8');
       }
     }
 
@@ -138,7 +142,7 @@ export class PatchService {
     // Honour earlier hunks staged for the same file in this batch.
     const existing = pendingWrites.has(fullPath)
       ? pendingWrites.get(fullPath)!
-      : fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf8') : '';
+      : this.fileManager.readWorkspaceFile(fullPath) ?? '';
     let lines = existing.split('\n');
     let offset = 0;
 
@@ -192,9 +196,10 @@ export class PatchService {
   private _resolve(relativePath: string): string {
     const resolved = path.resolve(this.workspaceRoot, this._normalizePath(relativePath));
     const relative = path.relative(this.workspaceRoot, resolved);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error(`Patch path is outside the workspace: ${relativePath}`);
     }
+    this.fileManager.fileExists(resolved); // Validate parents and final symlinks even for a new target.
     return resolved;
   }
 
