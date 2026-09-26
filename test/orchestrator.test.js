@@ -2824,3 +2824,18 @@ test('per-task verification skips bundler module summaries and does not blame a 
   assert.match(own[0], /ERROR in src\/scenes\/GameScene\.ts\(2,1\)\n      TS6133/);
   assert.doesNotMatch(own[0], /\[built\]/);
 });
+
+test('test-fix focus maps a browser error\'s served URL path to the project file', async () => {
+  const root = makeTempWorkspace();
+  fs.mkdirSync(path.join(root, 'src/scripts'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/index.html'), '<script src="scripts/main.js"></script>');
+  fs.writeFileSync(path.join(root, 'src/scripts/main.js'), "import State from './state.js';\n");
+  fs.writeFileSync(path.join(root, 'src/scripts/state.js'), 'export default {};\n');
+  const orchestrator = await makeOrchestrator(root);
+  const output = 'Command: Browser smoke http://127.0.0.1:8080\nExit: 1\nJavaScript exception: SyntaxError: Cannot use import statement outside a module (at /scripts/main.js:1:1)';
+
+  const focus = orchestrator._testFixFocus({ failed: true, failedCommands: ['app smoke verification'], output }, []);
+
+  assert.deepEqual(focus.files, ['src/scripts/main.js', 'src/scripts/state.js', 'src/index.html']);
+  assert.match(focus.diagnostics, /at \/scripts\/main\.js:1:1/);
+});

@@ -4108,13 +4108,24 @@ export class AgentOrchestrator {
     const lines = output.split(/\r?\n/);
     const errorLine = /\berror\b|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|Exception|Cannot find|Blocking issues|^- /i;
     const ordered: string[] = [];
+    // Browser errors name served URLs ("/scripts/main.js") rather than project
+    // paths ("src/scripts/main.js"); map a mention to the one file it ends with.
+    const aliases = new Map<string, string>();
+    let sources: string[] | null = null;
+    const resolveMention = (mention: string): string | null => {
+      if (this.fileManager.fileExists(mention)) { return mention; }
+      sources ??= this.fileManager.listWorkspaceFiles('').filter(file => !/(^|\/)(node_modules|\.agent-workspace)\//.test(file));
+      const matches = sources.filter(file => file.endsWith(`/${mention}`));
+      return matches.length === 1 ? matches[0] : null;
+    };
     for (const line of lines) {
       if (!errorLine.test(line)) { continue; }
-      for (const file of this._extractWorkspaceFileMentions(line)) {
-        if (!ordered.includes(file) && this.fileManager.fileExists(file) && file !== 'package.json'
-          && !/(^|\/)node_modules\//.test(file) && !file.startsWith('.agent-workspace/')) {
-          ordered.push(file);
-        }
+      for (const mention of this._extractWorkspaceFileMentions(line)) {
+        const file = resolveMention(mention);
+        if (!file || ordered.includes(file) || file === 'package.json'
+          || /(^|\/)node_modules\//.test(file) || file.startsWith('.agent-workspace/')) { continue; }
+        ordered.push(file);
+        if (file !== mention) { aliases.set(mention, file); }
       }
     }
     if (ordered.length === 0) { return null; }
@@ -4142,11 +4153,13 @@ export class AgentOrchestrator {
 
     const picked: string[] = [];
     const startsError = /^\s*(\[\w+\]\s*)?(ERROR|✖|✗|FAIL)\b/i;
+    const namesScope = (line: string) => inScope.some(file => line.includes(file))
+      || [...aliases].some(([mention, file]) => inScope.includes(file) && line.includes(mention));
     lines.forEach((line, index) => {
-      if (!inScope.some(file => line.includes(file)) || !errorLine.test(line)) { return; }
+      if (!namesScope(line) || !errorLine.test(line)) { return; }
       picked.push(line);
       for (const next of lines.slice(index + 1, index + 4)) {
-        if (startsError.test(next) && !inScope.some(file => next.includes(file))) { break; }
+        if (startsError.test(next) && !namesScope(next)) { break; }
         picked.push(next);
       }
     });
@@ -4160,7 +4173,8 @@ export class AgentOrchestrator {
 
   private _extractWorkspaceFileMentions(text: string): string[] {
     const files = new Set<string>();
-    const pattern = /(?:^|[\s('"`])((?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|plist|storyboard|swift|ts|tsx|txt|xcconfig|xib|xml|yml|yaml))/g;
+    // A leading "/" (served URL paths such as "/scripts/main.js") is not captured.
+    const pattern = /(?:^|[\s('"`])\/?((?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|plist|storyboard|swift|ts|tsx|txt|xcconfig|xib|xml|yml|yaml))/g;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text)) !== null) {
       const normalized = this._normalizeRelativePath(match[1]);

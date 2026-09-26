@@ -15,7 +15,14 @@ interface ProtocolData {
   canceled?: boolean;
   args?: Array<{ value?: unknown; description?: string }>;
   result?: { value?: string };
-  exceptionDetails?: { exception?: { description?: string }; text?: string };
+  exceptionDetails?: {
+    exception?: { description?: string };
+    text?: string;
+    url?: string;
+    lineNumber?: number;
+    columnNumber?: number;
+    stackTrace?: { callFrames?: Array<{ url?: string; lineNumber?: number; columnNumber?: number }> };
+  };
   response?: { status: number; url: string };
 }
 
@@ -29,6 +36,22 @@ type ProtocolMessage = {
 };
 
 /** A real Chromium page, controlled through a private pipe; no npm install or open debug port. */
+/**
+ * " (at /scripts/main.js:1:1)" for an exception, from its script URL or top
+ * stack frame. Without it a parse error like "Cannot use import statement
+ * outside a module" names no file, and repairs cannot find the cause.
+ */
+function exceptionLocation(details: NonNullable<ProtocolData['exceptionDetails']>): string {
+  const frame = details.stackTrace?.callFrames?.find(candidate => candidate.url);
+  const url = details.url || frame?.url;
+  if (!url) { return ''; }
+  let where = url;
+  try { where = new URL(url).pathname; } catch { /* keep the raw URL */ }
+  const line = (details.url ? details.lineNumber : frame?.lineNumber) ?? 0;
+  const column = (details.url ? details.columnNumber : frame?.columnNumber) ?? 0;
+  return ` (at ${where}:${line + 1}:${column + 1})`;
+}
+
 export class BrowserSmokeService {
   constructor(private readonly workspaceRoot: string) {}
 
@@ -97,7 +120,7 @@ export class BrowserSmokeService {
         if (message.method === 'Page.loadEventFired') { loaded = true; }
         if (message.method === 'Runtime.exceptionThrown') {
           const details = params.exceptionDetails ?? {};
-          errors.add(`JavaScript exception: ${details.exception?.description ?? details.text ?? 'unknown exception'}`);
+          errors.add(`JavaScript exception: ${details.exception?.description ?? details.text ?? 'unknown exception'}${exceptionLocation(details)}`);
         }
         if (message.method === 'Runtime.consoleAPICalled' && params.type === 'error') {
           errors.add(`console.error: ${(params.args ?? []).map((arg: Record<string, unknown>) => arg.value ?? arg.description ?? '').join(' ')}`);
