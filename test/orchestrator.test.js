@@ -2697,3 +2697,21 @@ test('a fixer change outside the task scope is dropped while in-scope changes ar
   assert.deepEqual(output.files.map(file => file.path), ['tests/game.test.js']);
   assert.match(orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '', /outside the task scope/);
 });
+
+test('a task that writes JS tests may edit package.json and must leave a runnable test runner', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const task = {
+    id: 'task-007', title: 'Create automated tests', description: 'd', assignedAgent: 'codeWorker',
+    dependsOn: [], allowedFiles: ['tests/**/*', 'acceptance.json'], forbiddenActions: [],
+    acceptanceCriteria: ['tests cover levels'], status: 'pending', createdAt: '',
+  };
+
+  const normalized = orchestrator._normalizeTaskItem(task, 0, new Date().toISOString());
+
+  assert.ok(normalized.allowedFiles.includes('package.json'));
+  assert.ok(normalized.acceptanceCriteria.some(c => /real test runner/.test(c)));
+
+  const plain = orchestrator._normalizeTaskItem({ ...task, allowedFiles: ['src/game.js'], acceptanceCriteria: ['ok'] }, 0, new Date().toISOString());
+  assert.deepEqual(plain.allowedFiles, ['src/game.js']);
+});

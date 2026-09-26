@@ -69,6 +69,7 @@ import type { SecretVault } from '../connectors/SecretVault';
 import { ConnectorManager } from '../connectors/ConnectorManager';
 import { findTypeScriptTaskIssues } from '../utils/typeScriptGate';
 import { findBrowserDeliveryIssues } from '../utils/browserDelivery';
+import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports } from '../utils/testTaskContracts';
 import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
 interface ImprovementConsensus {
@@ -4529,6 +4530,27 @@ export class AgentOrchestrator {
       ];
     }
 
+    // Tests that can never run (benchmark run 8): a .ts test in a JS project,
+    // an undeclared 'chai' import, and a placeholder npm test script.
+    const changedPaths = workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path));
+    const contractIssuesForTests = [
+      ...findLanguageMismatch(this.workspace.rootDir, changedPaths, this.fileManager.listWorkspaceFiles('')),
+      ...findUndeclaredPackageImports(this.workspace.rootDir, changedPaths),
+      ...findTestScriptIssues(this.workspace.rootDir, changedPaths),
+    ];
+    if (contractIssuesForTests.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...contractIssuesForTests];
+      // Declaring a dependency or a test runner is only possible in package.json.
+      if (contractIssuesForTests.some(issue => /^\[(deps|tests)\]/.test(issue))
+        && this.fileManager.fileExists('package.json')
+        && !this._matchesAllowedPath('package.json', task.allowedFiles)) {
+        task.allowedFiles.push('package.json');
+        this.workspace.appendAssumption('reviewer', `Task ${task.id} may now edit package.json to declare the dependencies/test runner its files need.`);
+      }
+    }
+
     // Same reasoning, for the stub-comment and invalid-JSON heuristics: these
     // used to run only when a model call failed. They are cheap and essentially
     // false-positive-free, so they now always contribute alongside the LLM
@@ -7380,6 +7402,13 @@ export class AgentOrchestrator {
       taskId,
       Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria.map(String) : []
     );
+    // A task that writes JS/TS tests must be able to make them runnable
+    // (benchmark run 8: tests were written but package.json ran `echo`).
+    const writesJsTests = allowedFiles.some(file => TEST_FILE.test(file) && (/\.(m?[jt]sx?|cjs)$/.test(file) || /\*|\/$/.test(file)));
+    if (writesJsTests && !this._briefIsPythonOnly()) {
+      if (!allowedFiles.includes('package.json')) { allowedFiles.push('package.json'); }
+      acceptanceCriteria.push('package.json declares a real test runner (e.g. vitest or jest) in devDependencies and its "test" script runs these test files; tests are written in the project\'s language and every test makes at least one real assertion.');
+    }
     const forbiddenActions = Array.isArray(task.forbiddenActions)
       ? task.forbiddenActions.map(String)
       : [];
@@ -8836,6 +8865,13 @@ export class AgentOrchestrator {
       return state.currentTaskId ? 'coding' : 'testing';
     }
     return state.currentPhase;
+  }
+
+  private _briefIsPythonOnly(): boolean {
+    const raw = this.workspace.readFile(this.workspace.projectBriefPath);
+    if (!raw) { return false; }
+    const text = raw.toLowerCase();
+    return /\bpython\b/.test(text) && !/\b(javascript|typescript|node(\.js)?|npm|browser|html)\b/.test(text);
   }
 
   /** Remove changes outside the task's allowedFiles from a fixer's output; returns their paths. */
