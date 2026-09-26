@@ -7811,11 +7811,16 @@ export class AgentOrchestrator {
   private _splitOversizedTasks(tasks: TaskItem[]): TaskItem[] {
     const MAX_FILES_PER_TASK = 6;
     const isAggregator = (file: string) => /(^|\/)(index|main|app)\.[^/]+$/i.test(file);
+    // Directory/glob entries ("src/scenes/", "tests/**/*") are scopes, not
+    // files to author: they do not count toward the limit and every part keeps them.
+    const isScope = (file: string) => file.endsWith('/') || file.includes('*');
     return tasks.flatMap(task => {
-      if (task.allowedFiles.length <= MAX_FILES_PER_TASK) { return [task]; }
+      const scopes = task.allowedFiles.filter(isScope);
+      const realFiles = task.allowedFiles.filter(file => !isScope(file));
+      if (realFiles.length <= MAX_FILES_PER_TASK) { return [task]; }
       const ordered = [
-        ...task.allowedFiles.filter(file => !isAggregator(file)),
-        ...task.allowedFiles.filter(isAggregator),
+        ...realFiles.filter(file => !isAggregator(file)),
+        ...realFiles.filter(isAggregator),
       ];
       // Balanced parts (7 files → 4+3, not 6+1).
       const chunkSize = Math.ceil(ordered.length / Math.ceil(ordered.length / MAX_FILES_PER_TASK));
@@ -7827,9 +7832,9 @@ export class AgentOrchestrator {
       const partId = (k: number) => (k === total ? task.id : `${task.id}-part-${k}`);
       this.workspace.appendAssumption(
         'taskManager',
-        `Task ${task.id} listed ${task.allowedFiles.length} files, more than one model call can author reliably; split it into ${total} sequential parts of at most ${MAX_FILES_PER_TASK} files.`
+        `Task ${task.id} listed ${realFiles.length} files, more than one model call can author reliably; split it into ${total} sequential parts of at most ${MAX_FILES_PER_TASK} files.`
       );
-      this._emit('log', `Task "${task.id}" split into ${total} parts (${task.allowedFiles.length} files).`, 'info');
+      this._emit('log', `Task "${task.id}" split into ${total} parts (${realFiles.length} files).`, 'info');
       return chunks.map((files, index): TaskItem => {
         const k = index + 1;
         const isLast = k === total;
@@ -7844,7 +7849,7 @@ export class AgentOrchestrator {
           title: `${task.title} (part ${k}/${total})`,
           description: `${task.description}\n\n${scope}`,
           dependsOn: k === 1 ? task.dependsOn : [partId(k - 1)],
-          allowedFiles: files,
+          allowedFiles: [...files, ...scopes],
           acceptanceCriteria: isLast
             ? task.acceptanceCriteria
             : [

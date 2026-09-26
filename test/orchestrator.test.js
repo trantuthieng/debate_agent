@@ -2839,3 +2839,16 @@ test('test-fix focus maps a browser error\'s served URL path to the project file
   assert.deepEqual(focus.files, ['src/scripts/main.js', 'src/scripts/state.js', 'src/index.html']);
   assert.match(focus.diagnostics, /at \/scripts\/main\.js:1:1/);
 });
+
+test('directory and glob scopes do not count toward the task size limit and stay in every part', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const base = { title: 'Setup', description: 'd', dependsOn: [], forbiddenActions: [], acceptanceCriteria: ['runs'] };
+  const small = { ...base, id: 'task-001', allowedFiles: ['package.json', 'tsconfig.json', 'webpack.config.js', '.gitignore', 'src/style.css', 'src/scenes/', 'src/levels/', 'tests/**/*'] };
+  assert.deepEqual(orchestrator._splitOversizedTasks([small]), [small], '5 files + 3 scopes is not oversized');
+
+  const big = { ...base, id: 'task-002', allowedFiles: ['a.js', 'b.js', 'c.js', 'd.js', 'e.js', 'f.js', 'g.js', 'src/levels/'] };
+  const split = orchestrator._splitOversizedTasks([big]);
+  assert.deepEqual(split.map(t => t.allowedFiles.filter(f => !f.endsWith('/')).length), [4, 3]);
+  assert.ok(split.every(t => t.allowedFiles.includes('src/levels/')));
+});
