@@ -632,3 +632,13 @@ Fixture mới `testingRepairRegression.test.js` tái hiện: check ban đầu pa
 ### 2026-09-27 00:48 UTC - M-Core integration verification
 
 Full check 496/496 PASS with compile/lint; real Extension Host clean profile smoke PASS (9 registered commands, Open Panel/Stop). D01/D02 6154f05 adds atomic owner tokens, live-PID protection, loopback alias normalization, fail-closed corrupt ownership, recoverable exact retired tokens/guard markers under EACCES. Process contention and filesystem fault tests pass. VSIX compiler/runtime commit 6e6a20a: actual 2,624,531-byte archive passed isolated TS2304/DOM/ES2020/ws tests without user-project dependencies; removing bundled compiler reports unavailable. C06 recheck and ownership lifecycle integration tests included in full check but orchestrator/S1 awaits Claude commit. Run11 is still live; no matrix pass or M-Core completion claimed.
+
+
+### 2026-09-27 00:50 UTC - C06 newly created dependency lockfile regression
+
+New parameterized testingRepairRegression fixture fails when a repair changes package.json and its installer creates a previously absent package-lock.json. Snapshot only included dependency files already existing before repair, leaving the bad new lockfile for baseline reinstall. Repro log: /private/tmp/debate-c06-new-lock-repro.log. Fix: snapshot all known dependency filenames with null pre-images for absent files; existing concurrent-write protection remains.
+
+
+### 2026-09-27 00:57 UTC - M-Core revision checkpoint
+
+Full check 513/513 PASS, compile/lint clean. S1 integrated commit 36539e9 (Claude original work, Codex review fixes C06 stale success/new lockfile rollback and failed ownership lifecycle); S3 8481c8e (Claude harness and resume staging, Codex logger/locked brief integration); S4 runner/CLI harness 2b05c1c. Current packaged VSIX installed successfully in clean temporary VSCode profile and runtime check passed (2,624,701 bytes). M-Core is not achieved: matrix, natural/trusted input, local-notes acceptance, CLI atomic-fault/clean-copy, real kill/restart and Start/Resume UI evidence remain. Run11 still uses its existing internal copy; no manual product changes or extra model run.
