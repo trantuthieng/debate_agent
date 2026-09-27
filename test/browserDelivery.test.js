@@ -125,3 +125,20 @@ test('audit C05: without a bundler a relative import must name the file exactly,
   assert.equal(messages.length, 1, messages.join('\n'));
   assert.match(messages[0], /src\/main\.js imports '\.\/ball'.*the file is src\/ball\.js/);
 });
+
+test('run 12: a Vite project whose page sits outside the Vite root is reported with both ways to fix it', t => {
+  const { findMissingScriptTargets } = require('../out/utils/browserDelivery');
+  const files = {
+    'package.json': JSON.stringify({ scripts: { dev: 'vite', build: 'vite build' } }),
+    'vite.config.js': "import { defineConfig } from 'vite';\nexport default defineConfig({ build: { outDir: 'dist' } });\n",
+    'public/index.html': '<script type="module" src="/src/main.js"></script>',
+  };
+  const messages = findMissingScriptTargets(project(t, files), ['vite.config.js']).map(i => i.message);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /page is public\/index\.html, so the dev server answers 404.*set root: 'public' in vite\.config\.js/);
+  const rooted = { ...files, 'vite.config.js': "export default { root: 'public' };\n" };
+  assert.deepEqual(findMissingScriptTargets(project(t, rooted)), [], 'root pointing at the page is fine');
+  const moved = { 'package.json': files['package.json'], 'index.html': files['public/index.html'] };
+  assert.deepEqual(findMissingScriptTargets(project(t, moved)), []);
+  assert.deepEqual(findMissingScriptTargets(project(t, files), ['src/main.js']), [], 'only tasks that touch the setup are blamed');
+});

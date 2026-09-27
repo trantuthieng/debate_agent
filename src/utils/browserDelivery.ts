@@ -199,6 +199,24 @@ export function findMissingScriptTargets(root: string, changedFiles?: string[]):
         message: `package.json script "${name}" runs ${target}, which does not exist, so \`npm run ${name}\` can never work. Create ${target} or point the script at the real entry file.` });
     }
   }
+  // Run 12: the plan put index.html in public/; Vite serves the page from its
+  // root (the project folder unless vite.config sets root), so / was a 404 and
+  // three repairs never found why.
+  if (Object.values(scripts).some(command => typeof command === 'string' && /(^|[\s;&|/])vite(\s|$|[;&|])/.test(command))) {
+    const configFile = ['vite.config.js', 'vite.config.mjs', 'vite.config.ts', 'vite.config.mts'].find(file => fs.existsSync(path.join(root, file)));
+    const configuredRoot = configFile ? /\broot\s*:\s*['"]([^'"]+)['"]/.exec(read(root, configFile) ?? '')?.[1] : undefined;
+    const viteRoot = path.posix.normalize((configuredRoot ?? '.').replace(/^\.\//, '').replace(/\/+$/, '') || '.');
+    const expected = viteRoot === '.' ? 'index.html' : `${viteRoot}/index.html`;
+    if (!fs.existsSync(path.join(root, expected))) {
+      const found = ['public/index.html', 'src/index.html', 'index.html', 'app/index.html'].find(file => file !== expected && fs.existsSync(path.join(root, file)));
+      if (found) {
+        issues.push({ files: ['package.json', found, ...(configFile ? [configFile] : [])],
+          message: `Vite serves the page from ${expected} (its root is ${viteRoot === '.' ? 'the project folder' : `"${viteRoot}"`}), but the page is ${found}, so the dev server answers 404. ` +
+            (found.startsWith('public/') ? 'public/ is only for static assets copied as-is. ' : '') +
+            `Put index.html at ${expected}, or set root: '${path.posix.dirname(found)}' in ${configFile ?? 'vite.config.js'}.` });
+      }
+    }
+  }
   if (!changedFiles) { return issues; }
   const changed = new Set(changedFiles);
   return issues.filter(issue => issue.files.some(file => changed.has(file)));
