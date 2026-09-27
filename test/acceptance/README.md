@@ -22,6 +22,21 @@ replacement, and T08 needs installation/testing from a clean product copy.
 Perform those checks against the actual product and retain the evidence; do not
 change the report to `passed` merely because the subprocess checks passed.
 
+For a Node CLI that replaces data through `fs.rename`, run the supplementary
+fault probe against the same product command:
+
+```sh
+node test/acceptance/tasksCliAtomicAcceptance.js /absolute/generated-workspace /absolute/atomic-report.json -- node /absolute/generated-workspace/bin/tasks.js
+```
+
+This preloads a test-only interceptor into the subprocess, seeds a disposable
+store, throws before replacement of that exact store, and verifies nonzero exit,
+error text, unchanged original bytes, and reopening from another process.
+It supports synchronous, callback and Promise rename APIs. Direct synchronous
+overwrite/removal fails; an unsupported storage primitive stays unverified.
+A passing fault probe is one part of T06, not clean installation or full product
+acceptance. No application source is modified by the probe.
+
 ## Generating the two additional products
 
 `test/mcore_goal_e2e.js` accepts `--goal-id local-notes|tasks-cli`, a required
