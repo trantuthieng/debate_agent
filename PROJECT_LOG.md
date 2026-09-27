@@ -617,3 +617,18 @@ Run 10 (`dist/local-runs/20260926-194727.log`, workspace `demo/brick-breaker-20-
 6. **`findMissingScriptTargets`**: script package.json chạy file không tồn tại (`node server.js`) → issue trong review (task đổi package.json/file đích) và blocking issue trong VerificationPlanner. Quét `demo/`: 2 phát hiện, đều là lỗi thật (run 3 `src/main.js`, run 10 `server.js`).
 
 Test mới gồm 1 test tích hợp `_phaseCoding` tái hiện đúng run 10 (part 2 tạo lại file của part 1 → task vẫn xong, sprint tiếp tục, file part 1 không bị đổi, allowedFiles không bị nới) và 1 test "chạy lại tiền đề 1 lần". `npm run check` **407/407**, lint sạch. **Chưa chạy run 11** theo yêu cầu boss.
+
+
+### 2026-09-26 19:39 UTC — Tích hợp M-Core: kiểm tra 466/467, lỗi fixture prompt
+
+`npm run check` compile/lint sạch; 466/467 pass. Test `capabilityInputs` đọc prompt bằng regex chỉ chấp nhận một chuỗi literal; prompt benchmark S3 nay nối hai chuỗi nên nhận undefined. Đây là lỗi fixture, chưa có bằng chứng lỗi đánh giá capability. Cách sửa: khóa prompt vào JSON brief v1, benchmark và regression cùng đọc nguồn đó; giữ nguyên toàn bộ assertion capability. Log: /private/tmp/debate-mcore-integration-check.log. R4 baseline ngoài sandbox đã pass 410/410; commit 79bed08 chỉ gồm DynamicTeam và regression R4.
+
+
+### 2026-09-27 00:45 UTC — C06 regression sau kiểm tra chéo
+
+Fixture mới `testingRepairRegression.test.js` tái hiện: check ban đầu pass, tester yêu cầu sửa, fixer tạo lỗi ReferenceError, check sau fail nhưng _phaseTesting vẫn resolve vì passedAfterFix giữ true ban đầu. Chuỗi [true,false], file lỗi còn nguyên. Cách sửa: mỗi recheck phải tính lại passedAfterFix từ kết quả hiện tại và inventory, để rollback/check lại baseline trước khi hoàn tất. Không gọi model trong repro.
+
+
+### 2026-09-27 00:48 UTC - M-Core integration verification
+
+Full check 496/496 PASS with compile/lint; real Extension Host clean profile smoke PASS (9 registered commands, Open Panel/Stop). D01/D02 6154f05 adds atomic owner tokens, live-PID protection, loopback alias normalization, fail-closed corrupt ownership, recoverable exact retired tokens/guard markers under EACCES. Process contention and filesystem fault tests pass. VSIX compiler/runtime commit 6e6a20a: actual 2,624,531-byte archive passed isolated TS2304/DOM/ES2020/ws tests without user-project dependencies; removing bundled compiler reports unavailable. C06 recheck and ownership lifecycle integration tests included in full check but orchestrator/S1 awaits Claude commit. Run11 is still live; no matrix pass or M-Core completion claimed.
