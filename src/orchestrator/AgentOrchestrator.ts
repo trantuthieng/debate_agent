@@ -4202,7 +4202,20 @@ export class AgentOrchestrator {
         const broken = own.length > 0 ? [] : importerBreakage(outputOf(build));
         if (own.length > 0) { issues.push(`[runtime] \`${command}\` fails in this task's files:\n${own.join('\n')}`); }
         else if (broken.length > 0) { issues.push(`[runtime] \`${command}\` fails in files that import what this task changed or deleted:\n${broken.join('\n')}`); }
-        else if (buildSetupChanged && otherFileErrors.length === 0) { issues.push(`[runtime] \`${command}\` fails after this task changed the build setup:\n${this._errorEvidence(outputOf(build), 30)}`); }
+        else if (buildSetupChanged && otherFileErrors.length === 0) {
+          // Run 13: part 1 of a split setup task wrote webpack.config.js whose
+          // entry src/scripts/index.js is part 2's file. The build cannot pass
+          // until that part runs and the fixer may not create it, so a build
+          // that only misses files a pending task will write is unverified.
+          const waitingOn = this._missingPlannedFiles(task, outputOf(build));
+          if (waitingOn.length > 0) {
+            const note = `\`${command}\` fails only because ${waitingOn.map(item => `${item.file} (written by ${item.taskId})`).join(', ')} does not exist yet; the build for ${task.id} is unverified until then.`;
+            scope.unverified.push(note);
+            summary.push('(build waits for files a later task writes — not blocking)');
+          } else {
+            issues.push(`[runtime] \`${command}\` fails after this task changed the build setup:\n${this._errorEvidence(outputOf(build), 30)}`);
+          }
+        }
       }
     }
 
@@ -4266,6 +4279,27 @@ export class AgentOrchestrator {
 
     this._recordTaskRuntimeSummary(task, summary);
     return issues;
+  }
+
+  /**
+   * Files a build error reports as missing that a pending task of the plan
+   * will write. Empty when any missing-module line names something no pending
+   * task owns, so a genuinely wrong path is still the task's defect.
+   */
+  private _missingPlannedFiles(task: TaskItem, output: string): Array<{ file: string; taskId: string }> {
+    const MISSING = /can't resolve|cannot find module|could not resolve|module not found|failed to resolve|ENOENT|no such file/i;
+    const lines = this._stripWorkspaceRoot(output).split(/\r?\n/).filter(line => MISSING.test(line));
+    if (lines.length === 0) { return []; }
+    const pending = (this._loadTaskPlan()?.tasks ?? [])
+      .filter(other => other.id !== task.id && other.status !== 'completed')
+      .flatMap(other => other.allowedFiles
+        .filter(file => !file.endsWith('/') && !file.includes('*') && !this.fileManager.fileExists(file))
+        .map(file => ({ file: file.replace(/^\.\//, ''), taskId: other.id })));
+    const named = (line: string) => pending.filter(item => line.includes(item.file));
+    const unexplained = lines.filter(line => named(line).length === 0 && /['"`][^'"`]+['"`]/.test(line));
+    if (unexplained.length > 0) { return []; }
+    const found = lines.flatMap(named);
+    return found.filter((item, index) => found.findIndex(other => other.file === item.file) === index);
   }
 
   /** The dependency installs the orchestrator itself issues, never model-written text. */

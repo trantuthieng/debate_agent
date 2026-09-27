@@ -341,6 +341,25 @@ test('F9: final checks load the goal acceptance walk-through from outside the wo
   }
 });
 
+test('run 13: a split setup part is not blamed for a build entry that a later part writes', async () => {
+  const missing = "ERROR in main\nModule not found: Error: Can't resolve './src/scripts/index.js' in '/w'";
+  const { orchestrator, task } = await runtimeHarness({ scripts: { build: 'webpack' }, results: { 'npm run build': [false, missing] } });
+  const plan = { tasks: [
+    { ...task, id: 'task-001-part-1', allowedFiles: ['package.json', 'webpack.config.js'], status: 'in_progress' },
+    { ...task, id: 'task-001', allowedFiles: ['src/index.html', 'src/scripts/index.js'], status: 'pending' },
+  ] };
+  fs.mkdirSync(path.dirname(orchestrator.workspace.taskPlanPath), { recursive: true });
+  fs.writeFileSync(orchestrator.workspace.taskPlanPath, JSON.stringify(plan));
+  const part = { ...task, id: 'task-001-part-1', allowedFiles: ['package.json', 'webpack.config.js'] };
+
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(part, ['webpack.config.js']), []);
+  assert.match(orchestrator._taskReviewScopes.get(part.id).unverified[0], /src\/scripts\/index\.js \(written by task-001\)/);
+
+  orchestrator.terminal.runSafeCommand = async command => ({ command, success: false, exitCode: 1, stdout: "Module not found: Error: Can't resolve './src/main.js'", stderr: '', durationMs: 1 });
+  const wrong = await orchestrator._taskRuntimeIssues(part, ['webpack.config.js']);
+  assert.match(wrong[0], /changed the build setup/, 'an entry no task will write is still the task\'s defect');
+});
+
 test('audit C04: a task whose new tests are never discovered is blocked even though the runner exits 0', async () => {
   const { orchestrator, task } = await runtimeHarness({
     scripts: { test: 'vitest run' },
