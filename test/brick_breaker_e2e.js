@@ -10,6 +10,11 @@ const { initLogger } = require('../out/utils/logging');
 // So a repo-root .env (e.g. TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID) works for a
 // plain `npm run test:e2e:brick-breaker` without exporting vars by hand.
 loadEnvFile(path.join(__dirname, '..', '.env'));
+// F9: the pipeline's own final checks run the gameplay walk-through, so a
+// game that cannot be started fails verification and gets repaired, instead
+// of being caught only after delivery (run 11). The oracle lives outside the
+// product workspace, where no task can edit it.
+process.env.DEBATE_ACCEPTANCE_SCRIPT ??= path.join(__dirname, 'acceptance', 'brickBreakerAcceptance.js');
 
 const prompt = require('../benchmarks/goals/brick-breaker.v1.json').goal;
 const repository = path.resolve(__dirname, '..');

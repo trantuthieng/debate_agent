@@ -71,6 +71,7 @@ import { checkTypeScriptTask } from '../utils/typeScriptGate';
 import { findBrowserDeliveryIssues, findMissingScriptTargets } from '../utils/browserDelivery';
 import { TaskReviewScopes, findImporters, IMPORT_BREAKAGE } from '../utils/taskReviewScope';
 import { countExecutedTests } from '../utils/testRunEvidence';
+import type { BrowserInteraction } from '../services/browserSmokeService';
 import { findUnwiredModules, findCommentOnlyImplementations, findProjectCommentOnlyImplementations } from '../utils/implementationGaps';
 import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports, isPlaceholderScript } from '../utils/testTaskContracts';
 import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
@@ -3313,7 +3314,7 @@ export class AgentOrchestrator {
       this.terminal,
       this.terminalSessions,
       this.modelConfig.appVerification
-    ).verify();
+    ).verify(this._acceptanceInteraction());
     this.workspace.writeFile(this.workspace.appVerificationPath, prettyJson(appVerification));
     if (appVerification.failed) {
       failedCommands.push('app smoke verification');
@@ -4332,6 +4333,36 @@ export class AgentOrchestrator {
     this._testFixFocusText.clear();
     this._taskInstalledFingerprint = '';
     this._typeScriptGateWarned.clear();
+  }
+
+  /**
+   * The goal's acceptance walk-through, when the caller supplies one (F9).
+   * Run 11: 25/25 unit tests and every check passed on a game that could not
+   * be started; only the benchmark's browser walk-through caught it, after
+   * the pipeline had finished. DEBATE_ACCEPTANCE_SCRIPT names a module
+   * outside the workspace (so tasks cannot edit the oracle) exporting a
+   * factory that returns a BrowserInteraction; its failed checks then fail
+   * the final verification and drive the test-fix loop like any other error.
+   */
+  private _acceptanceInteraction(): BrowserInteraction | undefined {
+    const script = process.env.DEBATE_ACCEPTANCE_SCRIPT;
+    if (!script) { return undefined; }
+    const resolved = path.resolve(script);
+    const root = path.resolve(this.workspace.rootDir);
+    if (resolved === root || resolved.startsWith(root + path.sep)) {
+      this._journal('warn', 'Acceptance script ignored', `${resolved} lies inside the workspace, where tasks could edit it.`);
+      return undefined;
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const loaded = require(resolved) as Record<string, unknown>;
+      const factory = [loaded.interaction, loaded.default, ...Object.values(loaded)].find(value => typeof value === 'function') as (() => BrowserInteraction) | undefined;
+      if (!factory) { throw new Error('the module exports no interaction factory'); }
+      return factory();
+    } catch (err) {
+      this._journal('warn', 'Acceptance script could not be loaded', `${resolved}: ${formatError(err)}`);
+      return undefined;
+    }
   }
 
   /** Unwired modules and comment-only implementations across the project (run 11). */

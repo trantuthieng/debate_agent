@@ -318,6 +318,29 @@ test('run 11 (F6): the reviewer excerpt says where it stops and gives the real J
   assert.equal(A.reviewExcerpt('a.js', 'x'), '```\nx\n```');
 });
 
+test('F9: final checks load the goal acceptance walk-through from outside the workspace only', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'acceptance-oracle-'));
+  const script = path.join(outside, 'oracle.js');
+  fs.writeFileSync(script, 'module.exports = { interaction: () => async () => [{ label: "starts", passed: true }] };\n');
+  const inside = path.join(root, 'oracle.js');
+  fs.copyFileSync(script, inside);
+  const previous = process.env.DEBATE_ACCEPTANCE_SCRIPT;
+  try {
+    delete process.env.DEBATE_ACCEPTANCE_SCRIPT;
+    assert.equal(orchestrator._acceptanceInteraction(), undefined, 'no script: plain smoke');
+    process.env.DEBATE_ACCEPTANCE_SCRIPT = script;
+    const interaction = orchestrator._acceptanceInteraction();
+    assert.equal(typeof interaction, 'function');
+    assert.deepEqual(await interaction({}), [{ label: 'starts', passed: true }]);
+    process.env.DEBATE_ACCEPTANCE_SCRIPT = inside;
+    assert.equal(orchestrator._acceptanceInteraction(), undefined, 'a script tasks could edit is ignored');
+  } finally {
+    if (previous === undefined) { delete process.env.DEBATE_ACCEPTANCE_SCRIPT; } else { process.env.DEBATE_ACCEPTANCE_SCRIPT = previous; }
+  }
+});
+
 test('audit C04: a task whose new tests are never discovered is blocked even though the runner exits 0', async () => {
   const { orchestrator, task } = await runtimeHarness({
     scripts: { test: 'vitest run' },
