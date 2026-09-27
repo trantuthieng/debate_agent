@@ -1,99 +1,86 @@
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { writeFileAtomic } from '../utils/atomicFile';
+import { isLockPidAlive, withFileLockMutation, retireLockToken, forgetRetiredLockToken, isRetiredLockToken } from '../utils/fileLockMutation';
 
 interface RunLockPayload {
   pid: number;
   startedAt: string;
   heartbeatAt: string;
+  token?: string;
 }
 
-/**
- * Tracks whether a live process currently owns this workspace's workflow.
- *
- * A hard process kill (OOM-kill, SIGBUS, an extension-host crash) leaves
- * `project_state.json` stuck at `status: 'running'` forever — nothing gets a
- * chance to mark it `'failed'`. `resume()` used to refuse to touch a
- * `'running'` status at all, which is exactly backwards for the crash this
- * lock exists to detect: it lets `resume()` tell "orphaned by a crash" (no
- * live owner, or a stale heartbeat) apart from "a second window is
- * legitimately running this same project right now" (a live, freshly
- * heartbeating pid), so only the former is safe to reclaim automatically.
- */
+/** A live PID owns its run until release or death; heartbeat age is diagnostic. */
 export class RunLock {
-  constructor(
-    private readonly lockPath: string,
-    private readonly staleMs = 90_000
-  ) {}
+  private token: string | undefined;
+  private released = false;
+
+  constructor(private readonly lockPath: string, _staleMs = 90_000) {}
 
   acquire(): void {
-    this._write();
+    const result = withFileLockMutation(this.lockPath, () => {
+      const existing = this._read();
+      if (existing && isLockPidAlive(existing.pid) && !isRetiredLockToken(this.lockPath, existing)) {
+        throw new Error(`Workflow lock is already held by pid ${existing.pid}.`);
+      }
+      const now = new Date().toISOString();
+      const token = crypto.randomBytes(16).toString('hex');
+      writeFileAtomic(this.lockPath, JSON.stringify({ pid: process.pid, startedAt: now, heartbeatAt: now, token }));
+      if (existing?.token) { forgetRetiredLockToken(this.lockPath, existing.token); }
+      this.token = token;
+      this.released = false;
+    });
+    if (!result.acquired) { throw new Error('Workflow lock ownership is being changed by another process.'); }
   }
 
-  /**
-   * Runs from a timer, so a throw here is an uncaught exception that kills
-   * the whole run (benchmark run 5: a sync client briefly revoked access to
-   * the workspace folder → EACCES). A missed heartbeat only makes the lock
-   * look stale sooner; the next tick rewrites it.
-   */
+  /** A transient timer write failure must not crash the extension host. */
   heartbeat(): void {
+    if (!this.token || this.released) { return; }
     try {
-      this._write();
-    } catch { /* transient fs failure — retried on the next tick */ }
+      withFileLockMutation(this.lockPath, () => {
+        const existing = this._read();
+        if (existing?.token !== this.token) { return; }
+        writeFileAtomic(this.lockPath, JSON.stringify({ ...existing, heartbeatAt: new Date().toISOString() }));
+      });
+    } catch { /* live PID still prevents takeover; retry on the next tick */ }
   }
 
-  /** Only removes the lock if it still belongs to this process. */
   release(): void {
-    const payload = this._read();
-    if (payload && payload.pid === process.pid) {
-      try { fs.unlinkSync(this.lockPath); } catch { /* already gone — nothing to clean up */ }
-    }
+    if (!this.token) { return; }
+    this.released = true;
+    const token = this.token;
+    retireLockToken(this.lockPath, token);
+    try {
+      withFileLockMutation(this.lockPath, () => {
+        if (this._read()?.token === token) { fs.unlinkSync(this.lockPath); }
+        forgetRetiredLockToken(this.lockPath, token);
+      }, 1_000);
+    } catch { /* failed cleanup must not remove another owner's lock */ }
   }
 
-  /**
-   * True when there is no live process behind this lock: missing, corrupt,
-   * an owning pid that is no longer running, or a heartbeat older than
-   * `staleMs`. False only for a lock with a live pid and a fresh heartbeat.
-   */
   isStale(): boolean {
-    const payload = this._read();
-    if (!payload) { return true; }
-    if (!this._isPidAlive(payload.pid)) { return true; }
-    const heartbeatAt = Date.parse(payload.heartbeatAt);
-    if (!Number.isFinite(heartbeatAt)) { return true; }
-    return Date.now() - heartbeatAt > this.staleMs;
-  }
-
-  private _write(): void {
-    const now = new Date().toISOString();
-    const existing = this._read();
-    const payload: RunLockPayload = {
-      pid: process.pid,
-      startedAt: existing?.pid === process.pid ? existing.startedAt : now,
-      heartbeatAt: now,
-    };
-    writeFileAtomic(this.lockPath, JSON.stringify(payload));
+    try {
+      const result = withFileLockMutation(this.lockPath, () => {
+        const payload = this._read();
+        return !payload || !isLockPidAlive(payload.pid) || isRetiredLockToken(this.lockPath, payload);
+      });
+      return result.acquired && result.value;
+    } catch { return false; } // Unknown filesystem state is not proof of death.
   }
 
   private _read(): RunLockPayload | null {
+    let raw: string;
+    try { raw = fs.readFileSync(this.lockPath, 'utf8'); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') { return null; }
+      throw err;
+    }
     try {
-      const raw = fs.readFileSync(this.lockPath, 'utf8');
       const parsed = JSON.parse(raw) as Partial<RunLockPayload>;
-      if (typeof parsed.pid !== 'number' || typeof parsed.heartbeatAt !== 'string') { return null; }
+      if (!parsed || !Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0) {
+        throw new Error('Invalid run lock owner.');
+      }
       return parsed as RunLockPayload;
-    } catch {
-      return null;
-    }
-  }
-
-  private _isPidAlive(pid: number): boolean {
-    try {
-      // Signal 0 sends nothing; it only checks whether the pid exists and is
-      // ours to signal. Throws ESRCH (dead) or EPERM (alive, owned by another
-      // user — still "alive" for our purposes).
-      process.kill(pid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException)?.code === 'EPERM';
-    }
+    } catch { throw new Error(`Cannot establish ownership of corrupt workflow lock: ${this.lockPath}`); }
   }
 }

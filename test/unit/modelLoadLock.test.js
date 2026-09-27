@@ -60,17 +60,15 @@ test('a lock left by a dead pid is reclaimed immediately, not waited out', async
   release();
 });
 
-test('a lock older than staleMs is reclaimed even if the owning pid happens to still be alive', async () => {
+test('a live PID is never reclaimed by age; timeout throws without ownership', async () => {
   const lockDir = tmpLockDir();
-  fs.mkdirSync(lockDir, { recursive: true });
   const hash = require('node:crypto').createHash('sha1').update('http://local.test').digest('hex');
-  fs.writeFileSync(path.join(lockDir, `${hash}.lock`), JSON.stringify({ pid: process.pid, model: 'ancient', acquiredAt: Date.now() - 1_000_000 }));
-
-  const lock = new ModelLoadLock('http://local.test', { lockDir, pollMs: 10, staleMs: 10 });
-  const start = Date.now();
-  const release = await lock.acquire('m1');
-  assert.ok(Date.now() - start < 2_000, 'an aged-out lock must be reclaimed even with a live pid');
-  release();
+  const lockFile = path.join(lockDir, `${hash}.lock`);
+  const payload = JSON.stringify({ pid: process.pid, model: 'ancient', acquiredAt: 1 });
+  fs.writeFileSync(lockFile, payload);
+  const lock = new ModelLoadLock('http://local.test', { lockDir, pollMs: 5, staleMs: 1, timeoutMs: 30 });
+  await assert.rejects(lock.acquire('m1'), /timed out/);
+  assert.equal(fs.readFileSync(lockFile, 'utf8'), payload);
 });
 
 test('shouldAbort stops the wait and throws UserAbortError instead of hanging', async () => {
@@ -88,32 +86,85 @@ test('shouldAbort stops the wait and throws UserAbortError instead of hanging', 
   releaseA();
 });
 
-test('release() only removes the lock if it is still the one this call acquired', async () => {
+test('a stale release never removes a newer token in the same PID', async () => {
   const lockDir = tmpLockDir();
   const hash = require('node:crypto').createHash('sha1').update('http://local.test').digest('hex');
   const lockFile = path.join(lockDir, `${hash}.lock`);
-
-  const lock = new ModelLoadLock('http://local.test', { lockDir, pollMs: 10 });
+  const lock = new ModelLoadLock('http://local.test', { lockDir, pollMs: 5 });
   const release = await lock.acquire('m1');
-  // Age the lock (from a future acquirer's point of view) so `other` reclaims
-  // it as abandoned, simulating a takeover race before the original release() runs.
-  const current = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
-  fs.writeFileSync(lockFile, JSON.stringify({ ...current, acquiredAt: Date.now() - 1_000_000 }));
-
-  const other = new ModelLoadLock('http://local.test', { lockDir, pollMs: 10, staleMs: 10 });
-  const releaseOther = await other.acquire('m2'); // reclaims the "aged" lock
-  release(); // stale call from the original acquirer — must be a no-op now
-  assert.ok(fs.existsSync(lockFile), 'the newer holder\'s lock must survive the stale release() call');
+  release();
+  const releaseOther = await lock.acquire('m2');
+  const newer = fs.readFileSync(lockFile, 'utf8');
+  release();
+  assert.equal(fs.readFileSync(lockFile, 'utf8'), newer);
   releaseOther();
 });
 
-test('proceeds without the lock (rather than hanging forever) once timeoutMs is exceeded', async () => {
+test('filesystem failures never grant an unlocked model operation', async () => {
+  const dir = tmpLockDir();
+  const badDir = path.join(dir, 'not-a-directory');
+  fs.writeFileSync(badDir, 'file');
+  await assert.rejects(new ModelLoadLock('http://local.test', { lockDir: badDir }).acquire('m1'), /EEXIST|ENOTDIR/);
+});
+
+test('partial lock JSON fails closed and remains untouched', async () => {
   const lockDir = tmpLockDir();
-  const lockA = new ModelLoadLock('http://local.test', { lockDir, pollMs: 10, staleMs: 10 * 60_000 });
-  const lockB = new ModelLoadLock('http://local.test', { lockDir, pollMs: 10, timeoutMs: 50 });
-  const releaseA = await lockA.acquire('m1');
-  const release = await lockB.acquire('m2'); // should give up waiting after ~50ms and proceed
-  assert.equal(typeof release, 'function');
+  const hash = require('node:crypto').createHash('sha1').update('http://local.test').digest('hex');
+  const lockFile = path.join(lockDir, `${hash}.lock`);
+  fs.writeFileSync(lockFile, '{"pid":');
+  await assert.rejects(new ModelLoadLock('http://local.test', { lockDir }).acquire('m1'), /corrupt/);
+  assert.equal(fs.readFileSync(lockFile, 'utf8'), '{"pid":');
+});
+
+test('loopback aliases, default ports and trailing slashes share ownership', async () => {
+  const lockDir = tmpLockDir();
+  const first = new ModelLoadLock('http://localhost:11434/', { lockDir });
+  const release = await first.acquire('m1');
+  try {
+    for (const url of ['http://127.0.0.1:11434', 'http://[::1]:11434/', 'http://LOCALHOST.:11434///']) {
+      await assert.rejects(new ModelLoadLock(url, { lockDir, timeoutMs: 10, pollMs: 2 }).acquire('m2'), /timed out/);
+    }
+    const anotherPort = await new ModelLoadLock('http://localhost:11435', { lockDir }).acquire('m3');
+    anotherPort();
+  } finally { release(); }
+  const defaultPort = await new ModelLoadLock('http://localhost:80/', { lockDir }).acquire('m4');
+  await assert.rejects(new ModelLoadLock('http://127.0.0.1', { lockDir, timeoutMs: 10, pollMs: 2 }).acquire('m5'), /timed out/);
+  defaultPort();
+});
+
+test('model lock retries failed release through the exact retired token', async () => {
+  const lockDir = tmpLockDir();
+  const lock = new ModelLoadLock('http://local.test', { lockDir, timeoutMs: 30, pollMs: 2 });
+  const release = await lock.acquire('m1');
+  const lockFile = path.join(lockDir, fs.readdirSync(lockDir).find(file => file.endsWith('.lock')));
+  const unlink = fs.unlinkSync;
+  fs.unlinkSync = function (file, ...args) {
+    if (file === lockFile) { throw Object.assign(new Error('injected release EACCES'), { code: 'EACCES' }); }
+    return unlink.call(this, file, ...args);
+  };
+  try { release(); } finally { fs.unlinkSync = unlink; }
+  const other = new ModelLoadLock('http://local.test', { lockDir, timeoutMs: 30, pollMs: 2 });
+  const releaseOther = await other.acquire('m2');
+  const newer = fs.readFileSync(lockFile, 'utf8');
   release();
-  releaseA();
+  assert.equal(fs.readFileSync(lockFile, 'utf8'), newer);
+  releaseOther();
+});
+
+test('model acquisition survives deferred guard cleanup while retaining exclusive ownership', async () => {
+  const lockDir = tmpLockDir();
+  const lock = new ModelLoadLock('http://local.test', { lockDir, timeoutMs: 10, pollMs: 2 });
+  const unlink = fs.unlinkSync;
+  fs.unlinkSync = function (file, ...args) {
+    if (String(file).startsWith(lockDir) && String(file).includes('.guard/')) {
+      throw Object.assign(new Error('injected guard EACCES'), { code: 'EACCES' });
+    }
+    return unlink.call(this, file, ...args);
+  };
+  let release;
+  try { release = await lock.acquire('m1'); } finally { fs.unlinkSync = unlink; }
+  await assert.rejects(lock.acquire('m2'), /timed out/);
+  release();
+  const releaseNext = await lock.acquire('m3');
+  releaseNext();
 });
