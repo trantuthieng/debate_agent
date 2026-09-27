@@ -699,3 +699,11 @@ Run 12 (`dist/local-runs/20260927-103700.log`), revision `5be701b` + WIP driver 
 **Đã sửa (`82a522d`):** kiểm tra tất định trong `findMissingScriptTargets`: dự án chạy Vite mà trang không nằm ở root Vite → issue nêu rõ trang ở đâu, root là gì, và hai cách sửa (chuyển trang, hoặc đặt `root` trong vite.config). Áp dụng ở review theo task và verification plan.
 
 **Còn mở:** plan tuyến tính (mọi task phụ thuộc task setup) khiến 1 task hỏng giết cả sprint; fixer không được tạo file mới ngoài scope kể cả khi issue tất định chỉ đích danh file đó. Theo dõi ở run 13 trước khi đổi.
+
+### 2026-09-27 — Run 13 (lần 2, đang chạy): phần 1 của task setup bị chặn vì entry build thuộc phần 2 — nguyên nhân + sửa
+
+Run 13 lần 2 (`~/.debate-agent-runs/20260927-151138`, revision `ae5b88a` + WIP Codex). Debate 4 vòng sạch; plan dùng Webpack + Jest. sprint-01-task-001 có 7 file nên `_splitOversizedTasks` tách 2 phần: phần 1 = `package.json`, `webpack.config.js`, `jest.config.js`, `src/styles.css`; phần 2 = `README.md`, `src/index.html`, `src/scripts/index.js`.
+
+- **Nguyên nhân:** phần 1 viết `webpack.config.js` với `entry: './src/scripts/index.js'` (đúng theo kế hoạch). Kiểm tra runtime sau task chạy `npm run build` → "Can't resolve './src/scripts/index.js'"; vì task đổi build setup và không file nguồn nào khác có lỗi, gate đổ lỗi cho phần 1. Fixer chỉ được sửa 4 file của phần 1, không tạo được entry → vòng fix vô nghiệm (hoặc làm hỏng config cho qua).
+- **Đã sửa (`7666000`):** `_missingPlannedFiles` — nếu mọi dòng "module not found" của build chỉ nhắc tới file mà một task **chưa hoàn thành** trong plan sẽ viết (và file chưa tồn tại), build ghi là *unverified* (uncertainty trong review), không chặn. Đường dẫn không thuộc task nào vẫn chặn như cũ. Test hồi quy trong `test/orchestrator.test.js`; full check 530/530.
+- Run hiện tại chạy code cũ nên không hưởng bản sửa; theo dõi xem fixer có vượt qua không.
