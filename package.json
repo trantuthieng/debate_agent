@@ -106,15 +106,17 @@
     "check:release": "npm run check && npm run test:vscode",
     "prepackage:vsix": "npm run check:release",
     "package:vsix": "vsce package --allow-missing-repository --out dist/local-multi-agent-coder-1.0.1.vsix",
-    "postpackage:vsix": "npm run test:vsix",
+    "postpackage:vsix": "npm run test:vsix:runtime && npm run test:vsix",
     "test:vsix": "node test/vscode/installVsix.js",
     "lint": "eslint src",
     "server": "npm run compile && node out/server/index.js",
     "docker:build": "docker compose build",
     "docker:up": "docker compose up -d",
-    "docker:logs": "docker compose logs -f"
+    "docker:logs": "docker compose logs -f",
+    "test:vsix:runtime": "node test/vscode/checkVsixRuntime.js"
   },
   "dependencies": {
+    "typescript": "^5.3.3",
     "ws": "^8.21.3"
   },
   "devDependencies": {
@@ -125,7 +127,6 @@
     "@typescript-eslint/parser": "^8.59.4",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
-    "eslint": "^10.4.0",
-    "typescript": "^5.3.3"
+    "eslint": "^10.4.0"
   }
 }
