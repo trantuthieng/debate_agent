@@ -6,6 +6,7 @@ import type { AppVerificationConfig, AppVerificationResult, TerminalRunResult } 
 import { TerminalRunner } from '../terminal/TerminalRunner';
 import { TerminalSessionRunner } from '../terminal/TerminalSessionRunner';
 import { BrowserSmokeService } from './browserSmokeService';
+import type { BrowserInteraction } from './browserSmokeService';
 
 interface HttpCheck extends TerminalRunResult { contentType?: string }
 
@@ -17,7 +18,7 @@ export class AppVerificationService {
     private readonly config?: Partial<AppVerificationConfig>
   ) {}
 
-  async verify(): Promise<AppVerificationResult> {
+  async verify(interaction?: BrowserInteraction): Promise<AppVerificationResult> {
     const cfg = { enabled: true, startServer: true, httpSmokeTest: true, browserSmokeTest: true, ...this.config };
     const checks: TerminalRunResult[] = [];
     const warnings: string[] = [];
@@ -63,7 +64,7 @@ export class AppVerificationService {
       if (document.success) {
         checks.push(...await this._checkResources(url, document.stdout));
         if (cfg.browserSmokeTest) {
-          checks.push(await new BrowserSmokeService(this.workspaceRoot).verify(url));
+          checks.push(await new BrowserSmokeService(this.workspaceRoot).verify(url, interaction));
         } else {
           warnings.push('Browser smoke is disabled: HTTP evidence does not prove JavaScript executes successfully.');
         }

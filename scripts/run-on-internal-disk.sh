@@ -12,6 +12,10 @@
 #         (default command: node test/brick_breaker_e2e.js)
 # Env:    DEBATE_LOCAL_RUN_ROOT  where the temporary copy goes (default ~/.debate-agent-runs)
 #         COPYBACK_WAIT_MINUTES  how long to wait for the Data folder to reappear (default 240)
+#         STAGE_WORKSPACE        resume: a workspace under the repo (e.g. demo/brick-breaker-20-…)
+#                                to copy to the internal disk too; BRICK_E2E_WORKSPACE is then
+#                                pointed at that internal copy, so the resumed run never writes
+#                                to the Data volume. It is copied back with demo/ afterwards.
 #
 # Outputs copied back: demo/ and dist/ (generated projects' node_modules are
 # skipped — reinstall with npm install). The run log ends up in
@@ -37,6 +41,23 @@ say "Command: $*"
 rsync -a \
   --exclude node_modules --exclude out --exclude demo --exclude dist --exclude .git \
   "$SRC/" "$DEST/" || { say "Copy to internal disk failed."; exit 1; }
+
+# Evidence: which source the run used, including uncommitted changes.
+if git -C "$SRC" rev-parse HEAD >/dev/null 2>&1; then
+  say "Source revision: $(git -C "$SRC" rev-parse HEAD)"
+  say "Uncommitted diff sha256: $(git -C "$SRC" diff HEAD | shasum -a 256 | cut -d' ' -f1) ($(git -C "$SRC" status --porcelain | wc -l | tr -d ' ') changed paths)"
+  git -C "$SRC" status --porcelain >>"$LOG" 2>&1
+fi
+
+if [ -n "${STAGE_WORKSPACE:-}" ]; then
+  rel="${STAGE_WORKSPACE#"$SRC"/}"
+  case "$rel" in /*|..*) say "STAGE_WORKSPACE must be inside the repo: $STAGE_WORKSPACE"; exit 1;; esac
+  [ -d "$SRC/$rel" ] || { say "STAGE_WORKSPACE not found: $SRC/$rel"; exit 1; }
+  mkdir -p "$DEST/$rel"
+  rsync -a --exclude node_modules "$SRC/$rel/" "$DEST/$rel/" || { say "Staging $rel failed."; exit 1; }
+  export BRICK_E2E_WORKSPACE="$DEST/$rel"
+  say "Staged workspace for resume: $rel -> $BRICK_E2E_WORKSPACE (node_modules reinstalled by the run)"
+fi
 
 cd "$DEST" || exit 1
 if ! npm ci --no-audit --no-fund >>"$LOG" 2>&1; then say "npm ci failed."; exit 1; fi

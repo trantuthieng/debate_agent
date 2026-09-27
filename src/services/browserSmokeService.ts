@@ -52,10 +52,46 @@ function exceptionLocation(details: NonNullable<ProtocolData['exceptionDetails']
   return ` (at ${where}:${line + 1}:${column + 1})`;
 }
 
+/** What an interaction script can do with the loaded page. */
+export interface PageDriver {
+  /** Evaluates an expression in the page (promises are awaited) and returns its JSON-serialisable value. */
+  evaluate<T = unknown>(expression: string): Promise<T>;
+  /** Presses a key (e.g. 'ArrowLeft', ' ', 'Enter', 'p'), holding it for holdMs. */
+  press(key: string, holdMs?: number): Promise<void>;
+  /** Clicks at page coordinates. */
+  click(x: number, y: number): Promise<void>;
+  wait(ms: number): Promise<void>;
+  /** Saves a screenshot under .agent-workspace/logs and returns its path. */
+  screenshot(name: string): Promise<string>;
+}
+
+export interface InteractionCheck { label: string; passed: boolean; detail?: string }
+
+/**
+ * A scripted walk through the product (acceptance, not only "no exception").
+ * Each failed check fails the smoke run with its label and detail.
+ */
+export type BrowserInteraction = (page: PageDriver) => Promise<InteractionCheck[]>;
+
+const KEYS: Record<string, { code: string; keyCode: number; text?: string }> = {
+  ArrowLeft: { code: 'ArrowLeft', keyCode: 37 }, ArrowRight: { code: 'ArrowRight', keyCode: 39 },
+  ArrowUp: { code: 'ArrowUp', keyCode: 38 }, ArrowDown: { code: 'ArrowDown', keyCode: 40 },
+  ' ': { code: 'Space', keyCode: 32, text: ' ' }, Enter: { code: 'Enter', keyCode: 13, text: '\r' },
+  Escape: { code: 'Escape', keyCode: 27 },
+};
+function keyInfo(key: string): { code: string; keyCode: number; text?: string } {
+  if (KEYS[key]) { return KEYS[key]; }
+  if (/^[a-z0-9]$/i.test(key)) {
+    const upper = key.toUpperCase();
+    return { code: /\d/.test(key) ? `Digit${key}` : `Key${upper}`, keyCode: upper.charCodeAt(0), text: key };
+  }
+  return { code: key, keyCode: 0 };
+}
+
 export class BrowserSmokeService {
   constructor(private readonly workspaceRoot: string) {}
 
-  async verify(url: string): Promise<TerminalRunResult> {
+  async verify(url: string, interaction?: BrowserInteraction): Promise<TerminalRunResult> {
     const started = Date.now();
     const command = `Browser smoke ${url}`;
     const executable = this._browserExecutable();
@@ -169,13 +205,59 @@ export class BrowserSmokeService {
       if (page.exceptionDetails) { errors.add('Could not inspect the loaded page.'); }
       const pageEvidence = JSON.parse(page.result?.value ?? '{}') as Record<string, unknown>;
       if (!pageEvidence.elementCount && !pageEvidence.bodyText) { errors.add('The browser rendered an empty document.'); }
-      const screenshotPath = path.join(this.workspaceRoot, '.agent-workspace', 'logs', 'browser-smoke.png');
-      const screenshot = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, sessionId);
-      fs.mkdirSync(path.dirname(screenshotPath), { recursive: true });
-      fs.writeFileSync(screenshotPath, Buffer.from(String(screenshot.data), 'base64'));
+      const capture = async (name: string): Promise<string> => {
+        const file = path.join(this.workspaceRoot, '.agent-workspace', 'logs', `${name}.png`);
+        const shot = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false }, sessionId);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, Buffer.from(String(shot.data), 'base64'));
+        return file;
+      };
+      const screenshotPath = await capture('browser-smoke');
+      let interactionChecks: InteractionCheck[] | undefined;
+      if (interaction) {
+        const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+        // Keys are dispatched as KeyboardEvents inside the page, bubbling from
+        // the focused element to document and window, so they reach the game's
+        // own keyboard handlers. CDP Input.dispatchKeyEvent was tried first: a
+        // key press followed by a held arrow key left headless Chrome deferring
+        // every other task (evaluate, timers) by seconds while frames kept
+        // running, which made the checks time out.
+        const keyEvent = (type: 'keydown' | 'keyup', key: string) => {
+          const info = keyInfo(key);
+          const init = JSON.stringify({ key, code: info.code, keyCode: info.keyCode });
+          return driver.evaluate(`(() => { const i = ${init}; const e = new KeyboardEvent('${type}', { key: i.key, code: i.code, bubbles: true, cancelable: true });
+            for (const p of ['keyCode', 'which']) Object.defineProperty(e, p, { get: () => i.keyCode });
+            (document.activeElement || document.body || document).dispatchEvent(e); return true; })()`);
+        };
+        const driver: PageDriver = {
+          evaluate: async <T>(expression: string) => {
+            const evaluated = await call('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
+            if (evaluated.exceptionDetails) {
+              throw new Error(evaluated.exceptionDetails.exception?.description ?? evaluated.exceptionDetails.text ?? 'evaluation failed');
+            }
+            return (evaluated.result as { value?: unknown } | undefined)?.value as T;
+          },
+          press: async (key, holdMs = 50) => { await keyEvent('keydown', key); await sleep(holdMs); await keyEvent('keyup', key); },
+          click: async (x, y) => {
+            for (const type of ['mousePressed', 'mouseReleased']) {
+              await call('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 }, sessionId);
+            }
+          },
+          wait: sleep,
+          screenshot: name => capture(`acceptance-${name.replace(/[^\w-]/g, '_')}`),
+        };
+        try {
+          interactionChecks = await interaction(driver);
+        } catch (error) {
+          interactionChecks = [{ label: 'interaction script', passed: false, detail: error instanceof Error ? error.message : String(error) }];
+        }
+        for (const check of interactionChecks.filter(item => !item.passed)) {
+          errors.add(`Acceptance failed: ${check.label}${check.detail ? ` — ${check.detail}` : ''}`);
+        }
+      }
       return { command, success: errors.size === 0, exitCode: errors.size ? 1 : 0,
         durationMs: Date.now() - started,
-        stdout: JSON.stringify({ browser: version.product, page: pageEvidence, screenshotPath }, null, 2),
+        stdout: JSON.stringify({ browser: version.product, page: pageEvidence, screenshotPath, ...(interactionChecks ? { interaction: interactionChecks } : {}) }, null, 2),
         stderr: [...errors].join('\n').slice(0, 16_000) };
     } catch (error) {
       return { command, success: false, exitCode: 1, stdout: '', durationMs: Date.now() - started,

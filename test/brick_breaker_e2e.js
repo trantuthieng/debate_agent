@@ -5,12 +5,13 @@ const os = require('node:os');
 const { createHash } = require('node:crypto');
 const { AgentOrchestrator } = require('../out/orchestrator/AgentOrchestrator');
 const { loadEnvFile } = require('../out/utils/loadEnvFile');
+const { initLogger } = require('../out/utils/logging');
 
 // So a repo-root .env (e.g. TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID) works for a
 // plain `npm run test:e2e:brick-breaker` without exporting vars by hand.
 loadEnvFile(path.join(__dirname, '..', '.env'));
 
-const prompt = 'Build a complete, polished Brick Breaker (Arkanoid-style) browser game with exactly 20 distinct playable levels of increasing difficulty. Include keyboard and pointer/touch controls, score and lives, pause/resume, restart, level progression, and a victory state after level 20. Deliver a runnable project with README instructions and meaningful automated tests verifying all 20 levels and core gameplay.';
+const prompt = require('../benchmarks/goals/brick-breaker.v1.json').goal;
 const repository = path.resolve(__dirname, '..');
 const implementation = Object.fromEntries([
   'orchestrator/AgentOrchestrator.js', 'ollama/OllamaClient.js', 'dynamic/DynamicTeam.js',
@@ -47,6 +48,7 @@ function report(status) {
     schemaVersion: 2, generatedAt: new Date().toISOString(), status, prompt, workspace: root,
     invocation: { mode: resume ? 'resume' : 'new', reportPath: invocationReportPath, resumedFromReport },
     implementation,
+    diagnosticsLog: path.join(root, '.agent-workspace', 'logs', `benchmark-${stamp}.log`),
     elapsedMs: Date.now() - started, error,
     host: { platform: process.platform, architecture: process.arch, totalMemoryBytes: os.totalmem(), freeMemoryBytes: os.freemem() },
     finalState: state, phases,
@@ -56,7 +58,7 @@ function report(status) {
     collectionAcceptance: readJson(path.join(workspace, 'logs', 'collection_acceptance.json')),
     usedDeterministicRecovery: /deterministic (product )?recovery/i.test(assumptions),
     calls: { total: calls.length, failed: calls.filter(call => !call.success).length, byModel: Object.fromEntries([...new Set(calls.map(call => call.model))].map(model => [model, calls.filter(call => call.model === model).length])) },
-    independentGameplayReview: 'pending',
+    gameplayAcceptance: readJson(path.join(workspace, 'logs', 'gameplay_acceptance.json')),
   };
   // A transient write failure (e.g. a sync client briefly locking the folder)
   // must never kill a multi-hour run from inside the heartbeat timer.
@@ -74,6 +76,11 @@ async function main() {
     throw new Error(`Workspace is not empty: ${root}. Use a fresh folder or --resume.`);
   }
   fs.mkdirSync(root, { recursive: true });
+  // Internal warnings do not use orchestrator callbacks. Keep them in the run
+  // output AND an invocation-specific artifact, including scorecard rejection
+  // reasons that occur after a successful Ollama JSON response.
+  initLogger({ appendLine: line => console.log(line) },
+    path.join(root, '.agent-workspace', 'logs', `benchmark-${stamp}.log`));
   if (resume) {
     const previous = readJson(reportPath);
     if (previous?.workspace === root) {
@@ -116,7 +123,12 @@ async function main() {
       if (!fs.existsSync(path.join(root, '.agent-workspace', 'agents', name))) throw new Error(`Missing debate evidence: ${name}`);
     }
     report('pipeline-completed');
-    console.log(`[BENCHMARK] Pipeline completed. Independent gameplay review remains required. Report: ${reportPath}`);
+    // S3: independent gameplay acceptance on the delivered product (real browser, 17 checks).
+    const acceptance = require('node:child_process').spawnSync(process.execPath,
+      [path.join(__dirname, 'acceptance', 'brickBreakerAcceptance.js'), root], { encoding: 'utf8', timeout: 300_000 });
+    console.log(`[BENCHMARK] Gameplay acceptance:\n${acceptance.stdout}${acceptance.stderr}`);
+    report(acceptance.status === 0 ? 'accepted' : 'pipeline-completed-not-accepted');
+    console.log(`[BENCHMARK] Pipeline completed; gameplay ${acceptance.status === 0 ? 'ACCEPTED' : 'NOT accepted'}. Report: ${reportPath}`);
   } finally {
     clearInterval(heartbeat);
     agent.terminalSessions?.stopAll();
