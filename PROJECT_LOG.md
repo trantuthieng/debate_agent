@@ -707,3 +707,12 @@ Run 13 lần 2 (`~/.debate-agent-runs/20260927-151138`, revision `ae5b88a` + WIP
 - **Nguyên nhân:** phần 1 viết `webpack.config.js` với `entry: './src/scripts/index.js'` (đúng theo kế hoạch). Kiểm tra runtime sau task chạy `npm run build` → "Can't resolve './src/scripts/index.js'"; vì task đổi build setup và không file nguồn nào khác có lỗi, gate đổ lỗi cho phần 1. Fixer chỉ được sửa 4 file của phần 1, không tạo được entry → vòng fix vô nghiệm (hoặc làm hỏng config cho qua).
 - **Đã sửa (`7666000`):** `_missingPlannedFiles` — nếu mọi dòng "module not found" của build chỉ nhắc tới file mà một task **chưa hoàn thành** trong plan sẽ viết (và file chưa tồn tại), build ghi là *unverified* (uncertainty trong review), không chặn. Đường dẫn không thuộc task nào vẫn chặn như cũ. Test hồi quy trong `test/orchestrator.test.js`; full check 530/530.
 - Run hiện tại chạy code cũ nên không hưởng bản sửa; theo dõi xem fixer có vượt qua không.
+
+
+### 2026-09-27 — Trusted keyboard driver completed (Codex)
+
+BrowserSmokeService now sends CDP keyboard input instead of synthetic DOM events. Non-text keys use rawKeyDown, printable keys retain native text insertion, and platform-specific nativeVirtualKeyCode is omitted (Windows virtual-key values are not macOS native codes). Headless focus/background settings are explicit. The regression verifies isTrusted and text insertion; gameplay fixtures still reject broken paddle input, victory, and restart.
+
+Validation: focused browser/gameplay tests 4/4; npm run check (compile, lint, full tests) 530/530, no skips. Logs: /private/tmp/debate-trusted-final-tests.log and /private/tmp/debate-trusted-input-full-check.log. These validate the harness, not acceptance of a generated product. README distinguishes current trusted input from historical synthetic-input reports.
+
+Run 14 was stopped by the user according to Claude's 09:41 UTC coordination note. No new model benchmark launched by Codex while clarifying whether that stop also applies to this Goal. M-Core remains incomplete: fresh product acceptance matrix, remaining CLI/notes evidence, real kill/restart, and Start/Resume UI still outstanding.

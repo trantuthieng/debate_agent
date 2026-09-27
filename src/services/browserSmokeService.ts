@@ -105,6 +105,8 @@ export class BrowserSmokeService {
       '--headless=new', '--remote-debugging-pipe', `--user-data-dir=${profile}`,
       '--no-first-run', '--no-default-browser-check', '--disable-extensions',
       '--disable-background-networking', '--disable-component-update',
+      '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
       '--window-size=1280,900', 'about:blank',
     ], { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'] });
     const input = proc.stdio[3] as NodeJS.WritableStream;
@@ -187,6 +189,8 @@ export class BrowserSmokeService {
       const attached = await call('Target.attachToTarget', { targetId: target.targetId, flatten: true });
       sessionId = String(attached.sessionId);
       await call('Page.enable', {}, sessionId);
+      await call('Page.bringToFront', {}, sessionId);
+      await call('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId);
       await call('Runtime.enable', {}, sessionId);
       await call('Network.enable', {}, sessionId);
       const navigation = await call('Page.navigate', { url }, sessionId);
@@ -216,18 +220,17 @@ export class BrowserSmokeService {
       let interactionChecks: InteractionCheck[] | undefined;
       if (interaction) {
         const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-        // Keys are dispatched as KeyboardEvents inside the page, bubbling from
-        // the focused element to document and window, so they reach the game's
-        // own keyboard handlers. CDP Input.dispatchKeyEvent was tried first: a
-        // key press followed by a held arrow key left headless Chrome deferring
-        // every other task (evaluate, timers) by seconds while frames kept
-        // running, which made the checks time out.
+        // Send trusted browser input, including default actions such as typing
+        // and focus movement. Non-text keys use rawKeyDown; omit the platform-
+        // specific native key code instead of passing Windows codes on macOS.
+        // Do not silently replace protocol failures with synthetic DOM events.
         const keyEvent = (type: 'keydown' | 'keyup', key: string) => {
           const info = keyInfo(key);
-          const init = JSON.stringify({ key, code: info.code, keyCode: info.keyCode });
-          return driver.evaluate(`(() => { const i = ${init}; const e = new KeyboardEvent('${type}', { key: i.key, code: i.code, bubbles: true, cancelable: true });
-            for (const p of ['keyCode', 'which']) Object.defineProperty(e, p, { get: () => i.keyCode });
-            (document.activeElement || document.body || document).dispatchEvent(e); return true; })()`);
+          return call('Input.dispatchKeyEvent', {
+            type: type === 'keydown' ? (info.text ? 'keyDown' : 'rawKeyDown') : 'keyUp', key, code: info.code,
+            windowsVirtualKeyCode: info.keyCode,
+            ...(type === 'keydown' && info.text ? { text: info.text, unmodifiedText: info.text } : {}),
+          }, sessionId);
         };
         const driver: PageDriver = {
           evaluate: async <T>(expression: string) => {

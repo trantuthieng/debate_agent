@@ -57,5 +57,9 @@ The existing gameplay harness uses test hooks to accelerate level completion and
 life loss. Those checks prove transitions only. Real collisions, natural life
 loss, real keyboard/pointer/touch input, distinct level content, visual quality
 and clean-copy delivery still need evidence from the generated product. Synthetic
-DOM keyboard events are not proof of trusted browser input. A green harness alone
-does not satisfy every B01–B08 requirement.
+DOM keyboard events are not proof of trusted browser input. The current driver
+sends trusted CDP keyboard input; its regression checks `isTrusted` and native
+text insertion, and the gameplay fixtures verify held-arrow behavior. Earlier
+reports made with the synthetic driver do not establish trusted input evidence.
+A green fixture harness alone does not satisfy every B01–B08 requirement for a
+generated product.
