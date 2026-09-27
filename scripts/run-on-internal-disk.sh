@@ -23,7 +23,18 @@
 # copied file is verified byte-for-byte; otherwise it is kept and its path printed.
 set -uo pipefail
 
-SRC="$(cd "$(dirname "$0")/.." && pwd)"
+# bash reads a script file lazily while running it. This file lives on the
+# Data volume, so when that volume vanished mid-run (runs 12 and 13,
+# 2026-09-27) bash could not read the copy-back section and died, leaving the
+# outputs stranded on the internal disk. Run from a private internal copy.
+if [ -z "${RUN_ON_INTERNAL_REEXEC:-}" ]; then
+  SELF_COPY="$(mktemp -t run-on-internal-disk)"
+  cp "$0" "$SELF_COPY" || exit 1
+  RUN_ON_INTERNAL_REEXEC=1 RUN_ON_INTERNAL_SRC="$(cd "$(dirname "$0")/.." && pwd)" exec bash "$SELF_COPY" "$@"
+fi
+trap 'rm -f "$0"' EXIT
+
+SRC="${RUN_ON_INTERNAL_SRC:?}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 DEST="${DEBATE_LOCAL_RUN_ROOT:-$HOME/.debate-agent-runs}/$RUN_ID"
 LOG_DIR="$DEST/dist/local-runs"
