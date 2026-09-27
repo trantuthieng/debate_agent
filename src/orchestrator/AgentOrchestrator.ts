@@ -71,6 +71,7 @@ import { checkTypeScriptTask } from '../utils/typeScriptGate';
 import { findBrowserDeliveryIssues, findMissingScriptTargets } from '../utils/browserDelivery';
 import { TaskReviewScopes, findImporters, IMPORT_BREAKAGE } from '../utils/taskReviewScope';
 import { countExecutedTests } from '../utils/testRunEvidence';
+import { findUnwiredModules, findCommentOnlyImplementations, findProjectCommentOnlyImplementations } from '../utils/implementationGaps';
 import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports, isPlaceholderScript } from '../utils/testTaskContracts';
 import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
@@ -3288,6 +3289,14 @@ export class AgentOrchestrator {
       failedCommands.push('static quality gate');
     }
 
+    // Benchmark run 11: tests passed on modules nothing loaded, behind an
+    // empty entry loop and comment-only key handlers. A product must run its
+    // own code: every source module reachable from a page, no stub bodies.
+    const implementationGaps = this._implementationGaps();
+    if (implementationGaps.issues.length > 0) {
+      failedCommands.push('implementation gaps');
+    }
+
     const collectionAcceptance = await new CollectionAcceptanceService(this.workspace.rootDir)
       .verify(this.workspace.readUserPrompt());
     this.workspace.writeFile(path.join(this.workspace.logsDir, 'collection_acceptance.json'), prettyJson(collectionAcceptance));
@@ -3334,6 +3343,7 @@ export class AgentOrchestrator {
           : 'No structural or placeholder-test blockers found.',
       ].join('\n'),
       qualityGate.output,
+      implementationGaps.output,
       `## Quantitative Collection Acceptance\n${prettyJson(collectionAcceptance)}`,
       this._formatAppVerificationResult(appVerification),
       this.modelConfig.requireVerificationScripts && !hasArtifactVerification
@@ -4307,6 +4317,27 @@ export class AgentOrchestrator {
     this._typeScriptGateWarned.clear();
   }
 
+  /** Unwired modules and comment-only implementations across the project (run 11). */
+  private _implementationGaps(): { issues: string[]; output: string } {
+    const issues: string[] = [];
+    try {
+      const wiring = findUnwiredModules(this.workspace.rootDir);
+      if (wiring.unwired.length > 0) {
+        issues.push(`Source modules that no page loads (entry ${wiring.entries.join(', ')} never imports them, directly or indirectly): ${wiring.unwired.slice(0, 15).join(', ')}. ` +
+          'Import and use them from the page\'s entry script, or delete them if they are obsolete.');
+      }
+      issues.push(...findProjectCommentOnlyImplementations(this.workspace.rootDir));
+    } catch (err) {
+      this._journal('warn', 'Implementation-gap check could not run', formatError(err));
+    }
+    return {
+      issues,
+      output: issues.length > 0
+        ? `## Implementation Gaps\nFailed: the product does not run its own code.\n${issues.map(issue => `- ${issue}`).join('\n')}`
+        : '## Implementation Gaps\nPassed: every source module is loaded by a page (or a script), and no function or input handler is only a comment.',
+    };
+  }
+
   /** Manifests and lockfiles a dependency install or self-heal may rewrite. */
   private static readonly DEPENDENCY_FILES = ['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'requirements.txt'];
 
@@ -4787,6 +4818,7 @@ export class AgentOrchestrator {
     ).filter(Boolean);
     structuralIssues.push(...collectionAcceptance.checks.filter(check => check.status !== 'passed')
       .map(check => `Collection acceptance: ${check.diagnostic}`));
+    structuralIssues.push(...this._implementationGaps().issues);
     const unfinishedTasks = this._loadTaskPlan()?.tasks.filter(task => task.status !== 'completed') ?? [];
     structuralIssues.push(...unfinishedTasks.map(task => `Unfinished task ${task.id}: ${task.title} (${task.status}).`));
     structuralIssues.push(...state.failedTasks
@@ -5137,7 +5169,11 @@ export class AgentOrchestrator {
     // used to run only when a model call failed. They are cheap and essentially
     // false-positive-free, so they now always contribute alongside the LLM
     // passes instead of only standing in for one that is unavailable.
-    const structuralIssues = this._heuristicReviewIssues(workerOutput);
+    const structuralIssues = [
+      ...this._heuristicReviewIssues(workerOutput),
+      // A handler or loop that is only a comment is an unwritten implementation (run 11).
+      ...taskPaths.flatMap(file => findCommentOnlyImplementations(file, this.fileManager.readWorkspaceFile(file) ?? '')).map(issue => `[stub] ${issue}`),
+    ];
     if (structuralIssues.length > 0) {
       review.needsFix = true;
       review.approved = false;

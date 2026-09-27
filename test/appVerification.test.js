@@ -215,3 +215,22 @@ test('a placeholder npm test script is a blocking issue, a real one is not', t =
   const real = fixture(t, { 'package.json': pkg('echo "running" && jest') });
   assert.ok(!new VerificationPlanner(real).plan().blockingIssues.some(issue => /placeholder/.test(issue)));
 });
+
+test('run 11: a page under src/ is served and smoke-checked, and a script-loading page without a manifest is a browser artifact', async t => {
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const { AppVerificationService: Service } = require('../out/services/appVerificationService');
+  const root = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'app-src-entry-'));
+  t.after(() => fs2.rmSync(root, { recursive: true, force: true }));
+  fs2.mkdirSync(path2.join(root, 'src'));
+  fs2.writeFileSync(path2.join(root, 'src/index.html'), '<script type="module" src="index.js"></script>');
+  fs2.writeFileSync(path2.join(root, 'src/index.js'), 'document.body.textContent = "ok";');
+  const service = new Service(root, {}, {}, { browserSmokeTest: false });
+  assert.equal(service._staticRoot(), path2.join(root, 'src'));
+  assert.equal(service._hasBrowserManifest(), true, 'an HTML page with a script is a browser artifact');
+  const plain = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'app-no-page-'));
+  t.after(() => fs2.rmSync(plain, { recursive: true, force: true }));
+  fs2.writeFileSync(path2.join(plain, 'cli.js'), '');
+  assert.equal(new Service(plain, {}, {}, {})._hasBrowserManifest(), false);
+});

@@ -642,3 +642,48 @@ New parameterized testingRepairRegression fixture fails when a repair changes pa
 ### 2026-09-27 00:57 UTC - M-Core revision checkpoint
 
 Full check 513/513 PASS, compile/lint clean. S1 integrated commit 36539e9 (Claude original work, Codex review fixes C06 stale success/new lockfile rollback and failed ownership lifecycle); S3 8481c8e (Claude harness and resume staging, Codex logger/locked brief integration); S4 runner/CLI harness 2b05c1c. Current packaged VSIX installed successfully in clean temporary VSCode profile and runtime check passed (2,624,701 bytes). M-Core is not achieved: matrix, natural/trusted input, local-notes acceptance, CLI atomic-fault/clean-copy, real kill/restart and Start/Resume UI evidence remain. Run11 still uses its existing internal copy; no manual product changes or extra model run.
+
+### 2026-09-26 (tiếp) — M-Core S1 (gate đúng, không pass giả) + S3 harness gameplay — Claude, theo phân công trong `talking.md`
+
+Boss giao hai agent tự phối hợp làm hết kế hoạch M-Core. Claude nhận S1 + tích hợp C07/C08 + S3; Codex nhận S0/S2 (xem `talking.md`). ID theo bản audit Codex 14:52.
+
+- **C01** blocker smoke giữ theo task đến khi smoke pass (module mới `src/utils/taskReviewScope.ts`); task khác không bị quy lỗi cũ.
+- **C02** phạm vi review tích luỹ mọi patch của task (fix no-op hoặc lệch file không che lỗi cũ); lỗi import/export ở file import module bị task đổi/xoá được quy cho task; install fail → task `unverified` (ghi vào `review.uncertainties` + journal), không coi là sạch.
+- **C04** `src/utils/testRunEvidence.ts` đếm số test thực chạy (node:test/jest/vitest/mocha/pytest). Lệnh test exit 0 nhưng 0 test → fail ở check cuối và chặn task viết test không được discover. Test chỉ có comment, toàn skip/todo, `node -e "process.exit(0)"` → placeholder.
+- **C05** browser delivery: inline `<script type="module">`, `import()` trong script thường, bundler chỉ khai báo mà không dùng để serve; thêm: import tương đối thiếu đuôi khi không có bundler.
+- **C06 + D03** test-fix: snapshot gồm manifest/lockfile; rollback không ghi đè file bị sửa sau patch; trạng thái chạy ít lệnh/ít test hơn không được coi là tốt hơn hay pass; rollback rồi pass = thành công; thông báo đúng số lượt đã chạy; reset trạng thái kiểm tra theo run, focus text không rò giữa sprint.
+- **C03 (dev)** `checkTypeScriptTask` trả `passed/failed/unavailable/skipped`; review ghi rõ khi gate không chạy được. Bundle compiler vào VSIX để S5.
+- **D04** test .ts không bị chặn khi project chạy được TS (vitest/ts-jest/tsx…); import map HTML không miễn cho test chạy trên Node. **D05** CDN thư viện đã biết chỉ miễn đúng global của nó, typo vẫn bị bắt.
+- **Tích hợp C08** install của orchestrator chạy như lệnh đã uỷ quyền chỉ khi `autoInstallDependencies=true`; **tích hợp C07** restore qua `FileManager`.
+- **Runner** `STAGE_WORKSPACE` cho resume trên ổ trong; log ghi revision + sha256 diff chưa commit.
+- **S3** `BrowserSmokeService.verify(url, interaction)` nhận kịch bản tương tác; `test/acceptance/brickBreakerAcceptance.js` 17 kiểm tra gameplay dựa trên hợp đồng `window.__gameState` + `window.__gameTest`; fixture + 3 biến thể hỏng đều bị bắt. Phát hiện: phím gửi qua CDP `Input.dispatchKeyEvent` làm Chrome headless hoãn các task khác vài giây → driver phát `KeyboardEvent` trong trang.
+- Repro audit của Codex sau sửa: C01 `secondIssues` 0→1; C04 comment-only true, `node -e` bị chặn; C05 ba fixture 0→1 issue; C03 gate tách dependency → `unavailable`.
+
+### 2026-09-27 — Run 11: pipeline báo xanh ở sprint 1 nhưng game không chơi được; sprint 2 fail ở cổng viability — phân tích + cách sửa (ghi TRƯỚC khi sửa)
+
+Run 11 (`dist/local-runs/20260927-000253.log`, workspace `demo/brick-breaker-20-2026-09-26T17-03-01-029Z`), source `ea37155` + diff chưa commit của S0/S1/S2/S3 (sha256 trong log). Prompt benchmark có thêm hợp đồng `window.__gameState`/`__gameTest`. Tổng ~10 giờ 20 phút.
+
+**Diễn biến:**
+- Debate 4 vòng sạch; kế hoạch 18 task; 13 xong, task-014 (tự động hoá test) fail → 4 task phụ thuộc skip (README, final review ×3).
+- Gate S1 hoạt động trên model thật: blocker runtime giữ đến khi pass; đếm test thực chạy (`tests executed: 3/23/25`); fixer sửa file ngoài scope bị bỏ; escalate model; install chạy như lệnh đã uỷ quyền (C08); test-fix cuối điểm 2007→1001→pass ở lượt 7, số test không giảm (C06).
+- task-012 (`levels.json` 20 level, toạ độ từng viên gạch) tốn ~2,5 giờ: qwen 14B/devstral/gemma lần lượt timeout 600s; model nhỏ ghi `// Add more levels as needed` → JSON hỏng; gpt-oss:20b cuối cùng ghi đủ 20 level (13 KB).
+- Sprint 1 test-fix pass → retrospective mở sprint 2 → sprint-02-task-001 "Initialize Project" trả **0 file thay đổi** (file đã tồn tại) 2 lần → 11 task skip → **"Build is not viable: 0/12"** → toàn bộ run fail dù sprint 1 đã pass check cuối.
+
+**Nghiệm thu gameplay độc lập (harness S3 trên `src/`):** PASS contract, 20 level, trạng thái đầu; **FAIL không bắt đầu được game bằng Enter/Space/click.** Nguyên nhân: `src/index.js` là vòng lặp rỗng (`// Update game state logic here`), không import module game nào; `Input.js` mọi nhánh phím chỉ có comment (`// Move paddle left`). Paddle/Ball/Level có code thật và 25 test pass vì test gọi trực tiếp module → **sản phẩm là cái vỏ, pipeline báo xanh.**
+
+**Vì sao các gate bỏ lọt:**
+1. App smoke bị bỏ qua: `_staticRoot` chỉ tìm `index.html` ở dist/build/out/./public (không có `src/`), và `_hasBrowserManifest` chỉ xét dependency phaser/vite… → "passed/skipped" được tính là pass (vi phạm nguyên tắc S1: không chạy ≠ pass).
+2. Không có kiểm tra "entry nối tới code": `findUnreferencedExportingFiles` chỉ là advisory và nhận tham chiếu từ file test.
+3. Không có phát hiện hàm/nhánh chỉ chứa comment mô tả hành động (implementation giả).
+4. Harness gameplay chỉ chạy sau pipeline, không nằm trong vòng sửa.
+
+**Cách sửa (thứ tự ưu tiên):**
+- **F1** App verification: tìm entry HTML cả ở `src/` (và entry khai báo trong package/vite); dự án có HTML entry mà không chạy được browser smoke → **fail** ("web artifact chưa được chạy"), không "skipped".
+- **F2** Cổng nối dây ở check cuối (blocking) và review theo task (task sửa entry): đi đồ thị import từ HTML entry (bỏ test); module nguồn có export mà không reachable từ entry nào → issue. Ngoại lệ: file chỉ dùng cho Node/CLI khi không có HTML entry.
+- **F3** Phát hiện implementation giả: thân hàm/arrow/nhánh `case` chỉ gồm comment (không có câu lệnh) trong file nguồn không phải test → issue cụ thể có vị trí. Không chặn TODO nói chung (theo chốt 15:15).
+- **F4** Sprint cải tiến (sprint ≥2) 0 task hoàn thành không được xoá kết quả sprint trước đã pass: kết thúc sprint đó "không cải thiện", giữ sản phẩm sprint trước, ghi journal.
+- **F5** Task trả 0 file mà mọi allowedFiles đã tồn tại: review file hiện có (coi như đề xuất no-op) thay vì fail ngay.
+- **F6** Review LLM chỉ thấy 3000 ký tự đầu mỗi file → báo sai "JSON không hoàn chỉnh" với `levels.json` hợp lệ: ghi rõ file bị cắt cho review + kết quả parse thật.
+- **F7** Hướng dẫn prompt: tập dữ liệu lớn (N level) dùng mã hoá gọn (chuỗi hàng gạch) hoặc sinh bằng code, không liệt kê toạ độ từng phần tử.
+- **F8** Theo task: task viết lại file test không được làm giảm số test đã pass trước đó.
+- **F9** Chạy acceptance gameplay trong vòng test-fix (S3 tổng quát) — sau F1–F3.

@@ -130,7 +130,9 @@ export class AppVerificationService {
   }
 
   private _staticRoot(): string | null {
-    for (const dir of ['dist', 'build', 'out', '.', 'public']) {
+    // src/ too: benchmark run 11 shipped src/index.html only, the smoke check
+    // found no entry and was skipped, and an unplayable game passed.
+    for (const dir of ['dist', 'build', 'out', '.', 'public', 'src']) {
       const root = path.join(this.workspaceRoot, dir);
       if (fs.existsSync(path.join(root, 'index.html'))) { return root; }
     }
@@ -191,9 +193,23 @@ export class AppVerificationService {
         dependencies?: Record<string, unknown>; devDependencies?: Record<string, unknown>;
       };
       const dependencies = { ...parsed.dependencies, ...parsed.devDependencies };
-      return ['phaser', 'pixi.js', 'three', 'react-dom', 'vue', 'svelte', 'vite', 'next', 'nuxt', 'astro', '@angular/core']
-        .some(name => name in dependencies);
-    } catch { return false; }
+      if (['phaser', 'pixi.js', 'three', 'react-dom', 'vue', 'svelte', 'vite', 'next', 'nuxt', 'astro', '@angular/core']
+        .some(name => name in dependencies)) { return true; }
+    } catch { /* no manifest: a plain HTML project is still a browser artifact */ }
+    // Any HTML page that loads a script makes this a browser artifact whose
+    // runtime check must not be silently skipped.
+    const pageLoadsScript = (dir: string, depth: number): boolean => {
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(path.join(this.workspaceRoot, dir), { withFileTypes: true }); } catch { return false; }
+      return entries.some(entry => {
+        if (entry.name.startsWith('.') || ['node_modules', 'coverage', 'tests', 'test'].includes(entry.name)) { return false; }
+        const rel = dir ? `${dir}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) { return depth < 3 && pageLoadsScript(rel, depth + 1); }
+        if (!/\.html?$/i.test(entry.name)) { return false; }
+        try { return /<script\b/i.test(fs.readFileSync(path.join(this.workspaceRoot, rel), 'utf8')); } catch { return false; }
+      });
+    };
+    return pageLoadsScript('', 0);
   }
 
   private _extractLocalUrl(logs: string): string | null {

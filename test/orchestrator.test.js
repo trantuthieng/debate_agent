@@ -278,6 +278,24 @@ test('audit C04: final checks fail a green test command that executed 0 tests, a
   assert.match(real.output, /Executed tests: 3/);
 });
 
+test('run 11: final checks fail a product whose page loads none of its game code and whose handlers are comments', async () => {
+  const root = makeTempWorkspace();
+  fs.mkdirSync(path.join(root, 'src/game'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/index.html'), '<script type="module" src="index.js"></script>');
+  fs.writeFileSync(path.join(root, 'src/index.js'), 'function update() {\n  // Update game state logic here\n}\nupdate();\n');
+  fs.writeFileSync(path.join(root, 'src/game/Paddle.js'), 'export default class Paddle {}\n');
+  const terminal = makeTerminal({ scripts: ['test'] });
+  terminal.runTests = async () => ({ command: 'npm test', success: true, exitCode: 0, stdout: 'ℹ tests 25\nℹ pass 25', stderr: '', durationMs: 1 });
+  const orchestrator = await makeOrchestrator(root, { terminal });
+  orchestrator.modelConfig.appVerification = { enabled: false };
+
+  const checks = await orchestrator._runProjectChecks('npm');
+  assert.ok(checks.failedCommands.includes('implementation gaps'), checks.failedCommands.join(', '));
+  assert.match(checks.output, /## Implementation Gaps\nFailed/);
+  assert.match(checks.output, /src\/game\/Paddle\.js/);
+  assert.match(checks.output, /src\/index\.js:1 has a function body that is only a comment/);
+});
+
 test('audit C04: a task whose new tests are never discovered is blocked even though the runner exits 0', async () => {
   const { orchestrator, task } = await runtimeHarness({
     scripts: { test: 'vitest run' },
