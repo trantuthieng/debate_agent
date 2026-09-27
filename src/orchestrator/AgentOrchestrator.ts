@@ -220,6 +220,10 @@ export class AgentOrchestrator {
   private _lastTaskSmokePassed: boolean | null = null;
   /** Files and open runtime failures of each task across its review/fix loop (audit C01/C02). */
   private readonly _taskReviewScopes = new TaskReviewScopes();
+  /** Files a task owns that it has not created yet, when it proposed no change (run 11, sprint 2). */
+  private readonly _missingTaskFiles = new Map<string, string[]>();
+  /** Most tests a green per-task `npm test` has run so far in this run (F8). */
+  private _passingTestFloor = 0;
   /** Gate states already reported this run, so the warning is not repeated per task. */
   private readonly _typeScriptGateWarned = new Set<string>();
   /** Focused diagnostics for a test-fix attempt, shown to the fixer instead of the whole verification log. */
@@ -4215,6 +4219,17 @@ export class AgentOrchestrator {
       // Exit 0 after running nothing is not a passing test suite (audit C04).
       const ran = countExecutedTests(outputOf(test));
       if (ran.executed !== null) { summary.push(`tests executed: ${ran.executed}${ran.skipped ? ` (${ran.skipped} skipped)` : ''}`); }
+      // Run 11: task-014 rewrote the test file that task-009 had brought to
+      // 23 passing tests. A task may add tests, not lose passing ones.
+      const touchedTests = changedPaths.some(file => TEST_FILE.test(file));
+      if (test.success && ran.executed !== null && ran.executed > 0) {
+        if (touchedTests && ran.executed < this._passingTestFloor) {
+          issues.push(`[tests] \`${pm} test\` now runs ${ran.executed} test(s), but ${this._passingTestFloor} passed before this task. ` +
+            'Keep the existing tests (fix or extend them) instead of replacing them with fewer.');
+        } else {
+          this._passingTestFloor = Math.max(this._passingTestFloor, ran.executed);
+        }
+      }
       if (test.success && ran.executed === 0 && changedPaths.some(file => TEST_FILE.test(file))) {
         issues.push(`[tests] \`${pm} test\` exits successfully but ran 0 tests${ran.skipped ? ` (${ran.skipped} skipped or todo)` : ''}. ` +
           'The tests this task wrote are not discovered or not active: check the runner\'s file pattern and remove skip/todo.');
@@ -4312,6 +4327,8 @@ export class AgentOrchestrator {
   private _resetRunScopedChecks(): void {
     this._lastTaskSmokePassed = null;
     this._taskReviewScopes.clear();
+    this._missingTaskFiles.clear();
+    this._passingTestFloor = 0;
     this._testFixFocusText.clear();
     this._taskInstalledFingerprint = '';
     this._typeScriptGateWarned.clear();
@@ -4954,16 +4971,54 @@ export class AgentOrchestrator {
   }
 
   /** A resumed no-op still requires the ordinary review and verification gates. */
+  /**
+   * A file as shown to the LLM reviewer/auditor. Run 11: a valid 13 KB
+   * levels.json was cut at 3000 characters and the auditor reported
+   * "incomplete JSON, the file ends abruptly" on every attempt. Say where the
+   * excerpt stops, and for JSON give the real parse result.
+   */
+  static reviewExcerpt(file: string, content: string, limit = 3000): string {
+    const fence = (text: string) => `\`\`\`\n${text}\n\`\`\``;
+    if (content.length <= limit) { return fence(content); }
+    let parsed = '';
+    if (/\.json$/i.test(file)) {
+      try {
+        const value = JSON.parse(content) as unknown;
+        parsed = Array.isArray(value)
+          ? ` The full file parses as valid JSON: an array of ${value.length} item(s).`
+          : ` The full file parses as valid JSON (an object with keys: ${Object.keys(value as object).slice(0, 12).join(', ')}).`;
+      } catch (err) {
+        parsed = ` The full file does NOT parse as JSON: ${err instanceof Error ? err.message : String(err)}.`;
+      }
+    }
+    return `${fence(content.slice(0, limit))}\n[Excerpt: the first ${limit} of ${content.length} characters. The file continues on disk; do not report it as truncated or incomplete because this excerpt ends.${parsed}]`;
+  }
+
+  /** A blocking issue while a task still has not created files it owns, else null. */
+  private _missingTaskFilesIssue(taskId: string): string | null {
+    const stillMissing = (this._missingTaskFiles.get(taskId) ?? []).filter(file => !this.fileManager.fileExists(file));
+    if (stillMissing.length === 0) { this._missingTaskFiles.delete(taskId); return null; }
+    return `[missing] This task must create ${stillMissing.join(', ')}, which does not exist yet. Return the complete file content.`;
+  }
+
   private _existingTaskReviewOutput(task: TaskItem, output: CodeWorkerOutput): CodeWorkerOutput | null {
     if (task.allowedFiles.length === 0) { return null; }
     const files: FileChange[] = [];
+    const missing: string[] = [];
     let hasContent = false;
     try {
       for (const candidate of task.allowedFiles) {
         const relative = this._normalizeRelativePath(candidate);
         if (!relative || relative === '..' || relative.startsWith('../')) { return null; }
         const full = path.join(this.workspace.rootDir, relative);
-        if (!fs.existsSync(full)) { return null; }
+        // Benchmark run 11, sprint 2: one not-yet-created file (vite.config.js)
+        // made "no change" fail the task and skip the sprint. Review what
+        // exists; the missing files become a blocking issue for the fix loop.
+        if (!fs.existsSync(full)) {
+          if (/[*?[\]{}]/.test(relative) || relative.endsWith('/')) { continue; }
+          missing.push(relative);
+          continue;
+        }
         const stat = fs.lstatSync(full);
         if (stat.isDirectory()) {
           files.push({ path: `${relative.replace(/\/+$/, '')}/`, action: 'create', content: '', description: 'Existing directory, review only.' });
@@ -4975,7 +5030,9 @@ export class AgentOrchestrator {
         } else { return null; }
       }
     } catch { return null; }
-    return hasContent ? { ...output, reasoning: `${output.reasoning}\nReviewing actual existing task outputs; no changes have been applied.`, files } : null;
+    if (!hasContent) { return null; }
+    if (missing.length > 0) { this._missingTaskFiles.set(task.id, missing); } else { this._missingTaskFiles.delete(task.id); }
+    return { ...output, reasoning: `${output.reasoning}\nReviewing actual existing task outputs; no changes have been applied.`, files };
   }
 
   private async _executeReviewer(
@@ -4992,7 +5049,7 @@ export class AgentOrchestrator {
     const contextFiles = workerOutput.files.length > 0 ? workerOutput.files
       : taskPaths.map(file => ({ path: file, content: this.fileManager.readWorkspaceFile(file) ?? '' }));
     const filesContext = contextFiles
-      .map(f => `## File: ${f.path}\n\`\`\`\n${(f.content ?? '').substring(0, 3000)}\n\`\`\``)
+      .map(f => `## File: ${f.path}\n${AgentOrchestrator.reviewExcerpt(f.path, f.content ?? '')}`)
       .join('\n\n');
     const prompt = this._userPromptWithFileContext();
     const promptFiles = this._promptReferencedFilePaths();
@@ -5163,6 +5220,12 @@ export class AgentOrchestrator {
     }
     if (scope.unverified.length > 0) {
       review.uncertainties = [...(review.uncertainties ?? []), ...scope.unverified];
+    }
+    const missingIssue = this._missingTaskFilesIssue(task.id);
+    if (missingIssue) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, missingIssue];
     }
 
     // Same reasoning, for the stub-comment and invalid-JSON heuristics: these

@@ -296,6 +296,28 @@ test('run 11: final checks fail a product whose page loads none of its game code
   assert.match(checks.output, /src\/index\.js:1 has a function body that is only a comment/);
 });
 
+test('run 11 (F8): a task that rewrites the tests may not drop below the tests that already passed', async () => {
+  let output = 'ℹ tests 23\nℹ pass 23';
+  const { orchestrator, task } = await runtimeHarness({ scripts: { test: 'vitest run' }, results: {} });
+  orchestrator.terminal.runTests = async () => ({ command: 'npm test', success: true, exitCode: 0, stdout: output, stderr: '', durationMs: 1 });
+  assert.deepEqual(await orchestrator._taskRuntimeIssues({ ...task, id: 'task-009' }, ['tests/game.test.js']), []);
+  output = 'ℹ tests 3\nℹ pass 3';
+  const issues = await orchestrator._taskRuntimeIssues({ ...task, id: 'task-014' }, ['tests/game.test.js']);
+  assert.match(issues[0], /now runs 3 test\(s\), but 23 passed before this task/);
+  assert.deepEqual(await orchestrator._taskRuntimeIssues({ ...task, id: 'task-015' }, ['src/ball.js']), [], 'a task that did not touch tests is not blamed');
+  output = 'ℹ tests 25\nℹ pass 25';
+  assert.deepEqual(await orchestrator._taskRuntimeIssues({ ...task, id: 'task-014' }, ['tests/game.test.js']), [], 'more tests is fine');
+});
+
+test('run 11 (F6): the reviewer excerpt says where it stops and gives the real JSON parse result', () => {
+  const { AgentOrchestrator: A } = require('../out/orchestrator/AgentOrchestrator');
+  const levels = JSON.stringify(Array.from({ length: 20 }, (_, i) => ({ level: i + 1, rows: ['XXXXXXXXXX', 'XX..XX..XX'].concat(Array(20).fill('X'.repeat(10))) })), null, 2);
+  assert.ok(levels.length > 3000);
+  assert.match(A.reviewExcerpt('src/levels.json', levels), /first 3000 of \d+ characters.*do not report it as truncated.*valid JSON: an array of 20 item/s);
+  assert.match(A.reviewExcerpt('src/levels.json', levels.slice(0, -2)), /does NOT parse as JSON/);
+  assert.equal(A.reviewExcerpt('a.js', 'x'), '```\nx\n```');
+});
+
 test('audit C04: a task whose new tests are never discovered is blocked even though the runner exits 0', async () => {
   const { orchestrator, task } = await runtimeHarness({
     scripts: { test: 'vitest run' },
@@ -1203,7 +1225,10 @@ test('resumed no-op reviews existing outputs and does not bypass a rejecting rev
     assert.equal(reviewed, 1);
     assert.deepEqual(state.completedTasks, approved ? [task.id] : []);
     assert.equal(agent.fileManager.readWorkspaceFile('src/main.js'), 'module.exports = 42;\n');
-    assert.equal(agent._existingTaskReviewOutput({ allowedFiles: ['src/main.js', 'missing.js'] }, { files: [] }), null);
+    // Run 11 sprint 2: a missing file no longer voids the review; it blocks as a [missing] issue instead.
+    const partial = agent._existingTaskReviewOutput({ id: 'partial', allowedFiles: ['src/main.js', 'missing.js'] }, { files: [] });
+    assert.deepEqual(partial.files.map(f => f.path), ['src/main.js']);
+    assert.match(agent._missingTaskFilesIssue('partial'), /must create missing\.js/);
     agent.fileManager.writeWorkspaceFile('empty.js', '');
     assert.equal(agent._existingTaskReviewOutput({ allowedFiles: ['empty.js'] }, { files: [] }), null);
   }
@@ -3037,6 +3062,24 @@ test('a failed prerequisite is retried once with the stronger fixer before its d
   assert.deepEqual(state.completedTasks.sort(), ['task-001', 'task-002']);
   assert.ok(orchestrator.escalatedFixTasks.has('task-001'));
   assert.match(orchestrator.workspace.readFile(orchestrator.workspace.assumptionsPath) ?? '', /got one retry/);
+});
+
+test('run 11 sprint 2: a no-change task with one not-yet-created file is reviewed on the rest, and the missing file blocks until created', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/index.html'), '<script src="index.js"></script>\n');
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"g"}\n');
+  const task = { id: 'sprint-02-task-001', title: 'Initialize Project', allowedFiles: ['package.json', 'vite.config.js', 'src/index.html'] };
+  const empty = { reasoning: 'already set up', needUserInput: false, questions: [], files: [] };
+
+  const review = orchestrator._existingTaskReviewOutput(task, empty);
+  assert.deepEqual(review.files.map(f => f.path), ['package.json', 'src/index.html']);
+  assert.match(orchestrator._missingTaskFilesIssue(task.id), /must create vite\.config\.js/);
+  fs.writeFileSync(path.join(root, 'vite.config.js'), 'export default {};\n');
+  assert.equal(orchestrator._missingTaskFilesIssue(task.id), null, 'creating it clears the blocker');
+
+  assert.equal(orchestrator._existingTaskReviewOutput({ id: 't2', allowedFiles: ['src/new.js'] }, empty), null, 'nothing exists: still a real failure');
 });
 
 test('identical re-creations are silent no-ops; real conflicts are reported', async () => {
