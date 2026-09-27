@@ -687,3 +687,15 @@ Run 11 (`dist/local-runs/20260927-000253.log`, workspace `demo/brick-breaker-20-
 - **F7** Hướng dẫn prompt: tập dữ liệu lớn (N level) dùng mã hoá gọn (chuỗi hàng gạch) hoặc sinh bằng code, không liệt kê toạ độ từng phần tử.
 - **F8** Theo task: task viết lại file test không được làm giảm số test đã pass trước đó.
 - **F9** Chạy acceptance gameplay trong vòng test-fix (S3 tổng quát) — sau F1–F3.
+
+### 2026-09-27 — Run 12: fail ở task đầu (Vite phục vụ trang 404) → cổng viability; nguyên nhân + sửa
+
+Run 12 (`dist/local-runs/20260927-103700.log`), revision `5be701b` + WIP driver phím của Codex, brief khoá `brick-breaker.v1.json`. ~2 giờ.
+
+- Debate 4 vòng sạch. Kế hoạch tốt hơn run 11: Vite từ đầu, 20 level chia thành 20 file JSON nhỏ (4 task × 5 level; có thể do quy tắc F7).
+- sprint-01-task-001 "Initialize the project with Vite" đặt trang ở `public/index.html`. Vite phục vụ trang từ root dự án → dev server trả 404, `vite build` lỗi. Gate runtime chặn đúng ngay task đầu, nhưng chỉ báo "HTTP 404"; 3 lượt sửa + 1 lần chạy lại với fixer mạnh đều không tìm ra nguyên nhân. Task không được tạo `index.html` ở root (ngoài scope); cách sửa hợp lệ trong scope là `root: 'public'` trong `vite.config.js`, model không nghĩ ra.
+- 11 task phụ thuộc skip → "Build is not viable 0/12".
+
+**Đã sửa (`82a522d`):** kiểm tra tất định trong `findMissingScriptTargets`: dự án chạy Vite mà trang không nằm ở root Vite → issue nêu rõ trang ở đâu, root là gì, và hai cách sửa (chuyển trang, hoặc đặt `root` trong vite.config). Áp dụng ở review theo task và verification plan.
+
+**Còn mở:** plan tuyến tính (mọi task phụ thuộc task setup) khiến 1 task hỏng giết cả sprint; fixer không được tạo file mới ngoài scope kể cả khi issue tất định chỉ đích danh file đó. Theo dõi ở run 13 trước khi đổi.
