@@ -52,6 +52,9 @@ async function setup(t, { maxFixRetries = 2, manifest = conflictingManifest, req
   orchestrator.terminal = {
     detectPackageManager: () => 'npm',
     runSafeCommand: async command => { commands.push(command); return result(command, true); },
+    // The orchestrator's own install is pre-approved (audit C08); the tests
+    // below script both paths through runSafeCommand.
+    runApprovedCommand(command, timeoutMs) { return this.runSafeCommand(command, timeoutMs); },
   };
   return { root, orchestrator, state, commands,
     installLog: () => fs.readFileSync(orchestrator.workspace.dependencyInstallLogPath, 'utf8') };
@@ -379,6 +382,7 @@ test('restart during dependency reinstall resumes installation before entering t
   restarted.terminal = {
     detectPackageManager: () => 'npm',
     runSafeCommand: async command => { order.push(command); return result(command, true); },
+    runApprovedCommand(command, timeoutMs) { return this.runSafeCommand(command, timeoutMs); },
   };
   for (const phase of ['_phaseBrainstorm', '_phaseCritique', '_phaseSecondBrainstorm', '_phaseDebateResponse', '_phaseDebateScoring', '_phaseBriefing', '_phaseToolchainDiscovery', '_phaseArchitecture', '_phaseTaskPlanning', '_phaseCoding']) {
     restarted[phase] = async () => { throw new Error(`Resume must not repeat ${phase}`); };
@@ -430,4 +434,102 @@ test('test repairs that make things worse twice in a row are rolled back to the 
 
   assert.equal(fs.readFileSync(path.join(root, 'source.js'), 'utf8'), 'v0', 'the best (initial) state is left on disk');
   assert.ok(logs.some(message => /rolled back to the best state/.test(message)), logs.join('\n'));
+});
+
+function versionedChecks(root, spec) {
+  return async () => {
+    const version = fs.readFileSync(path.join(root, 'source.js'), 'utf8');
+    const { errors = 0, tests = null } = spec(version);
+    const testOutput = tests === null ? '' : `ℹ tests ${tests}\nℹ pass ${tests - Math.min(errors, tests)}`;
+    return {
+      failed: errors > 0, failedCommands: errors > 0 ? ['npm test'] : [], skippedChecks: [], compileResult: null,
+      testResult: { command: 'npm test', success: errors === 0, exitCode: errors ? 1 : 0, stdout: testOutput, stderr: '', durationMs: 1 },
+      output: [testOutput, ...Array.from({ length: errors }, (_, i) => `error ${i} in source.js`)].join('\n'),
+    };
+  };
+}
+
+function scriptedFixer(orchestrator, versions) {
+  let attempt = 0;
+  orchestrator._analyzeProjectChecks = async () => ({ passed: false, testsRun: 1, errors: ['Source error'], warnings: [], needsFix: true });
+  orchestrator._collectTestFixAllowedFiles = () => ['source.js'];
+  orchestrator._executeFixer = async () => fixFile(orchestrator, 'source.js', versions[attempt++] ?? `v${attempt}`);
+}
+
+test('audit C06: a rollback whose restored state passes ends the test phase as a success', async t => {
+  const { root, orchestrator, state } = await setup(t, { maxFixRetries: 4, manifest: null });
+  fs.writeFileSync(path.join(root, 'source.js'), 'v0');
+  let v0Checks = 0;
+  // The initial state only fails until something external settles (e.g. a reinstall).
+  orchestrator._runProjectChecks = versionedChecks(root, v => v === 'v0' ? { errors: ++v0Checks > 1 ? 0 : 1, tests: 3 } : { errors: v === 'v1' ? 5 : 9, tests: 3 });
+  scriptedFixer(orchestrator, ['v1', 'v2']);
+
+  await orchestrator._phaseTesting(state);
+  assert.equal(fs.readFileSync(path.join(root, 'source.js'), 'utf8'), 'v0');
+});
+
+test('audit C06: a rollback does not overwrite a file someone else changed after the repair', async t => {
+  const { root, orchestrator, state } = await setup(t, { maxFixRetries: 2, manifest: null });
+  fs.writeFileSync(path.join(root, 'source.js'), 'v0');
+  orchestrator._runProjectChecks = versionedChecks(root, v => ({ errors: v === 'v0' ? 1 : 9, tests: 3 }));
+  scriptedFixer(orchestrator, ['v1', 'v2']);
+  const analyze = orchestrator._analyzeProjectChecks;
+  let analyses = 0;
+  orchestrator._analyzeProjectChecks = async checks => {
+    if (++analyses === 3) { fs.writeFileSync(path.join(root, 'source.js'), 'edited by someone else'); }
+    return analyze(checks);
+  };
+
+  await assert.rejects(() => orchestrator._phaseTesting(state), /still fail after 2 fix attempt/);
+  assert.equal(fs.readFileSync(path.join(root, 'source.js'), 'utf8'), 'edited by someone else');
+});
+
+test('audit C06: the lockfile an install rewrote during a repair is restored with the source', async t => {
+  const { root, orchestrator, state } = await setup(t, { maxFixRetries: 2, manifest: null });
+  fs.writeFileSync(path.join(root, 'source.js'), 'v0');
+  fs.writeFileSync(path.join(root, 'package-lock.json'), 'lock-v0');
+  const checks = versionedChecks(root, v => ({ errors: v === 'v0' ? 1 : 9, tests: 3 }));
+  orchestrator._runProjectChecks = async pm => {
+    if (fs.readFileSync(path.join(root, 'source.js'), 'utf8') !== 'v0') { fs.writeFileSync(path.join(root, 'package-lock.json'), 'lock-rewritten'); }
+    return checks(pm);
+  };
+  scriptedFixer(orchestrator, ['v1', 'v2']);
+
+  await assert.rejects(() => orchestrator._phaseTesting(state), /still fail/);
+  assert.equal(fs.readFileSync(path.join(root, 'source.js'), 'utf8'), 'v0');
+  assert.equal(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'), 'lock-v0');
+});
+
+test('audit C06: a repair that passes by running fewer tests is not a pass and not the best state', async t => {
+  const { root, orchestrator, state } = await setup(t, { maxFixRetries: 1, manifest: null });
+  fs.writeFileSync(path.join(root, 'source.js'), 'v0');
+  const logs = [];
+  orchestrator.setCallbacks({ onLog: message => logs.push(message) });
+  orchestrator._runProjectChecks = versionedChecks(root, v => v === 'v0' ? { errors: 2, tests: 5 } : { errors: 0, tests: 1 });
+  scriptedFixer(orchestrator, ['tests deleted']);
+
+  await assert.rejects(() => orchestrator._phaseTesting(state), /still fail after 1 fix attempt/);
+  assert.equal(fs.readFileSync(path.join(root, 'source.js'), 'utf8'), 'v0', 'the shrunken state is rolled back');
+  assert.ok(logs.some(message => /ran less than before \(1 test\(s\) executed instead of 5\)/.test(message)), logs.join('\n'));
+});
+
+test('audit C06: the failure message counts the attempts actually run when repairs stop early', async t => {
+  const { root, orchestrator, state } = await setup(t, { maxFixRetries: 8, manifest: null });
+  fs.writeFileSync(path.join(root, 'source.js'), 'v0');
+  const errors = { v0: 1, v1: 5, v2: 9, v3: 20, v4: 30 };
+  orchestrator._runProjectChecks = versionedChecks(root, v => ({ errors: errors[v] ?? 40, tests: 3 }));
+  scriptedFixer(orchestrator, ['v1', 'v2', 'v3', 'v4']);
+
+  await assert.rejects(() => orchestrator._phaseTesting(state), /still fail after 4 fix attempt\(s\)/);
+});
+
+test('audit D03: a test-fix attempt without focus does not reuse the previous sprint\'s focus text', async t => {
+  const { root, orchestrator, state } = await setup(t, { maxFixRetries: 1, manifest: null });
+  fs.writeFileSync(path.join(root, 'source.js'), 'v0');
+  orchestrator._testFixFocusText.set('test-fix-1', 'stale diagnostics from sprint 1');
+  orchestrator._testFixFocus = () => null;
+  orchestrator._runProjectChecks = versionedChecks(root, v => ({ errors: v === 'v0' ? 1 : 0, tests: 3 }));
+  scriptedFixer(orchestrator, ['v1']);
+  await orchestrator._phaseTesting(state);
+  assert.equal(orchestrator._testFixFocusText.has('test-fix-1'), false);
 });

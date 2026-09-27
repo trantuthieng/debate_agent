@@ -64,3 +64,46 @@ test('JavaScript: globals from CDN or vendored scripts are not reported as undec
     assert.deepEqual(findTypeScriptTaskIssues(root, ['game.js']), [], src);
   }
 });
+
+test('audit C03: without a loadable compiler the gate reports unavailable, never a silent pass', t => {
+  const { checkTypeScriptTask } = require('../out/utils/typeScriptGate');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-gate-c03-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'main.js'), 'const x = totallyMissingName;\n');
+
+  const missing = checkTypeScriptTask(root, ['main.js'], () => null);
+  assert.equal(missing.status, 'unavailable');
+  assert.deepEqual(missing.issues, []);
+  assert.match(missing.reason, /not type-checked/);
+
+  const real = checkTypeScriptTask(root, ['main.js']);
+  assert.equal(real.status, 'failed');
+  assert.match(real.issues[0], /totallyMissingName/);
+  assert.equal(checkTypeScriptTask(root, ['README.md']).status, 'not-applicable');
+});
+
+test('audit C03: a project over the source limit reports skipped', t => {
+  const { checkTypeScriptTask } = require('../out/utils/typeScriptGate');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ts-gate-c03-big-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (let i = 0; i < 401; i++) { fs.writeFileSync(path.join(root, `m${i}.js`), `export const v${i} = ${i};\n`); }
+  const result = checkTypeScriptTask(root, ['m0.js']);
+  assert.equal(result.status, 'skipped');
+  assert.match(result.reason, /401 source files/);
+});
+
+test('audit D05: with a CDN Phaser, its global is allowed but a typo is still reported; an unknown CDN script stays permissive', t => {
+  const root = project(t, {
+    'index.html': '<script src="https://cdn.jsdelivr.net/npm/phaser@3/dist/phaser.min.js"></script><script src="game.js"></script>',
+    'game.js': 'const game = new Phaser.Game({});\nconsole.log(game, scoreBoardd);\n',
+  });
+  const issues = findTypeScriptTaskIssues(root, ['game.js']);
+  assert.equal(issues.length, 1, issues.join('\n'));
+  assert.match(issues[0], /scoreBoardd/);
+
+  const unknown = project(t, {
+    'index.html': '<script src="https://example.com/some-engine.js"></script><script src="game.js"></script>',
+    'game.js': 'Engine.start(); console.log(anythingGoes);\n',
+  });
+  assert.deepEqual(findTypeScriptTaskIssues(unknown, ['game.js']), []);
+});

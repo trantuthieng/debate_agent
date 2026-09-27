@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { stripJsComments } from '../utils/testRunEvidence';
 import { findBrowserDeliveryIssues, findMissingScriptTargets } from '../utils/browserDelivery';
 import { isPlaceholderScript } from '../utils/testTaskContracts';
 import * as path from 'path';
@@ -173,8 +174,14 @@ export class VerificationPlanner {
       if (/def\s+test_[^(]*\([^)]*\):\s*(?:#.*\s*)?(?:pass|\.\.\.)\s*$/m.test(content)) { return true; }
       return false;
     }
-    if (/\b(?:it|test)\s*\([^,]+,\s*(?:async\s*)?\(.*?\)\s*=>\s*\{\s*\}\s*\)/s.test(content)) { return true; }
-    if (/\b(?:it|test)\s*\([^,]+,\s*(?:async\s*)?function\s*\([^)]*\)\s*\{\s*\}\s*\)/s.test(content)) { return true; }
+    // A body holding only a comment ("// Add assertions here") is as empty as {} (audit C04).
+    const code = stripJsComments(content);
+    if (/\b(?:it|test)\s*\([^,]+,\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{\s*\}\s*\)/.test(code)) { return true; }
+    if (/\b(?:it|test)\s*\([^,]+,\s*(?:async\s*)?function\s*\([^)]*\)\s*\{\s*\}\s*\)/.test(code)) { return true; }
+    // Every declared test is skipped or a todo: nothing will run.
+    const declared = code.match(/\b(?:x?it|x?test)(?:\.(?:skip|todo|only|each|concurrent))?\s*\(/g) ?? [];
+    const inactive = code.match(/\b(?:xit|xtest|(?:it|test|describe)\.(?:skip|todo))\s*\(/g) ?? [];
+    if (declared.length > 0 && inactive.length >= declared.length) { return true; }
     return false;
   }
 

@@ -42,9 +42,10 @@ test('a TypeScript project, declared/aliased/import-mapped packages and a real r
     'package.json': JSON.stringify({ scripts: { test: 'vitest run' }, dependencies: { phaser: '^3' }, devDependencies: { vitest: '^2', '@testing-library/dom': '^10' } }),
     'tsconfig.json': '{}',
     'index.html': '<script type="importmap">{"imports":{"lodash":"https://cdn.jsdelivr.net/npm/lodash-es/lodash.js"}}</script>',
-    'tests/game.test.ts': "import { describe, it, expect } from 'vitest';\nimport { screen } from '@testing-library/dom/dist/queries';\nimport Phaser from 'phaser';\nimport x from '@/utils/x';\nimport _ from 'lodash';\nimport { readFileSync } from 'node:fs';\n",
+    'tests/game.test.ts': "import { describe, it, expect } from 'vitest';\nimport { screen } from '@testing-library/dom/dist/queries';\nimport Phaser from 'phaser';\nimport x from '@/utils/x';\nimport { readFileSync } from 'node:fs';\n",
+    'src/page.js': "import _ from 'lodash';\n",
   });
-  const changed = ['tests/game.test.ts'];
+  const changed = ['tests/game.test.ts', 'src/page.js'];
   assert.deepEqual(findLanguageMismatch(root, changed, ['tests/game.test.ts']), []);
   assert.deepEqual(findUndeclaredPackageImports(root, changed), []);
   assert.deepEqual(findTestScriptIssues(root, changed), []);
@@ -59,4 +60,28 @@ test('the test script is only required when the task writes tests', t => {
 test('placeholder scripts are recognised; real commands are not', () => {
   for (const script of ["echo 'No tests yet.'", 'echo "later" && exit 0', 'true']) { assert.equal(isPlaceholderScript(script), true, script); }
   for (const script of ['vitest run', 'echo start && jest', 'node --test']) { assert.equal(isPlaceholderScript(script), false, script); }
+});
+
+test('audit D04: a TS test is fine without tsconfig when the project runs TypeScript (vitest, tsx, ts-jest)', t => {
+  for (const pkg of [
+    { scripts: { test: 'vitest run' }, devDependencies: { vitest: '1.0.0' } },
+    { scripts: { test: 'jest' }, devDependencies: { jest: '29', 'ts-jest': '29' } },
+    { scripts: { test: 'node --import tsx --test tests/' } },
+  ]) {
+    const root = project(t, { 'package.json': JSON.stringify(pkg), 'src/main.js': 'export const v = 1;', 'tests/value.test.ts': "import { test } from 'vitest';" });
+    assert.deepEqual(findLanguageMismatch(root, ['tests/value.test.ts'], ['src/main.js', 'tests/value.test.ts']), [], JSON.stringify(pkg));
+  }
+  const plainJest = project(t, { 'package.json': JSON.stringify({ scripts: { test: 'jest' }, devDependencies: { jest: '29' } }), 'src/main.js': '', 'tests/v.test.ts': '' });
+  assert.equal(findLanguageMismatch(plainJest, ['tests/v.test.ts'], ['src/main.js', 'tests/v.test.ts']).length, 1, 'plain jest cannot run .ts');
+});
+
+test('audit D04: a browser import map does not satisfy a Node test\'s import', t => {
+  const root = project(t, {
+    'package.json': JSON.stringify({ scripts: { test: 'node --test' } }),
+    'index.html': '<script type="importmap">{"imports":{"phaser":"https://cdn.jsdelivr.net/npm/phaser@3/dist/phaser.esm.js"}}</script>',
+    'src/game.js': "import Phaser from 'phaser';\n",
+    'tests/game.test.js': "import Phaser from 'phaser';\n",
+  });
+  assert.deepEqual(findUndeclaredPackageImports(root, ['src/game.js']), [], 'the page resolves it through the map');
+  assert.match(findUndeclaredPackageImports(root, ['tests/game.test.js'])[0], /tests\/game\.test\.js imports 'phaser'/);
 });

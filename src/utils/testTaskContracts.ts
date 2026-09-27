@@ -19,7 +19,9 @@ const BUILTINS = new Set(builtinModules);
 /** A script made only of echo / exit 0 / true segments runs nothing. */
 export function isPlaceholderScript(script: string): boolean {
   const segments = script.split(/&&|\|\||;/).map(part => part.trim()).filter(Boolean);
-  return segments.length > 0 && segments.every(part => /^(echo\b.*|exit\s+0|true|:)$/i.test(part));
+  // `node -e "process.exit(0)"` and friends exit 0 without running anything (audit C04).
+  const noOpEval = /^node\s+(?:-e|--eval|-p|--print)\s+(['"]?)\s*(?:process\.exit\(\s*0?\s*\)|0|true|void 0|)\s*;?\s*\1$/i;
+  return segments.length > 0 && segments.every(part => /^(echo\b.*|exit\s+0|true|:)$/i.test(part) || noOpEval.test(part));
 }
 
 interface PackageJson {
@@ -86,7 +88,9 @@ export function findUndeclaredPackageImports(root: string, changedFiles: string[
     for (const spec of new Set(importedSpecifiers(read(root, file)))) {
       const name = packageName(spec);
       if (!name || BUILTINS.has(name) || declared.has(name)) { continue; }
-      if (mapped.some(key => key === spec || (key.endsWith('/') && spec.startsWith(key)))) { continue; }
+      // An HTML import map serves the browser only; a Node test importing
+      // the same name still needs the package (audit D04).
+      if (!TEST_FILE.test(file) && mapped.some(key => key === spec || (key.endsWith('/') && spec.startsWith(key)))) { continue; }
       issues.push(`[deps] ${file} imports '${spec}', but package.json does not declare "${name}". Add it to dependencies/devDependencies, or use a package the project already declares.`);
     }
   }
@@ -94,9 +98,22 @@ export function findUndeclaredPackageImports(root: string, changedFiles: string[
 }
 
 /** New TypeScript files in a project that has no TypeScript setup. */
+/** Tools that run .ts directly (tests or dev server) without a tsconfig. */
+const TS_CAPABLE = ['typescript', 'vitest', 'ts-jest', '@swc/jest', '@babel/preset-typescript', 'tsx', 'ts-node', 'esbuild-register', 'vite', 'bun-types', '@types/bun'];
+
+/** Whether the project's declared tooling can run TypeScript, even without tsconfig.json (audit D04). */
+function projectRunsTypeScript(root: string): boolean {
+  const pkg = readPackageJson(root);
+  if (!pkg) { return false; }
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+  const scripts = Object.values(pkg.scripts ?? {}).join('\n');
+  return TS_CAPABLE.some(name => name in deps)
+    || /(^|[\s;&|])(vitest|tsx|ts-node|bun)(\s|$)|--experimental-strip-types|--import[= ]tsx/m.test(scripts);
+}
+
 export function findLanguageMismatch(root: string, changedFiles: string[], allSourceFiles: string[]): string[] {
   const changedTs = changedFiles.filter(file => /\.tsx?$/.test(file) && !file.endsWith('.d.ts'));
-  if (changedTs.length === 0 || fs.existsSync(path.join(root, 'tsconfig.json'))) { return []; }
+  if (changedTs.length === 0 || fs.existsSync(path.join(root, 'tsconfig.json')) || projectRunsTypeScript(root)) { return []; }
   const otherTs = allSourceFiles.filter(file => /\.tsx?$/.test(file) && !file.endsWith('.d.ts')
     && !/(^|\/)(node_modules|\.agent-workspace)\//.test(file) && !changedTs.includes(file));
   if (otherTs.length > 0) { return []; }

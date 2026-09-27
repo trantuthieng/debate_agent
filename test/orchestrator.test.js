@@ -91,6 +91,7 @@ function makeTerminal({ scripts = [], compileSuccess = true, testSuccess = true 
       commands.push(command);
       return makeResult(command, compileSuccess, compileSuccess ? 'compile ok' : 'compile failed');
     },
+    runApprovedCommand(command, timeoutMs) { return this.runSafeCommand(command, timeoutMs); },
     runTests: async () => {
       commands.push('npm test');
       return makeResult('npm test', testSuccess, testSuccess ? 'tests ok' : 'tests failed');
@@ -258,6 +259,34 @@ test('testing skips npx tsc when no compile/build script exists', async () => {
   await orchestrator._phaseTesting(makeState());
 
   assert.deepEqual(terminal.commands, ['npm test']);
+});
+
+test('audit C04: final checks fail a green test command that executed 0 tests, and keep a real count as evidence', async () => {
+  const root = makeTempWorkspace();
+  const terminal = makeTerminal({ scripts: ['test'] });
+  let testOutput = '# tests 0\n# pass 0';
+  terminal.runTests = async () => ({ command: 'npm test', success: true, exitCode: 0, stdout: testOutput, stderr: '', durationMs: 1 });
+  const orchestrator = await makeOrchestrator(root, { terminal });
+
+  const empty = await orchestrator._runProjectChecks('npm');
+  assert.ok(empty.failedCommands.includes('npm test'));
+  assert.match(empty.output, /exited 0 but executed 0 tests/);
+
+  testOutput = 'ℹ tests 3\nℹ pass 3\nℹ skipped 0';
+  const real = await orchestrator._runProjectChecks('npm');
+  assert.ok(!real.failedCommands.includes('npm test'));
+  assert.match(real.output, /Executed tests: 3/);
+});
+
+test('audit C04: a task whose new tests are never discovered is blocked even though the runner exits 0', async () => {
+  const { orchestrator, task } = await runtimeHarness({
+    scripts: { test: 'vitest run' },
+    results: { 'npm test': [true, 'No test files found, exiting with code 0'] },
+  });
+  const issues = await orchestrator._taskRuntimeIssues(task, ['tests/ball.test.js']);
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /exits successfully but ran 0 tests/);
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['src/ball.js']), [], 'a task that wrote no tests is not blamed');
 });
 
 test('architecture self-heals when the model does not return a JSON plan', async () => {
@@ -2745,6 +2774,7 @@ async function runtimeHarness({ scripts, results }) {
   const orchestrator = await makeOrchestrator(root);
   orchestrator.modelConfig = { ...orchestrator.modelConfig, perTaskVerification: true, autoInstallDependencies: true, appVerification: { enabled: false } };
   const commands = [];
+  const approved = [];
   const reply = (command) => {
     commands.push(command);
     const [success, output = ''] = results[command] ?? [true];
@@ -2752,11 +2782,12 @@ async function runtimeHarness({ scripts, results }) {
     return { command, success, exitCode: success ? 0 : 1, stdout: output, stderr: '', durationMs: 1 };
   };
   orchestrator.terminal.runSafeCommand = async command => reply(command);
+  orchestrator.terminal.runApprovedCommand = async command => { approved.push(command); return reply(command); };
   orchestrator.terminal.runTests = async () => reply('npm test');
   orchestrator.terminal.detectPackageManager = () => 'npm';
   orchestrator.terminal.hasPackageScript = name => typeof scripts[name] === 'string';
   const task = { id: 'task-003', title: 't', description: 'd', dependsOn: [], allowedFiles: ['src/ball.js'], forbiddenActions: [], acceptanceCriteria: ['ok'] };
-  return { root, orchestrator, commands, task };
+  return { root, orchestrator, commands, approved, task };
 }
 
 test('per-task verification installs dependencies, then reports build errors in the task\'s own files only', async () => {
@@ -2774,6 +2805,19 @@ test('per-task verification installs dependencies, then reports build errors in 
   assert.ok(!commands.slice(3).includes('npm install'), 'an unchanged manifest is not reinstalled');
 });
 
+test('audit C08: the configured install runs as pre-approved, other commands still go through the policy', async () => {
+  const { orchestrator, approved, task } = await runtimeHarness({ scripts: { build: 'vite build' }, results: {} });
+  await orchestrator._taskRuntimeIssues(task, ['src/ball.js']);
+  assert.deepEqual(approved, ['npm install'], 'only the install bypasses the network approval rule');
+
+  orchestrator.modelConfig.autoInstallDependencies = false;
+  const calls = [];
+  orchestrator.terminal.runSafeCommand = async command => { calls.push(['safe', command]); return { command, success: true, exitCode: 0, stdout: '', stderr: '' }; };
+  await orchestrator._runConfiguredInstall('npm install', 1000);
+  await orchestrator._runConfiguredInstall('npm install left-pad', 1000);
+  assert.deepEqual(calls, [['safe', 'npm install'], ['safe', 'npm install left-pad']], 'without auto-install, or for any other text, the policy decides');
+});
+
 test('per-task verification blames failing tests on the task that wrote them, and skips placeholder test scripts', async () => {
   const { orchestrator, task } = await runtimeHarness({
     scripts: { test: 'vitest run' },
@@ -2787,7 +2831,7 @@ test('per-task verification blames failing tests on the task that wrote them, an
   assert.deepEqual(placeholder.commands, ['npm install']);
 });
 
-test('a failed install is reported only when the task changed package.json, and stops further checks', async () => {
+test('a failed install is reported only when the task changed package.json, and otherwise leaves the task unverified, not clean', async () => {
   const { orchestrator, commands, task } = await runtimeHarness({
     scripts: { build: 'vite build' },
     results: { 'npm install': [false, 'ERESOLVE could not resolve'] },
@@ -2795,6 +2839,67 @@ test('a failed install is reported only when the task changed package.json, and 
   assert.match((await orchestrator._taskRuntimeIssues(task, ['package.json']))[0], /npm install` fails after this task's package.json change/);
   assert.deepEqual(await orchestrator._taskRuntimeIssues(task, ['src/ball.js']), []);
   assert.ok(!commands.includes('npm run build'));
+  const scope = orchestrator._taskReviewScopes.get(task.id);
+  assert.equal(scope.unverified.length, 1, 'skipped checks are recorded (audit C02)');
+  assert.match(scope.unverified[0], /unverified, not clean/);
+});
+
+test('audit C01: a browser failure the task caused stays its blocker on the next review, and an unrelated task is not blamed', async () => {
+  const { AppVerificationService } = require('../out/services/appVerificationService');
+  const { root, orchestrator, task } = await runtimeHarness({ scripts: {}, results: {} });
+  orchestrator.modelConfig.appVerification = { enabled: true };
+  fs.writeFileSync(path.join(root, 'index.html'), '<script src="src/main.js"></script>');
+  let pageBroken = true;
+  const original = AppVerificationService.prototype.verify;
+  AppVerificationService.prototype.verify = async () => pageBroken
+    ? { failed: true, summary: 'broken', checks: [{ success: false, command: 'Browser smoke', stdout: '', stderr: 'ReferenceError: boom is not defined' }] }
+    : { failed: false, summary: 'ok', checks: [] };
+  try {
+    assert.equal((await orchestrator._taskRuntimeIssues(task, ['src/main.js'])).length, 1, 'first review blames the task');
+    assert.equal((await orchestrator._taskRuntimeIssues(task, ['src/main.js'])).length, 1, 'a fix that did not help is still blocked');
+    const other = { ...task, id: 'task-009' };
+    assert.equal((await orchestrator._taskRuntimeIssues(other, ['src/hud.js'])).length, 0, 'another task does not inherit the failure');
+    pageBroken = false;
+    assert.equal((await orchestrator._taskRuntimeIssues(task, ['src/main.js'])).length, 0, 'a real fix passes');
+    assert.ok(!orchestrator._taskReviewScopes.get(task.id).openRuntime.has('smoke'));
+  } finally {
+    AppVerificationService.prototype.verify = original;
+  }
+});
+
+test('audit C02: the review scope accumulates the task\'s files across fixes, so a no-op or off-target fix keeps earlier failures', () => {
+  const { TaskReviewScopes } = require('../out/utils/taskReviewScope');
+  const scopes = new TaskReviewScopes();
+  scopes.record('t', [{ path: 'src/ball.js', action: 'create' }, { path: 'src/old.js', action: 'delete' }]);
+  scopes.record('t', []);
+  const scope = scopes.record('t', [{ path: 'src/hud.js', action: 'modify' }]);
+  assert.deepEqual([...scope.written].sort(), ['src/ball.js', 'src/hud.js']);
+  assert.deepEqual([...scope.deleted], ['src/old.js']);
+  scopes.reset('t');
+  assert.equal(scopes.get('t').written.size, 0, 'a new attempt at the task starts clean');
+});
+
+test('audit C02: build errors in an untouched importer are blamed on the task that deleted or reshaped the module', async () => {
+  const { root, orchestrator, task } = await runtimeHarness({
+    scripts: { build: 'vite build' },
+    results: { 'npm run build': [false, 'ERROR in src/main.js:1\n  SyntaxError: The requested module does not provide an export named Ball'] },
+  });
+  fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src/main.js'), "import { Ball } from './ball.js';\nnew Ball();\n");
+  fs.writeFileSync(path.join(root, 'src/ball.js'), 'export const Paddle = 1;\n');
+  fs.writeFileSync(path.join(root, 'src/unrelated.js'), 'export const x = 1;\n');
+
+  const issues = await orchestrator._taskRuntimeIssues(task, ['src/ball.js']);
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /fails in files that import what this task changed or deleted:\nERROR in src\/main\.js:1/);
+
+  const deleter = { ...task, id: 'task-010' };
+  orchestrator._taskReviewScopes.record(deleter.id, [{ path: 'src/ball.js', action: 'delete' }]);
+  fs.rmSync(path.join(root, 'src/ball.js'));
+  assert.equal((await orchestrator._taskRuntimeIssues(deleter, [])).length, 1, 'deleting the module is blamed too');
+
+  const bystander = { ...task, id: 'task-011' };
+  assert.deepEqual(await orchestrator._taskRuntimeIssues(bystander, ['src/unrelated.js']), [], 'a task whose module nobody imports is not blamed');
 });
 
 test('per-task verification can be turned off', async () => {

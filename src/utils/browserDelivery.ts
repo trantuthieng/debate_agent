@@ -48,9 +48,11 @@ function usesBundler(root: string): boolean {
   if (!raw) { return false; }
   try {
     const pkg = JSON.parse(raw) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: Record<string, string> };
-    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    // Only a bundler the scripts actually run serves or builds the page;
+    // one merely listed in devDependencies while "start" is http-server does
+    // not resolve bare imports (audit C05).
     const scripts = Object.values(pkg.scripts ?? {}).join('\n');
-    return BUNDLERS.some(name => name in deps || new RegExp(`\\b${name.replace(/[/@]/g, '\\$&')}\\b`).test(scripts));
+    return BUNDLERS.some(name => new RegExp(`(^|[\\s;&|/])${name.replace(/[/@]/g, '\\$&')}(\\s|$|[;&|])`, 'm').test(scripts));
   } catch { return false; }
 }
 
@@ -77,13 +79,18 @@ function specifiers(code: string): string[] {
 const isBare = (spec: string) => !/^(\.{1,2}\/|\/|https?:|data:|blob:)/.test(spec);
 
 function resolveLocal(root: string, fromFile: string, spec: string): string | null {
+  return resolveLocalExact(root, fromFile, spec).file;
+}
+
+/** Resolves like a bundler would, and says whether a browser would find the same file (it adds no extension). */
+function resolveLocalExact(root: string, fromFile: string, spec: string): { file: string | null; exact: boolean } {
   const base = spec.startsWith('/') ? spec.slice(1) : path.posix.join(path.posix.dirname(fromFile), spec);
   const normalized = path.posix.normalize(base);
-  if (normalized.startsWith('..')) { return null; }
+  if (normalized.startsWith('..')) { return { file: null, exact: false }; }
   for (const candidate of [normalized, `${normalized}.js`, `${normalized}.mjs`, `${normalized}/index.js`]) {
-    try { if (fs.statSync(path.join(root, candidate)).isFile()) { return candidate; } } catch { /* try next */ }
+    try { if (fs.statSync(path.join(root, candidate)).isFile()) { return { file: candidate, exact: candidate === normalized }; } } catch { /* try next */ }
   }
-  return null;
+  return { file: null, exact: false };
 }
 
 export function findBrowserDeliveryIssues(root: string, changedFiles?: string[]): BrowserDeliveryIssue[] {
@@ -102,10 +109,50 @@ export function findBrowserDeliveryIssues(root: string, changedFiles?: string[])
     const mapped = importMapKeys(html);
     const resolvedByMap = (spec: string) => mapped.some(key => key === spec || (key.endsWith('/') && spec.startsWith(key)));
 
-    for (const tag of html.matchAll(/<script\b([^>]*)>/gi)) {
+    // Walks a module graph through relative imports; bare names need an
+    // import map, and relative paths must name the file exactly.
+    const checkGraph = (start: string[], inlineCode: string | null) => {
+      const queue = [...start];
+      const visited = new Set<string>();
+      const visit = (file: string, code: string) => {
+        for (const spec of specifiers(code)) {
+          if (isBare(spec)) {
+            if (!resolvedByMap(spec)) {
+              add({ files: [page, file],
+                message: `${file === page ? `An inline script in ${page}` : file} imports '${spec}', but ${page} runs it in the browser without a bundler or import map, so the browser cannot resolve '${spec}'. Load it from a CDN (a <script src="https://…"> global, or an <script type="importmap"> entry), or build with a bundler such as Vite.` });
+            }
+          } else if (!/^(https?:|data:|blob:)/.test(spec)) {
+            const next = resolveLocalExact(root, file, spec.split(/[?#]/)[0]);
+            if (next.file && !next.exact) {
+              add({ files: [page, file, next.file],
+                message: `${file === page ? `An inline script in ${page}` : file} imports '${spec}', but without a bundler the browser requests that exact URL and gets 404; the file is ${next.file}. Write the full path with its extension.` });
+            }
+            if (next.file && /\.(m?js|jsx)$/.test(next.file)) { queue.push(next.file); }
+          }
+        }
+      };
+      if (inlineCode !== null) { visit(page, inlineCode); }
+      while (queue.length > 0 && visited.size < 50) {
+        const file = queue.shift()!;
+        if (visited.has(file)) { continue; }
+        visited.add(file);
+        visit(file, read(root, file) ?? '');
+      }
+    };
+
+    for (const tag of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)) {
       const attrs = tag[1];
       const src = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(attrs)?.[1];
-      if (!src || /^(https?:)?\/\//i.test(src)) { continue; }
+      const isModuleTag = /\btype\s*=\s*["']module["']/i.test(attrs);
+      // Inline code: a module's imports, or a classic script's import() (audit C05).
+      if (!src) {
+        if (!bundled && !/\btype\s*=\s*["'](importmap|application\/json|text\/template)["']/i.test(attrs)
+          && (isModuleTag || /\bimport\(/.test(tag[2]))) {
+          checkGraph([], tag[2]);
+        }
+        continue;
+      }
+      if (/^(https?:)?\/\//i.test(src)) { continue; }
       const isModule = /\btype\s*=\s*["']module["']/i.test(attrs);
       const entry = resolveLocal(root, page, src.split(/[?#]/)[0]) ?? (src.startsWith('/') ? null : resolveLocal(root, '', src.split(/[?#]/)[0]));
       if (!entry) { continue; } // missing files are the HTTP smoke check's job
@@ -120,27 +167,9 @@ export function findBrowserDeliveryIssues(root: string, changedFiles?: string[])
         add({ files: [page, entry],
           message: `${page} loads ${entry} with a classic <script>, but ${entry} uses import/export, so the browser throws "Cannot use import statement outside a module". Add type="module" to that <script> tag.` });
       }
-      if (bundled || (!isModule && !ESM_SYNTAX.test(code))) { continue; }
-
-      // Follow the module graph through relative imports.
-      const queue = [entry];
-      const visited = new Set<string>();
-      while (queue.length > 0 && visited.size < 50) {
-        const file = queue.shift()!;
-        if (visited.has(file)) { continue; }
-        visited.add(file);
-        for (const spec of specifiers(read(root, file) ?? '')) {
-          if (isBare(spec)) {
-            if (!resolvedByMap(spec)) {
-              add({ files: [page, file],
-                message: `${file} imports '${spec}', but ${page} runs it in the browser without a bundler or import map, so the browser cannot resolve '${spec}'. Load it from a CDN (a <script src="https://…"> global, or an <script type="importmap"> entry), or build with a bundler such as Vite.` });
-            }
-          } else if (!/^(https?:|data:|blob:)/.test(spec)) {
-            const next = resolveLocal(root, file, spec);
-            if (next && /\.(m?js|jsx)$/.test(next)) { queue.push(next); }
-          }
-        }
-      }
+      // A classic script can still import() modules at runtime (audit C05).
+      if (bundled || (!isModule && !ESM_SYNTAX.test(code) && !/\bimport\(/.test(code))) { continue; }
+      checkGraph([entry], null);
     }
   }
 

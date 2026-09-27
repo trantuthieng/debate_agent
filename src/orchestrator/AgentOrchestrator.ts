@@ -67,8 +67,10 @@ import type { ContextSection } from '../context/ContextCache';
 import { finalizeCompletedState } from './workflowState';
 import type { SecretVault } from '../connectors/SecretVault';
 import { ConnectorManager } from '../connectors/ConnectorManager';
-import { findTypeScriptTaskIssues } from '../utils/typeScriptGate';
+import { checkTypeScriptTask } from '../utils/typeScriptGate';
 import { findBrowserDeliveryIssues, findMissingScriptTargets } from '../utils/browserDelivery';
+import { TaskReviewScopes, findImporters, IMPORT_BREAKAGE } from '../utils/taskReviewScope';
+import { countExecutedTests } from '../utils/testRunEvidence';
 import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports, isPlaceholderScript } from '../utils/testTaskContracts';
 import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
@@ -215,6 +217,10 @@ export class AgentOrchestrator {
   private _taskInstalledFingerprint = '';
   /** Whether the browser smoke check passed at the previous per-task verification (null = not run yet). */
   private _lastTaskSmokePassed: boolean | null = null;
+  /** Files and open runtime failures of each task across its review/fix loop (audit C01/C02). */
+  private readonly _taskReviewScopes = new TaskReviewScopes();
+  /** Gate states already reported this run, so the warning is not repeated per task. */
+  private readonly _typeScriptGateWarned = new Set<string>();
   /** Focused diagnostics for a test-fix attempt, shown to the fixer instead of the whole verification log. */
   private readonly _testFixFocusText = new Map<string, string>();
 
@@ -255,8 +261,17 @@ export class AgentOrchestrator {
    * `_running = true`; pair with {@link _endRunOwnership} in its `finally`.
    */
   private _beginRunOwnership(): void {
-    this._activeRunLock = new RunLock(this.workspace.runLockPath);
-    this._activeRunLock.acquire();
+    const lock = new RunLock(this.workspace.runLockPath);
+    try {
+      lock.acquire();
+    } catch (error) {
+      // Entrypoints claim before their workflow try/finally. A failed claim
+      // must leave this instance retryable without touching the actual owner.
+      this._running = false;
+      this._activeRunLock = null;
+      throw error;
+    }
+    this._activeRunLock = lock;
     this._runHeartbeatTimer = setInterval(() => this._activeRunLock?.heartbeat(), 20_000);
     // Never keep the process/extension host alive just for this timer.
     (this._runHeartbeatTimer as { unref?: () => void }).unref?.();
@@ -303,6 +318,7 @@ export class AgentOrchestrator {
       this._promptFileContextCache = null;
       this._webContextCache = null;
       this._contextCache.clear();
+      this._resetRunScopedChecks();
       this._lastMicroCheckSummary = '';
       this._taskPlanComplexity = 'medium';
       const state = this._newState(prompt);
@@ -390,6 +406,7 @@ export class AgentOrchestrator {
       this._promptFileContextCache = null;
       this._webContextCache = null;
       this._contextCache.clear();
+      this._resetRunScopedChecks();
       this._lastMicroCheckSummary = '';
       this._taskPlanComplexity = 'medium';
       const state = this._newState(goal);
@@ -613,6 +630,7 @@ export class AgentOrchestrator {
       this._promptFileContextCache = null;
       this._webContextCache = null;
       this._contextCache.clear();
+      this._resetRunScopedChecks();
       this._buildTimeline();
       this._emitTimeline();
 
@@ -2291,6 +2309,7 @@ export class AgentOrchestrator {
           taskId: task.id,
           files: workerResult.files.map(file => file.path),
         });
+        this._taskReviewScopes.reset(task.id);
         let review = await this._executeReviewer(task, workerResult, state);
         if (scopeNote) {
           review.issues = [...review.issues, scopeNote];
@@ -2632,7 +2651,7 @@ export class AgentOrchestrator {
           if (!(this.fileManager.readWorkspaceFile(manifest) ?? '').trim()) {
             throw new Error(`Required dependency manifest ${manifest} is missing or empty.`);
           }
-          result = await this.terminal.runSafeCommand(command, 600_000);
+          result = await this._runConfiguredInstall(command, 600_000);
         } catch (err) {
           if (err instanceof UserAbortError) { throw err; }
           this._checkAborted();
@@ -2754,6 +2773,9 @@ export class AgentOrchestrator {
   private async _phaseTesting(state: ProjectState): Promise<void> {
     this._checkAborted();
     this._setPhase(state, 'testing', 'Tester Agent: Running tests...');
+    // Focus text is keyed test-fix-<n>; a previous sprint's must not leak
+    // into this one (audit D03).
+    this._testFixFocusText.clear();
 
     let pm = this.terminal.detectPackageManager();
     let installedDependencies = this._dependencyManifestFingerprint();
@@ -2786,11 +2808,32 @@ export class AgentOrchestrator {
       let bestAttempt = 0;
       let worseningStreak = 0;
       let rollbacks = 0;
-      const preImages = new Map<number, Map<string, string | null>>();
+      let attemptsRun = 0;
+      // Audit C06: a state that runs fewer checks or tests cannot count as
+      // better (a compiler that dies early, or deleted tests, lower the score).
+      let inventoryFloor = this._verificationInventory(checks);
+      // Per attempt: each file's content before the repair, and what the repair
+      // (plus any dependency self-heal during its recheck) left there. The
+      // snapshot includes the dependency manifests and lockfiles, which the
+      // recheck's install may rewrite although the fixer never named them.
+      const preImages = new Map<number, Map<string, { before: string | null; after?: string | null }>>();
       const rollBackTo = (target: number, fromAttempt: number): void => {
         for (let i = fromAttempt; i > target; i--) {
-          for (const [file, content] of preImages.get(i) ?? []) { this._restoreWorkspaceFile(file, content); }
+          for (const [file, image] of preImages.get(i) ?? []) {
+            const current = this.fileManager.fileExists(file) ? this.fileManager.readWorkspaceFile(file) : null;
+            if (image.after !== undefined && current !== image.after) {
+              // Someone else changed it since this repair: do not overwrite.
+              this._journal('warn', 'Rollback skipped a file', `${file} changed after test-fix attempt ${i}, so it was left as it is instead of being restored.`);
+              continue;
+            }
+            this._restoreWorkspaceFile(file, image.before);
+          }
           preImages.delete(i);
+        }
+      };
+      const recordAfterImages = (attempt: number): void => {
+        for (const [file, image] of preImages.get(attempt) ?? []) {
+          image.after = this.fileManager.fileExists(file) ? this.fileManager.readWorkspaceFile(file) : null;
         }
       };
       const recheck = async (): Promise<void> => {
@@ -2806,11 +2849,15 @@ export class AgentOrchestrator {
           this._setPhase(state, 'testing', 'Rechecking the project after dependency changes...');
         }
         checks = await this._runProjectChecks(pm);
+        // A repair can regress an initially passing project. Success always
+        // describes the current files/check inventory, never an earlier check.
+        passedAfterFix = !checks.failed && !this._inventoryShrank(this._verificationInventory(checks), inventoryFloor);
         this.workspace.writeFile(this.workspace.testResultLogPath, checks.output);
       };
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         this._checkAborted();
+        attemptsRun = attempt;
         state.fixRetryCount = attempt;
         this.workspace.writeProjectState(state);
         this._emit('log', `Test fix attempt ${attempt}/${maxRetries}`, 'warn');
@@ -2844,7 +2891,7 @@ export class AgentOrchestrator {
         // once; give each attempt only the first failing file cluster.
         const focus = this._testFixFocus(checks, allowedFiles);
         const fakeTaskId = `test-fix-${attempt}`;
-        if (focus) { this._testFixFocusText.set(fakeTaskId, focus.diagnostics); }
+        if (focus) { this._testFixFocusText.set(fakeTaskId, focus.diagnostics); } else { this._testFixFocusText.delete(fakeTaskId); }
         const fakeTask: TaskItem = {
           id: fakeTaskId,
           title: 'Fix test failures',
@@ -2928,10 +2975,15 @@ export class AgentOrchestrator {
             continue;
           }
           const patchId = `test-fix-${attempt}-${Date.now()}`;
-          const preImage = new Map(fixResult.files.map(file => {
-            const normalized = this._normalizeRelativePath(file.path);
-            return [normalized, this.fileManager.readWorkspaceFile(normalized)] as [string, string | null];
-          }));
+          const snapshotFiles = new Set([
+            ...fixResult.files.map(file => this._normalizeRelativePath(file.path)),
+            // Include absent lockfiles: installation may create them, and a
+            // rollback must remove those new files before restoring dependencies.
+            ...AgentOrchestrator.DEPENDENCY_FILES,
+          ]);
+          const preImage = new Map([...snapshotFiles].map(file =>
+            [file, { before: this.fileManager.fileExists(file) ? this.fileManager.readWorkspaceFile(file) : null }] as
+              [string, { before: string | null; after?: string | null }]));
           const applied = await this._applyCodeChanges(patchId, fixResult, state);
           if (applied) { preImages.set(attempt, preImage); }
           if (!applied) {
@@ -2953,20 +3005,27 @@ export class AgentOrchestrator {
         }
 
         await recheck();
+        recordAfterImages(attempt);
         this.workspace.appendFile(
           this.workspace.testerPath,
           `\n\n---\n\n## Verification After Fix Attempt ${attempt}\n\n${checks.output}\n`
         );
         if (this._deferIncompleteCollectionScope(checks)) { return; }
 
-        if (!checks.failed) {
+        const inventory = this._verificationInventory(checks);
+        const shrank = this._inventoryShrank(inventory, inventoryFloor);
+        if (!checks.failed && !shrank) {
           this._emit('log', 'Tests passed after fix.', 'info');
           passedAfterFix = true;
           break;
         }
+        if (shrank) {
+          this._emit('log', `Test fix attempt ${attempt} ran less than before (${shrank}); it does not count as progress.`, 'warn');
+        }
 
-        const score = this._verificationErrorScore(checks);
-        this._emit('log', `Test fix attempt ${attempt}: error score ${previousScore} → ${score} (best ${bestScore}).`, 'info');
+        const score = shrank ? Number.MAX_SAFE_INTEGER : this._verificationErrorScore(checks);
+        if (!shrank) { inventoryFloor = this._inventoryMax(inventoryFloor, inventory); }
+        this._emit('log', `Test fix attempt ${attempt}: error score ${previousScore} → ${shrank ? 'rejected' : score} (best ${bestScore}).`, 'info');
         worseningStreak = score > previousScore ? worseningStreak + 1 : 0;
         previousScore = score;
         if (score < bestScore) { bestScore = score; bestAttempt = attempt; }
@@ -2980,6 +3039,12 @@ export class AgentOrchestrator {
           this._journal('warn', 'Test-fix rollback', `Two consecutive repairs raised the error score; restored the state after attempt ${bestAttempt}.`);
           await recheck();
           previousScore = this._verificationErrorScore(checks);
+          if (!checks.failed && !this._inventoryShrank(this._verificationInventory(checks), inventoryFloor)) {
+            // The restored state passes: that is a success, not a failure (audit C06).
+            this._emit('log', 'The restored best state passes the checks.', 'info');
+            passedAfterFix = true;
+            break;
+          }
           if (rollbacks >= 2) {
             this._emit('log', 'Test repairs kept making things worse after a rollback; stopping test-fix attempts at the best state.', 'warn');
             break;
@@ -2989,6 +3054,8 @@ export class AgentOrchestrator {
         testerOutput = await this._analyzeProjectChecks(checks);
         repairFeedback = rolledBack
           ? `The last two repairs made the project worse and were rolled back. Take a different, smaller approach: fix only the first error below.`
+          : shrank
+          ? `The previous repair made the project run less (${shrank}). Never delete, skip or weaken tests or checks; fix the code they exercise.`
           : `The previous repair to ${fixResult.files.map(file => file.path).join(', ') || '(no files)'} was insufficient. The checks still fail: ${checks.failedCommands.join(', ')}. Do not repeat the same change; use the current file contents and exact resolved-path diagnostics below.`;
         this.workspace.appendFile(
           this.workspace.testerPath,
@@ -3000,16 +3067,18 @@ export class AgentOrchestrator {
         }
       }
 
-      if (!passedAfterFix && this._verificationErrorScore(checks) > bestScore) {
+      const currentShrank = this._inventoryShrank(this._verificationInventory(checks), inventoryFloor);
+      if (!passedAfterFix && (currentShrank || this._verificationErrorScore(checks) > bestScore)) {
         // Leave the best state on disk, not the last (worse) repair.
-        rollBackTo(bestAttempt, maxRetries);
+        rollBackTo(bestAttempt, attemptsRun);
         await recheck();
         this._emit('log', `Restored the best test-fix state (after attempt ${bestAttempt}).`, 'warn');
+        if (!checks.failed && !this._inventoryShrank(this._verificationInventory(checks), inventoryFloor)) { passedAfterFix = true; }
       }
       if (!passedAfterFix) {
         const fixerNote = fixerUnavailable ? ' The fixer model produced no usable output.' : '';
         throw new WorkflowError(
-          `Project checks still fail after ${maxRetries} fix attempt(s): ${checks.failedCommands.join(', ')}.${fixerNote}`,
+          `Project checks still fail after ${attemptsRun} fix attempt(s): ${checks.failedCommands.join(', ')}.${fixerNote}`,
           'testing'
         );
       }
@@ -3189,6 +3258,12 @@ export class AgentOrchestrator {
     if (testResult && !testResult.success) {
       failedCommands.push(testResult.command);
     }
+    // A green test command that executed no test proves nothing (audit C04).
+    // An unknown count (unrecognised runner) is reported, not failed.
+    const testCount = testResult ? countExecutedTests(`${testResult.stdout ?? ''}\n${testResult.stderr ?? ''}`) : null;
+    if (testResult?.success && testCount?.executed === 0) {
+      failedCommands.push(testResult.command);
+    }
     if (nativeResult && !nativeResult.success) {
       failedCommands.push(nativeResult.command);
     }
@@ -3241,7 +3316,10 @@ export class AgentOrchestrator {
         ? this._formatCommandResult('Compile / Build', compileResult)
         : '## Compile / Build\n_No compile or build script found_',
       testResult
-        ? this._formatCommandResult('Tests', testResult)
+        ? this._formatCommandResult('Tests', testResult) + (testCount?.executed === 0
+          ? `\n\n**Failed:** the test command exited 0 but executed 0 tests${testCount.skipped ? ` (${testCount.skipped} skipped or todo)` : ''}.`
+          : testCount?.executed == null ? '\n\n_Executed test count: unknown (runner summary not recognised)._'
+          : `\n\nExecuted tests: ${testCount.executed}${testCount.skipped ? ` (${testCount.skipped} skipped)` : ''}`)
         : '## Tests\n_No test script found_',
       nativeResult
         ? this._formatCommandResult('Native Project Verification', nativeResult)
@@ -4052,17 +4130,40 @@ export class AgentOrchestrator {
     };
     const issues: string[] = [];
     const summary: string[] = [];
+    const scope = this._taskReviewScopes.get(task.id);
+    scope.unverified = [];
+    // Files that import what this task changed or deleted: an export the task
+    // removed breaks them although the task never touched them (audit C02).
+    let importers: string[] | null = null;
+    const importerBreakage = (output: string): string[] => {
+      importers ??= findImporters(this.workspace.rootDir, [...changedPaths, ...scope.deleted],
+        this._projectSourceFiles().filter(file => !changedPaths.includes(file)));
+      if (importers.length === 0) { return []; }
+      const lines = this._diagnosticLinesFor(output, importers);
+      return IMPORT_BREAKAGE.test(lines.join('\n')) ? lines : [];
+    };
 
     const fingerprint = this._dependencyManifestFingerprint();
     const nodeModules = fs.existsSync(path.join(this.workspace.rootDir, 'node_modules'));
     if (hasPackageJson && this.modelConfig.autoInstallDependencies && (!nodeModules || fingerprint !== this._taskInstalledFingerprint)) {
       const command = pm === 'yarn' ? 'yarn install' : pm === 'pnpm' ? 'pnpm install' : 'npm install';
       this._emit('log', `Per-task verification for ${task.id}: installing dependencies.`, 'info');
-      const install = await run(command, 600_000);
+      let install: TerminalRunResult;
+      try { install = await this._runConfiguredInstall(command, 600_000); } catch (err) {
+        if (err instanceof UserAbortError) { throw err; }
+        install = { command, exitCode: -1, stdout: '', stderr: formatError(err), durationMs: 0, success: false };
+      }
       summary.push(`${command}: ${install.success ? 'ok' : 'FAILED'}`);
       if (!install.success) {
         if (changedPaths.includes('package.json')) {
           issues.push(`[runtime] \`${command}\` fails after this task's package.json change:\n${tail(outputOf(install))}`);
+        } else {
+          // Not this task's fault, but nothing was checked either: say so
+          // instead of letting the task look verified (audit C02).
+          const note = `\`${command}\` failed, so the build/test/browser checks for ${task.id} did not run; the task is unverified, not clean.`;
+          scope.unverified.push(note);
+          summary.push('(unverified: dependency install failed, later checks skipped)');
+          this._journal('warn', `Per-task checks skipped for ${task.id}`, `${note}\n\n${this._errorEvidence(outputOf(install), 12)}`);
         }
         this._recordTaskRuntimeSummary(task, summary);
         return issues; // nothing else can run without dependencies
@@ -4083,7 +4184,9 @@ export class AgentOrchestrator {
         // A setup change is blamed only for failures no source file explains
         // (config/resolution errors), not for errors inside other tasks' files.
         const otherFileErrors = this._diagnosticLinesFor(outputOf(build), this._projectSourceFiles().filter(file => !changedPaths.includes(file)), 1);
+        const broken = own.length > 0 ? [] : importerBreakage(outputOf(build));
         if (own.length > 0) { issues.push(`[runtime] \`${command}\` fails in this task's files:\n${own.join('\n')}`); }
+        else if (broken.length > 0) { issues.push(`[runtime] \`${command}\` fails in files that import what this task changed or deleted:\n${broken.join('\n')}`); }
         else if (buildSetupChanged && otherFileErrors.length === 0) { issues.push(`[runtime] \`${command}\` fails after this task changed the build setup:\n${this._errorEvidence(outputOf(build), 30)}`); }
       }
     }
@@ -4099,10 +4202,19 @@ export class AgentOrchestrator {
         && !this.fileManager.listWorkspaceFiles('').some(file => TEST_FILE.test(file) && /\.(m?[jt]sx?|cjs)$/.test(file)
           && !/(^|\/)(node_modules|\.agent-workspace)\//.test(file));
       if (!test.success && noTestsYet) { summary.push('(no test files yet — not blocking)'); }
+      // Exit 0 after running nothing is not a passing test suite (audit C04).
+      const ran = countExecutedTests(outputOf(test));
+      if (ran.executed !== null) { summary.push(`tests executed: ${ran.executed}${ran.skipped ? ` (${ran.skipped} skipped)` : ''}`); }
+      if (test.success && ran.executed === 0 && changedPaths.some(file => TEST_FILE.test(file))) {
+        issues.push(`[tests] \`${pm} test\` exits successfully but ran 0 tests${ran.skipped ? ` (${ran.skipped} skipped or todo)` : ''}. ` +
+          'The tests this task wrote are not discovered or not active: check the runner\'s file pattern and remove skip/todo.');
+      }
       if (!test.success && !noTestsYet) {
         const wroteTests = changedPaths.some(file => TEST_FILE.test(file));
         const own = this._diagnosticLinesFor(outputOf(test), changedPaths);
+        const broken = own.length > 0 ? [] : importerBreakage(outputOf(test));
         if (own.length > 0) { issues.push(`[runtime] \`${pm} test\` fails in this task's files:\n${own.join('\n')}`); }
+        else if (broken.length > 0) { issues.push(`[runtime] \`${pm} test\` fails in files that import what this task changed or deleted:\n${broken.join('\n')}`); }
         else if (wroteTests || changedPaths.includes('package.json')) { issues.push(`[runtime] \`${pm} test\` fails after this task changed the tests or their setup:\n${this._errorEvidence(outputOf(test), 30)}`); }
       }
     }
@@ -4112,7 +4224,12 @@ export class AgentOrchestrator {
     if (webChanged && isWeb && this.modelConfig.appVerification?.enabled !== false) {
       const smoke = await new AppVerificationService(this.workspace.rootDir, this.terminal, this.terminalSessions, this.modelConfig.appVerification).verify();
       summary.push(`browser smoke: ${smoke.failed ? 'FAILED' : 'ok'}`);
-      const regression = smoke.failed && (this._lastTaskSmokePassed !== false || changedPaths.some(file => /\.html?$/.test(file)));
+      // A failure this task already caused stays its blocker until the page
+      // loads again, even though the previous check failed too (audit C01).
+      const regression = smoke.failed && (this._lastTaskSmokePassed !== false
+        || changedPaths.some(file => /\.html?$/.test(file)) || scope.openRuntime.has('smoke'));
+      if (regression) { scope.openRuntime.add('smoke'); }
+      if (!smoke.failed) { scope.openRuntime.delete('smoke'); }
       if (regression) {
         const evidence = smoke.checks.filter(check => !check.success)
           .map(check => `${check.command}:\n${this._errorEvidence(outputOf(check), 8)}`).join('\n');
@@ -4123,6 +4240,22 @@ export class AgentOrchestrator {
 
     this._recordTaskRuntimeSummary(task, summary);
     return issues;
+  }
+
+  /** The dependency installs the orchestrator itself issues, never model-written text. */
+  private static readonly CONFIGURED_INSTALLS = new Set(['npm install', 'pnpm install', 'yarn install', 'pip3 install -r requirements.txt']);
+
+  /**
+   * Runs one of the orchestrator's own install commands. With
+   * autoInstallDependencies on, the user has already approved exactly these,
+   * so they bypass the network-approval rule that still applies to any other
+   * command (audit C08). Anything else goes through the normal policy.
+   */
+  private async _runConfiguredInstall(command: string, timeoutMs: number): Promise<TerminalRunResult> {
+    if (this.modelConfig.autoInstallDependencies && AgentOrchestrator.CONFIGURED_INSTALLS.has(command)) {
+      return this.terminal.runApprovedCommand(command, timeoutMs);
+    }
+    return this.terminal.runSafeCommand(command, timeoutMs);
   }
 
   private _projectSourceFiles(): string[] {
@@ -4155,11 +4288,45 @@ export class AgentOrchestrator {
 
   private _restoreWorkspaceFile(file: string, content: string | null): void {
     if (!this._isSafeWorkspaceRelativePath(file)) { return; }
-    if (content === null) {
-      try { fs.rmSync(path.join(this.workspace.rootDir, file), { force: true }); } catch { /* already gone */ }
-    } else {
-      this.fileManager.writeWorkspaceFile(file, content);
-    }
+    // Through FileManager so a symlink cannot lead a restore outside the workspace (audit C07).
+    if (content === null) { this.fileManager.deleteWorkspaceFile(file); }
+    else { this.fileManager.writeWorkspaceFile(file, content); }
+  }
+
+  /**
+   * Per-run verification memory lives on the instance; a new or resumed run
+   * must not inherit the previous run's smoke result, task scopes or test-fix
+   * focus (audit D03). Dependencies are reinstalled once, since node_modules
+   * may not match what the last run left.
+   */
+  private _resetRunScopedChecks(): void {
+    this._lastTaskSmokePassed = null;
+    this._taskReviewScopes.clear();
+    this._testFixFocusText.clear();
+    this._taskInstalledFingerprint = '';
+    this._typeScriptGateWarned.clear();
+  }
+
+  /** Manifests and lockfiles a dependency install or self-heal may rewrite. */
+  private static readonly DEPENDENCY_FILES = ['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'requirements.txt'];
+
+  /** What a verification run actually exercised: commands run and tests executed (null = unknown). */
+  private _verificationInventory(checks: ProjectCheckResults): { commands: number; tests: number | null } {
+    const commands = [checks.compileResult, checks.testResult, ...(checks.additionalResults ?? [])].filter(Boolean).length;
+    const test = checks.testResult;
+    const tests = test ? countExecutedTests(`${test.stdout ?? ''}\n${test.stderr ?? ''}`).executed : null;
+    return { commands, tests };
+  }
+
+  /** Why `now` exercised less than `floor`, or '' when it did not. */
+  private _inventoryShrank(now: { commands: number; tests: number | null }, floor: { commands: number; tests: number | null }): string {
+    if (now.commands < floor.commands) { return `${now.commands} check command(s) ran instead of ${floor.commands}`; }
+    if (floor.tests !== null && floor.tests > 0 && (now.tests ?? 0) < floor.tests) { return `${now.tests ?? 'an unknown number of'} test(s) executed instead of ${floor.tests}`; }
+    return '';
+  }
+
+  private _inventoryMax(a: { commands: number; tests: number | null }, b: { commands: number; tests: number | null }): { commands: number; tests: number | null } {
+    return { commands: Math.max(a.commands, b.commands), tests: a.tests === null ? b.tests : b.tests === null ? a.tests : Math.max(a.tests, b.tests) };
   }
 
   /**
@@ -4784,7 +4951,15 @@ export class AgentOrchestrator {
     workerOutput: CodeWorkerOutput,
     _state: ProjectState
   ): Promise<ReviewResult> {
-    const filesContext = workerOutput.files
+    // Everything this task touched so far, not only the latest patch: a fix
+    // that changes nothing or edits a different file must not hide the files
+    // that failed before (audit C02).
+    const scope = this._taskReviewScopes.record(task.id,
+      workerOutput.files.map(f => ({ path: this._normalizeRelativePath(f.path), action: f.action })));
+    const taskPaths = [...scope.written].filter(file => this.fileManager.fileExists(file));
+    const contextFiles = workerOutput.files.length > 0 ? workerOutput.files
+      : taskPaths.map(file => ({ path: file, content: this.fileManager.readWorkspaceFile(file) ?? '' }));
+    const filesContext = contextFiles
       .map(f => `## File: ${f.path}\n\`\`\`\n${(f.content ?? '').substring(0, 3000)}\n\`\`\``)
       .join('\n\n');
     const prompt = this._userPromptWithFileContext();
@@ -4880,10 +5055,18 @@ export class AgentOrchestrator {
     // final test-fix loop — 161 of them in benchmark run 7. Type-check the
     // changed files now (JavaScript too), reporting only errors that missing
     // @types cannot explain.
-    const typeScriptIssues = findTypeScriptTaskIssues(
-      this.workspace.rootDir,
-      workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path))
-    );
+    const typeScriptGate = checkTypeScriptTask(this.workspace.rootDir, taskPaths);
+    const typeScriptIssues = typeScriptGate.issues;
+    if (typeScriptGate.status === 'unavailable' || typeScriptGate.status === 'skipped') {
+      // Not checked is not clean (audit C03): say so on the review and, once
+      // per run, in the journal.
+      review.uncertainties = [...(review.uncertainties ?? []), `[typescript gate ${typeScriptGate.status}] ${typeScriptGate.reason}`];
+      if (!this._typeScriptGateWarned.has(typeScriptGate.status)) {
+        this._typeScriptGateWarned.add(typeScriptGate.status);
+        this._emit('log', `TypeScript gate ${typeScriptGate.status}: ${typeScriptGate.reason}`, 'warn');
+        this._journal('warn', `TypeScript gate ${typeScriptGate.status}`, typeScriptGate.reason);
+      }
+    }
     if (typeScriptIssues.length > 0) {
       review.needsFix = true;
       review.approved = false;
@@ -4897,7 +5080,7 @@ export class AgentOrchestrator {
     // A page that cannot load its own code (classic <script> for an ES module,
     // bare npm imports without a bundler) used to surface only at the final
     // browser smoke test, as an error naming no file (benchmark runs 6 and 8).
-    const deliveryPaths = workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path));
+    const deliveryPaths = taskPaths;
     const deliveryIssues = [
       ...findBrowserDeliveryIssues(this.workspace.rootDir, deliveryPaths),
       ...findMissingScriptTargets(this.workspace.rootDir, deliveryPaths),
@@ -4914,7 +5097,7 @@ export class AgentOrchestrator {
 
     // Tests that can never run (benchmark run 8): a .ts test in a JS project,
     // an undeclared 'chai' import, and a placeholder npm test script.
-    const changedPaths = workerOutput.files.filter(f => f.action !== 'delete').map(f => this._normalizeRelativePath(f.path));
+    const changedPaths = taskPaths;
     const contractIssuesForTests = [
       ...findLanguageMismatch(this.workspace.rootDir, changedPaths, this.fileManager.listWorkspaceFiles('')),
       ...findUndeclaredPackageImports(this.workspace.rootDir, changedPaths),
@@ -4945,6 +5128,9 @@ export class AgentOrchestrator {
         ...review.fixSuggestions,
         'Fix the failures reported by the real build/test/browser run above; they come from this task\'s files.',
       ];
+    }
+    if (scope.unverified.length > 0) {
+      review.uncertainties = [...(review.uncertainties ?? []), ...scope.unverified];
     }
 
     // Same reasoning, for the stub-comment and invalid-JSON heuristics: these
