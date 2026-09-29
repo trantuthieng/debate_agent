@@ -1,0 +1,17 @@
+Jane Doe
+Email: jane.doe@example.com | Location: Remote
+
+SUMMARY
+Senior software engineer with 6 years of experience in backend and data systems.
+
+SKILLS
+Python, TypeScript, Node.js, PostgreSQL, Docker, AWS, REST APIs, web scraping
+
+EXPERIENCE
+Senior Backend Engineer — Acme Corp (2021-present)
+- Built data pipelines and REST APIs serving 1M+ requests/day.
+Software Engineer — Globex (2018-2021)
+- Developed internal tooling and automated reporting.
+
+EDUCATION
+B.Sc. Computer Science, State University (2018)

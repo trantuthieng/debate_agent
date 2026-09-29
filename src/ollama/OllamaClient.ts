@@ -1,5 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import * as http from 'http';
+import * as https from 'https';
+import { estimateModelContextLimit } from '../services/systemResourceService';
 import type {
   AgentRole,
   ModelOptions,
@@ -10,21 +14,117 @@ import type {
 } from '../types';
 import { OllamaConnectionError, ModelNotFoundError, UserAbortError } from '../utils/errors';
 import { logInfo, logWarn, logError } from '../utils/logging';
+import { ModelLoadLock, type ModelLoadLockLike } from './ModelLoadLock';
+import { ModelExchangeRecorder, createReplayTransport, type ReplayStats } from './modelReplay';
 
 // Default request timeout in milliseconds
 const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
+// How long a text-model stays warm in VRAM after a call. Kept modest because
+// consecutive debate phases usually switch models, so a long keep-alive just
+// pins idle weights and risks OOM on constrained hardware (e.g. 24 GB Macs).
+const DEFAULT_TEXT_KEEP_ALIVE_SECONDS = 30;
+
+export interface LocalModelInventoryEntry {
+  name: string;
+  size?: number;
+  digest?: string;
+}
+
+export interface LocalModelDetails {
+  capabilities?: string[];
+  model_info?: Record<string, unknown>;
+}
+
+/** Injectable HTTP transport; production does not use Undici's 300s header limit. */
+export type OllamaTransport = (url: string, init: RequestInit) => Promise<Response>;
+
+/**
+ * Ollama stream:false can withhold headers for the entire inference. Native
+ * fetch has a separate Undici 300-second header timeout, which aborts healthy
+ * generations before our configured 600-second deadline. Use Node's HTTP
+ * client with no pooled socket timeout; the caller's AbortSignal owns the
+ * deadline through connection, headers and the complete response body.
+ */
+const nodeHttpTransport: OllamaTransport = (url, init) => new Promise((resolve, reject) => {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    reject(new Error(`Unsupported Ollama URL protocol: ${parsed.protocol}`));
+    return;
+  }
+  if (init.body !== undefined && init.body !== null && typeof init.body !== 'string') {
+    reject(new Error('Ollama HTTP transport expects a serialized JSON request body.'));
+    return;
+  }
+  const request = (parsed.protocol === 'https:' ? https : http).request(parsed, {
+    method: init.method ?? 'GET',
+    headers: Object.fromEntries(new Headers(init.headers).entries()),
+    agent: false,
+    signal: init.signal ?? undefined,
+  }, response => {
+    const chunks: Buffer[] = [];
+    response.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    response.on('error', reject);
+    response.on('end', () => {
+      try {
+        const headers = new Headers();
+        for (const [name, value] of Object.entries(response.headers)) {
+          if (value === undefined) { continue; }
+          for (const entry of Array.isArray(value) ? value : [value]) { headers.append(name, entry); }
+        }
+        const status = response.statusCode ?? 502;
+        resolve(new Response([204, 205, 304].includes(status) ? null : Buffer.concat(chunks), {
+          status, statusText: response.statusMessage, headers,
+        }));
+      } catch (err) { reject(err); }
+    });
+  });
+  request.on('error', reject);
+  request.end(init.body ?? undefined);
+});
 
 export class OllamaClient {
   private readonly baseUrl: string;
   private readonly requestTimeoutMs: number;
+  private readonly textKeepAliveSeconds: number;
   private logFilePath: string | null = null;
   private readonly activeControllers = new Set<AbortController>();
   private cancellationRequested = false;
+  private cancellationEpoch = 0;
+  private generationQueue: Promise<void> = Promise.resolve();
+  private lastResidentModel: string | null = null;
+  private readonly modelInventory = new Map<string, LocalModelInventoryEntry>();
+  private readonly modelDetails = new Map<string, LocalModelDetails>();
+  private readonly modelLoadLock: ModelLoadLockLike;
+  private readonly transport: OllamaTransport;
+  private recorder: ModelExchangeRecorder | null = null;
+  /** Set when DEBATE_MODEL_REPLAY serves a recorded run instead of Ollama. */
+  readonly replayStats?: ReplayStats;
 
-  constructor(baseUrl: string, logFilePath?: string, requestTimeoutMs: number = DEFAULT_TIMEOUT_MS) {
+  constructor(
+    baseUrl: string,
+    logFilePath?: string,
+    requestTimeoutMs: number = DEFAULT_TIMEOUT_MS,
+    textKeepAliveSeconds: number = DEFAULT_TEXT_KEEP_ALIVE_SECONDS,
+    transport: OllamaTransport = nodeHttpTransport,
+    modelLoadLock?: ModelLoadLockLike
+  ) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    const replayFile = process.env.DEBATE_MODEL_REPLAY;
+    if (replayFile) {
+      const replay = createReplayTransport(replayFile);
+      this.transport = replay;
+      this.replayStats = replay.stats;
+      logInfo(`Replaying recorded model exchanges from ${replayFile}; Ollama is not contacted.`);
+    } else {
+      this.transport = transport;
+    }
     this.logFilePath = logFilePath ?? null;
+    if (logFilePath) { this._startRecording(logFilePath); }
     this.requestTimeoutMs = Math.max(30_000, requestTimeoutMs);
+    this.textKeepAliveSeconds = Math.max(0, textKeepAliveSeconds);
+    // Cross-PROCESS lock: only one process on the machine ever holds a model
+    // in flight at a time, on top of the in-process generationQueue below.
+    this.modelLoadLock = modelLoadLock ?? new ModelLoadLock(this.baseUrl);
   }
 
   setLogFilePath(filePath: string): void {
@@ -33,6 +133,12 @@ export class OllamaClient {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+    this._startRecording(filePath);
+  }
+
+  /** Every exchange is recorded beside the call log so a run can be replayed (not while replaying). */
+  private _startRecording(callLogPath: string): void {
+    this.recorder = this.replayStats ? null : new ModelExchangeRecorder(path.join(path.dirname(callLogPath), 'model_exchanges.jsonl'));
   }
 
   // ------------------------------------------------------------------
@@ -41,8 +147,8 @@ export class OllamaClient {
 
   /**
    * Send a chat request to Ollama.
-   * Model is kept warm in VRAM for 60 s after the response so rapid
-   * consecutive calls (e.g. brainstorm → critic) avoid reload overhead.
+   * Reuse a warm model for consecutive calls; unload it before switching
+   * models so a sequential debate does not keep multiple weight sets in RAM.
    */
   async chat(
     model: string,
@@ -56,7 +162,6 @@ export class OllamaClient {
     let success = false;
     let errorMsg: string | undefined;
     let content = '';
-    let aborted = false;
 
     try {
       const response = await this._sendChatRequest(model, messages, false, options);
@@ -65,7 +170,6 @@ export class OllamaClient {
       return content;
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
-      aborted = err instanceof UserAbortError;
       throw err;
     } finally {
       const duration = Date.now() - startTime;
@@ -80,8 +184,7 @@ export class OllamaClient {
         outputFile,
         usedFallback: false,
       });
-      // keep_alive:60 in the request body lets Ollama evict the model
-      // automatically after 60 s of inactivity. No explicit unload needed.
+      // The next different-model call explicitly releases these weights.
     }
   }
 
@@ -100,7 +203,6 @@ export class OllamaClient {
     const startTime = Date.now();
     let success = false;
     let errorMsg: string | undefined;
-    let aborted = false;
 
     try {
       const response = await this._sendChatRequest(model, messages, true, options);
@@ -111,7 +213,6 @@ export class OllamaClient {
       return parsed;
     } catch (err) {
       errorMsg = err instanceof Error ? err.message : String(err);
-      aborted = err instanceof UserAbortError;
       throw err;
     } finally {
       const duration = Date.now() - startTime;
@@ -210,18 +311,25 @@ export class OllamaClient {
     try {
       const body: OllamaChatRequest = {
         model,
-        messages: [{ role: 'user', content: '' }],
+        messages: [],
         stream: false,
         keep_alive: 0,
       };
-      await this._fetchWithTimeout(`${this.baseUrl}/api/chat`, {
+      const response = await this._fetchWithTimeout(`${this.baseUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       }, 10_000);
+      if (!response.ok) { throw new Error(`Ollama unload returned HTTP ${response.status}`); }
+      if (this.lastResidentModel && this._matchesModelName(this.lastResidentModel, model)) {
+        this.lastResidentModel = null;
+      }
       logInfo(`Model "${model}" unloaded from RAM.`);
-    } catch {
-      // Unload failures are non-fatal
+    } catch (err) {
+      // Cleanup must not replace the original generation error, but keep the
+      // model tracked so a later switch can retry releasing its weights.
+      if (err instanceof UserAbortError) { throw err; }
+      logWarn(`Could not unload model "${model}": ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -230,6 +338,7 @@ export class OllamaClient {
    * does not appear stuck while a large local model is generating.
    */
   cancelActiveRequests(): void {
+    this.cancellationEpoch += 1;
     if (this.activeControllers.size === 0) { return; }
     this.cancellationRequested = true;
     for (const controller of this.activeControllers) {
@@ -255,10 +364,7 @@ export class OllamaClient {
    */
   async checkModelAvailable(model: string): Promise<boolean> {
     try {
-      const res = await this._fetchWithTimeout(`${this.baseUrl}/api/tags`, {}, 5_000);
-      if (!res.ok) { return false; }
-      const data = await res.json() as { models?: Array<{ name: string }> };
-      const models = data.models ?? [];
+      const models = await this.listModelInventory();
       return models.some(m => this._matchesModelName(m.name, model));
     } catch (err) {
       if (err instanceof UserAbortError) { throw err; }
@@ -270,14 +376,40 @@ export class OllamaClient {
    * List all available local models.
    */
   async listModels(): Promise<string[]> {
+    return (await this.listModelInventory()).map(model => model.name);
+  }
+
+  /** Inventory metadata is read without loading any model into inference RAM. */
+  async listModelInventory(): Promise<LocalModelInventoryEntry[]> {
     try {
       const res = await this._fetchWithTimeout(`${this.baseUrl}/api/tags`, {}, 5_000);
       if (!res.ok) { return []; }
-      const data = await res.json() as { models?: Array<{ name: string }> };
-      return (data.models ?? []).map(m => m.name);
+      const data = await res.json() as { models?: LocalModelInventoryEntry[] };
+      const models = (data.models ?? []).filter(model => typeof model.name === 'string');
+      this.modelInventory.clear();
+      for (const model of models) { this.modelInventory.set(this._normalizeModelName(model.name), model); }
+      return models;
     } catch (err) {
       if (err instanceof UserAbortError) { throw err; }
       return [];
+    }
+  }
+
+  async getModelDetails(model: string): Promise<LocalModelDetails | undefined> {
+    const key = this._normalizeModelName(model);
+    if (this.modelDetails.has(key)) { return this.modelDetails.get(key); }
+    try {
+      const res = await this._fetchWithTimeout(`${this.baseUrl}/api/show`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      }, 10_000);
+      if (!res.ok) { return undefined; }
+      const details = await res.json() as LocalModelDetails;
+      this.modelDetails.set(key, details);
+      return details;
+    } catch (err) {
+      if (err instanceof UserAbortError) { throw err; }
+      return undefined;
     }
   }
 
@@ -286,6 +418,24 @@ export class OllamaClient {
   // ------------------------------------------------------------------
 
   private async _sendChatRequest(
+    model: string,
+    messages: OllamaMessage[],
+    jsonFormat: boolean,
+    options?: ModelOptions
+  ): Promise<OllamaChatResponse> {
+    // Coding tasks may be prepared concurrently, but local generation is a
+    // single lane. Otherwise parallel KV caches defeat the per-model RAM
+    // budget, and one fallback could unload another task's active model.
+    const queuedEpoch = this.cancellationEpoch;
+    const request = this.generationQueue.then(async () => {
+      if (queuedEpoch !== this.cancellationEpoch) { throw new UserAbortError(); }
+      return this._sendChatRequestExclusive(model, messages, jsonFormat, options);
+    });
+    this.generationQueue = request.then(() => undefined, () => undefined);
+    return request;
+  }
+
+  private async _sendChatRequestExclusive(
     model: string,
     messages: OllamaMessage[],
     jsonFormat: boolean,
@@ -301,34 +451,61 @@ export class OllamaClient {
       throw new ModelNotFoundError(model);
     }
 
-    // Keep the model warm in VRAM for 60 s when it is expected to be called
-    // again soon (all non-JSON text calls, e.g. brainstorm → critic → brief).
-    // JSON calls unload immediately because they are typically one-shot per task.
-    const keepAliveSeconds = jsonFormat ? 0 : 60;
-    const body: OllamaChatRequest = {
-      model,
-      messages,
-      stream: false,
-      keep_alive: keepAliveSeconds,
-      ...(jsonFormat ? { format: 'json' } : {}),
-      options: options ?? {},
-    };
+    // Cross-process lock: only one process on the machine may hold a model
+    // in flight (loading or generating) at a time, so two VS Code windows or
+    // a benchmark script running alongside the extension can never both load
+    // a large model into RAM at once. Released in `finally` below — always,
+    // whether this call succeeds or fails.
+    const releaseModelLoadLock = await this.modelLoadLock.acquire(model, () => this.cancellationRequested);
+    try {
+      // Release the previous model before loading the next one, including a
+      // failed primary before its fallback. Same-model calls retain warm weights.
+      if (this.lastResidentModel && !this._matchesModelName(this.lastResidentModel, model)) {
+        await this.unloadModel(this.lastResidentModel);
+      }
+      const details = await this.getModelDetails(model);
+      const inventory = this.modelInventory.get(this._normalizeModelName(model));
+      const contextLimit = estimateModelContextLimit(os.totalmem(), inventory?.size ?? 0, details?.model_info);
+      const requestedContext = options?.num_ctx;
+      const boundedOptions: ModelOptions = {
+        ...options,
+        num_ctx: Math.min(requestedContext && requestedContext > 0 ? requestedContext : 8_192, contextLimit),
+      };
+      if (requestedContext && boundedOptions.num_ctx! < requestedContext) {
+        logInfo(`Context for "${model}" limited to ${boundedOptions.num_ctx} tokens (requested ${requestedContext}) by model metadata / RAM budget.`);
+      }
+      const keepAliveSeconds = jsonFormat ? 0 : this.textKeepAliveSeconds;
+      const body: OllamaChatRequest = {
+        model,
+        messages,
+        stream: false,
+        keep_alive: keepAliveSeconds,
+        ...(jsonFormat ? { format: 'json' } : {}),
+        options: boundedOptions,
+      };
+      // Track even failed requests: the runner may have loaded weights before
+      // generation failed, and a fallback must release those weights first.
+      this.lastResidentModel = model;
 
-    logInfo(`Calling Ollama model "${model}" (${messages.length} messages${jsonFormat ? ', JSON format' : ''})`);
+      logInfo(`Calling Ollama model "${model}" (${messages.length} messages${jsonFormat ? ', JSON format' : ''})`);
 
-    const res = await this._fetchWithTimeout(`${this.baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }, this.requestTimeoutMs);
+      const res = await this._fetchWithTimeout(`${this.baseUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }, this.requestTimeoutMs);
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => res.statusText);
-      throw new Error(`Ollama API error ${res.status}: ${text}`);
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        throw new Error(`Ollama API error ${res.status}: ${text}`);
+      }
+
+      const data = await res.json() as OllamaChatResponse;
+      if (keepAliveSeconds === 0) { this.lastResidentModel = null; }
+      return data;
+    } finally {
+      releaseModelLoadLock();
     }
-
-    const data = await res.json() as OllamaChatResponse;
-    return data;
   }
 
   private async _fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -340,10 +517,26 @@ export class OllamaClient {
     }, timeoutMs);
     this.activeControllers.add(controller);
     try {
-      const res = await fetch(url, { ...init, signal: controller.signal });
-      return res;
+      let res: Response;
+      let body: ArrayBuffer;
+      try {
+        res = await this.transport(url, { ...init, signal: controller.signal });
+        // fetch resolves when headers arrive. Keep cancellation and the deadline
+        // active until the non-streaming JSON body finishes as well, otherwise a
+        // stalled runner can hang forever after sending HTTP 200 headers.
+        body = await res.arrayBuffer();
+      } catch (err) {
+        if (!controller.signal.aborted) { this.recorder?.record(url, init, { error: err instanceof Error ? err.message : String(err) }); }
+        throw err;
+      }
+      this.recorder?.record(url, init, {
+        status: res.status, contentType: res.headers.get('content-type') ?? undefined, body: Buffer.from(body).toString('utf8'),
+      });
+      return new Response([204, 205, 304].includes(res.status) ? null : body, {
+        status: res.status, statusText: res.statusText, headers: res.headers,
+      });
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') {
+      if (controller.signal.aborted || (err instanceof Error && err.name === 'AbortError')) {
         if (this.cancellationRequested && !timedOut) {
           throw new UserAbortError();
         }
@@ -359,10 +552,12 @@ export class OllamaClient {
     }
   }
 
+  private _normalizeModelName(model: string): string {
+    return model.trim().toLowerCase().replace(/:latest$/, '');
+  }
+
   private _matchesModelName(installedName: string, requestedName: string): boolean {
-    if (installedName === requestedName) { return true; }
-    if (!requestedName.includes(':') && installedName === `${requestedName}:latest`) { return true; }
-    return false;
+    return this._normalizeModelName(installedName) === this._normalizeModelName(requestedName);
   }
 
   private _writeCallLog(entry: OllamaCallLog): void {

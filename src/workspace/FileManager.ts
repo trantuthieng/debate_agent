@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import type { FileChange, FileSnapshot, PatchResult } from '../types';
 import { logInfo, logWarn } from '../utils/logging';
 
@@ -9,9 +9,21 @@ import { logInfo, logWarn } from '../utils/logging';
 // -----------------------------------------------------------------------
 export class FileManager {
   private readonly workspaceRoot: string;
+  private readonly requestedRoot: string;
 
   constructor(workspaceRoot: string) {
-    this.workspaceRoot = path.resolve(workspaceRoot);
+    this.requestedRoot = path.resolve(workspaceRoot);
+    // Resolve aliases in the selected root once (e.g. macOS /var -> /private/var).
+    // Descendant symlinks, even links to other workspace files, are rejected.
+    let ancestor = this.requestedRoot;
+    const missing: string[] = [];
+    while (!fs.existsSync(ancestor)) {
+      missing.unshift(path.basename(ancestor));
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) { throw new Error('Workspace has no existing parent.'); }
+      ancestor = parent;
+    }
+    this.workspaceRoot = path.join(fs.realpathSync(ancestor), ...missing);
   }
 
   // ------------------------------------------------------------------
@@ -19,33 +31,58 @@ export class FileManager {
   // ------------------------------------------------------------------
 
   readWorkspaceFile(relativePath: string): string | null {
-    const fullPath = this._resolve(relativePath);
-    if (!fs.existsSync(fullPath)) { return null; }
+    // Validate outside the catch: an unsafe path must not look like a missing file.
+    this._resolve(relativePath);
     try {
-      return fs.readFileSync(fullPath, 'utf8');
+      const file = this._readFile(relativePath);
+      return file ? file.content.toString('utf8') : null;
     } catch (err) {
       logWarn(`Could not read file "${relativePath}": ${err instanceof Error ? err.message : err}`);
       return null;
     }
   }
 
-  writeWorkspaceFile(relativePath: string, content: string): void {
-    const fullPath = this._resolve(relativePath);
-    this.ensureDirectory(path.dirname(fullPath));
-    fs.writeFileSync(fullPath, content, 'utf8');
+  writeWorkspaceFile(relativePath: string, content: string | Uint8Array): void {
+    this._writeFile(relativePath, content, false);
     logInfo(`Wrote file: ${relativePath}`);
   }
 
+  /** Same-filesystem replacement preserves the previous checkpoint on failed writes. */
+  writeWorkspaceFileAtomic(relativePath: string, content: string): void {
+    const destination = this._resolve(relativePath);
+    this.ensureDirectory(path.dirname(destination));
+    const temporary = path.join(path.dirname(destination),
+      `.${path.basename(destination)}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`);
+    try {
+      this._writeFile(temporary, content, false);
+      // Check again after staging: neither metadata parents nor the final target
+      // may become symlinks. Rename remains subject to the parent race described below.
+      const checkedDestination = this._resolve(relativePath);
+      const checkedTemporary = this._resolve(temporary);
+      fs.renameSync(checkedTemporary, checkedDestination);
+    } catch (err) {
+      try { this.deleteWorkspaceFile(temporary); } catch { /* best-effort guarded cleanup */ }
+      throw err;
+    }
+  }
+
   appendWorkspaceFile(relativePath: string, content: string): void {
+    this._writeFile(relativePath, content, true);
+  }
+
+  deleteWorkspaceFile(relativePath: string): void {
     const fullPath = this._resolve(relativePath);
-    this.ensureDirectory(path.dirname(fullPath));
-    fs.appendFileSync(fullPath, content, 'utf8');
+    try { fs.unlinkSync(fullPath); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { throw err; } }
   }
 
   ensureDirectory(dirPath: string): void {
-    if (!fs.existsSync(dirPath)) {
-      fs.mkdirSync(dirPath, { recursive: true });
+    const fullPath = this._resolve(dirPath);
+    if (!fs.existsSync(fullPath)) {
+      fs.mkdirSync(fullPath, { recursive: true });
     }
+    this._resolve(fullPath);
+    if (!fs.statSync(fullPath).isDirectory()) { throw new Error(`Not a directory: ${dirPath}`); }
   }
 
   fileExists(relativePath: string): boolean {
@@ -74,14 +111,16 @@ export class FileManager {
       };
     }
 
-    const content = fs.readFileSync(fullPath);
+    const file = this._readFile(normalizedPath);
+    if (!file) { throw new Error(`File changed while capturing snapshot: ${normalizedPath}`); }
+    const { content } = file;
     return {
       path: normalizedPath,
       exists: true,
       capturedAt: new Date().toISOString(),
       hash: createHash('sha256').update(content).digest('hex'),
-      size: stat.size,
-      mtimeMs: stat.mtimeMs,
+      size: file.stat.size,
+      mtimeMs: file.stat.mtimeMs,
     };
   }
 
@@ -95,6 +134,12 @@ export class FileManager {
 
     for (const change of changes) {
       const normalizedPath = change.path.replace(/\\/g, '/');
+      if (normalizedPath.endsWith('/')) {
+        // A directory-only scaffold entry (e.g. "src/") has no content to
+        // conflict with — re-"creating" a directory that already exists
+        // (routine across sprints of an iterative build) is always safe.
+        continue;
+      }
       const baseline = baselines?.get(normalizedPath);
       const current = this.getFileSnapshot(normalizedPath);
 
@@ -142,7 +187,7 @@ export class FileManager {
     ]);
     const scan = (dir: string) => {
       let entries: fs.Dirent[];
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+      try { entries = fs.readdirSync(this._resolve(dir), { withFileTypes: true }); }
       catch { return; }
 
       for (const entry of entries) {
@@ -300,25 +345,98 @@ export class FileManager {
    * Save a patch file to .agent-workspace/patches/ for auditing.
    */
   savePatch(patchId: string, preview: string): string {
-    const patchDir = path.join(this.workspaceRoot, '.agent-workspace', 'patches');
-    this.ensureDirectory(patchDir);
-    const patchFile = path.join(patchDir, `${patchId}.md`);
-    fs.writeFileSync(patchFile, preview, 'utf8');
-    return patchFile;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(patchId)) {
+      throw new Error('Patch ID must be a filename without path separators.');
+    }
+    const relativePath = path.join('.agent-workspace', 'patches', `${patchId}.md`);
+    this.writeWorkspaceFile(relativePath, preview);
+    return this._resolve(relativePath);
   }
 
   // ------------------------------------------------------------------
   // Private helpers
   // ------------------------------------------------------------------
 
+  private _isOutside(relative: string): boolean {
+    return relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+  }
+
   private _resolve(relativePath: string): string {
-    // Prevent path traversal outside workspace
-    const resolved = path.resolve(this.workspaceRoot, relativePath);
-    const relative = path.relative(this.workspaceRoot, resolved);
-    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    const normalized = relativePath.replace(/\\/g, '/');
+    let relative = path.relative(this.requestedRoot, path.resolve(this.requestedRoot, normalized));
+    // Helpers also accept absolute paths returned by this manager for an aliased root.
+    if (this._isOutside(relative) && path.isAbsolute(normalized)) {
+      relative = path.relative(this.workspaceRoot, path.resolve(normalized));
+    }
+    if (this._isOutside(relative)) {
       throw new Error(`Path traversal attempt: "${relativePath}" is outside the workspace.`);
     }
-    return resolved;
+
+    // Check the pinned root, or its nearest existing parent for a new workspace.
+    let ancestor = this.workspaceRoot;
+    for (;;) {
+      try { fs.lstatSync(ancestor); break; }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { throw err; }
+        const parent = path.dirname(ancestor);
+        if (parent === ancestor) { throw err; }
+        ancestor = parent;
+      }
+    }
+    if (fs.realpathSync(ancestor) !== ancestor) {
+      throw new Error(`Workspace root changed or contains a symlink: ${ancestor}`);
+    }
+    let current = this.workspaceRoot;
+    for (const segment of relative.split(path.sep).filter(Boolean)) {
+      current = path.join(current, segment);
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(current); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') { break; }
+        throw err;
+      }
+      if (stat.isSymbolicLink() || fs.realpathSync(current) !== current) {
+        throw new Error(`Workspace symlink paths are not allowed: "${relativePath}".`);
+      }
+    }
+    return path.join(this.workspaceRoot, relative);
+  }
+
+  private _validateDescriptor(relativePath: string, fd: number): fs.Stats {
+    const fullPath = this._resolve(relativePath);
+    const opened = fs.fstatSync(fd);
+    const current = fs.lstatSync(fullPath);
+    if (!opened.isFile() || !current.isFile() || opened.dev !== current.dev || opened.ino !== current.ino) {
+      throw new Error(`Workspace file changed or is not a regular file: ${relativePath}`);
+    }
+    return opened;
+  }
+
+  private _readFile(relativePath: string): { content: Buffer; stat: fs.Stats } | null {
+    const fullPath = this._resolve(relativePath);
+    if (!fs.existsSync(fullPath) || fs.statSync(fullPath).isDirectory()) { return null; }
+    const fd = fs.openSync(fullPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+      const stat = this._validateDescriptor(relativePath, fd);
+      return { content: fs.readFileSync(fd), stat };
+    } finally { fs.closeSync(fd); }
+  }
+
+  private _writeFile(relativePath: string, content: string | Uint8Array, append: boolean): void {
+    this.ensureDirectory(path.dirname(this._resolve(relativePath)));
+    const fullPath = this._resolve(relativePath);
+    // Never truncate at open: validate the opened inode and parents before writing.
+    // O_NOFOLLOW closes final-component symlink swaps. Portable Node does not offer
+    // openat-style directory-relative operations: a hostile concurrent parent rename
+    // can still race a syscall (including creation/unlink). This is not an OS sandbox.
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW |
+      fs.constants.O_NONBLOCK | (append ? fs.constants.O_APPEND : 0);
+    const fd = fs.openSync(fullPath, flags);
+    try {
+      this._validateDescriptor(relativePath, fd);
+      if (!append) { fs.ftruncateSync(fd, 0); }
+      fs.writeFileSync(fd, content, typeof content === 'string' ? 'utf8' : undefined);
+    } finally { fs.closeSync(fd); }
   }
 
   private _applyChange(change: FileChange): void {
@@ -332,18 +450,37 @@ export class FileManager {
     switch (change.action) {
       case 'create':
       case 'modify':
-        this.ensureDirectory(path.dirname(fullPath));
-        fs.writeFileSync(fullPath, content, 'utf8');
+        if (change.path.endsWith('/')) {
+          // A directory-only scaffold entry (e.g. "src/" from a project
+          // structure list) — a model has produced this as a literal file
+          // path before. Create the directory itself; writing it as an empty
+          // file would break every real file later written inside it
+          // (ENOTDIR) and can never be recovered without deleting the file.
+          if (content.trim() || change.patch) {
+            throw new Error('A directory entry cannot contain file content or a patch.');
+          }
+          if (fs.existsSync(fullPath)) {
+            const existing = fs.lstatSync(fullPath);
+            if (!existing.isDirectory()) {
+              // Recover the exact zero-byte placeholder from an earlier run;
+              // never discard meaningful file content or follow a symlink.
+              if (!existing.isFile() || existing.size !== 0) {
+                throw new Error('Cannot replace a non-empty file or symlink with a directory.');
+              }
+              fs.unlinkSync(fullPath);
+            }
+          }
+          this.ensureDirectory(fullPath);
+          break;
+        }
+        this.writeWorkspaceFile(change.path, content);
         break;
       case 'append':
-        this.ensureDirectory(path.dirname(fullPath));
-        fs.appendFileSync(fullPath, content, 'utf8');
+        this.appendWorkspaceFile(change.path, content);
         break;
       case 'delete':
         // Note: delete requires explicit user approval (enforced upstream)
-        if (fs.existsSync(fullPath)) {
-          fs.unlinkSync(fullPath);
-        }
+        this.deleteWorkspaceFile(change.path);
         break;
     }
   }
@@ -360,9 +497,7 @@ export class FileManager {
 
   private _readExistingChangeTarget(relativePath: string): string | null {
     try {
-      const fullPath = this._resolve(relativePath);
-      if (!fs.existsSync(fullPath) || !fs.statSync(fullPath).isFile()) { return null; }
-      return fs.readFileSync(fullPath, 'utf8');
+      return this._readFile(relativePath)?.content.toString('utf8') ?? null;
     } catch {
       return null;
     }

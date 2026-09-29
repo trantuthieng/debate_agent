@@ -1,0 +1,55 @@
+# Chatbot + Tailscale sidecar. Pattern verified against Tailscale's own
+# Docker guide (https://tailscale.com/blog/docker-tailscale-guide):
+# the app container shares the tailscale container's network namespace
+# (network_mode: service:ts-chatbot), so `tailscale serve` can proxy
+# straight to it over 127.0.0.1 and hand out a real HTTPS cert for your
+# tailnet — no port needs to be exposed to the public internet.
+#
+# Setup:
+#   1. Generate a Tailscale auth key: https://login.tailscale.com/admin/settings/keys
+#   2. cp .env.example .env   and put the key in TS_AUTHKEY=...
+#   3. docker compose up -d
+#   4. docker compose logs ts-chatbot   -> find the assigned tailnet hostname
+#   5. Open https://<hostname>.<your-tailnet>.ts.net on your phone (Tailscale app installed)
+services:
+  ts-chatbot:
+    image: tailscale/tailscale:latest
+    hostname: debate-chatbot
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_EXTRA_ARGS=--advertise-tags=tag:container
+      - TS_SERVE_CONFIG=/config/serve.json
+      - TS_STATE_DIR=/var/lib/tailscale
+    volumes:
+      - ts-state:/var/lib/tailscale
+      - ./tailscale/config:/config
+    ports:
+      # Convenience only: curl/browse from the Mac mini itself without Tailscale.
+      - "127.0.0.1:8787:8787"
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    cap_add:
+      - net_admin
+      - sys_module
+    restart: unless-stopped
+
+  chatbot:
+    build: .
+    network_mode: service:ts-chatbot
+    depends_on:
+      - ts-chatbot
+    environment:
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - PORT=8787
+      - CHAT_DATA_DIR=/data
+    extra_hosts:
+      # Docker Desktop for Mac already provides this; harmless to repeat,
+      # and required if you ever run this on a Linux Docker host instead.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - chat-data:/data
+    restart: unless-stopped
+
+volumes:
+  ts-state:
+  chat-data:

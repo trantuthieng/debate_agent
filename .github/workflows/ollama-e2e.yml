@@ -1,0 +1,30 @@
+name: Real Ollama E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 18 * * *'
+
+jobs:
+  autonomous-e2e:
+    runs-on: [self-hosted, macOS, ollama]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - name: Require five installed local models
+        run: test "$(ollama list | tail -n +2 | awk '{print $1}' | sort -u | wc -l | tr -d ' ')" -ge 5
+      - run: npm run test:e2e:ollama
+      - name: Upload benchmark and failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-e2e-benchmark
+          path: |
+            dist/benchmarks/ollama-e2e-latest.json
+          if-no-files-found: warn

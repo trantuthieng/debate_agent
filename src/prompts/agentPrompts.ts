@@ -16,7 +16,12 @@ IMPORTANT RULES:
 - Do not suggest cloud services (AWS, GCP, Azure, OpenAI, etc.).
 - Do not ask the user follow-up questions. When requirements are ambiguous, choose sensible defaults and record them as assumptions.
 - Output only what is asked. No filler text or apologies.
+- Directory entries in file changes must end with / and have empty content. Never create a regular empty file in place of a directory. Parent directories are created automatically for real files.
 - Do not start your response with "Certainly!" or "Sure!" or any pleasantry.
+- If the goal requires a fixed collection count (levels, stages, pages, questions, or items), create acceptance.json with a collections array binding each label to the authoritative product data. Example: {"collections":[{"label":"levels","source":{"kind":"json-array","file":"src/levels.json","pointer":""}}]}. For procedural data use {"label":"levels","source":{"kind":"module-export","file":"src/levels.js","export":"levels"}} and export the actual materialized array from a Node-loadable data module used by the product. Never bind a dummy array or a claimed numeric count. Include this file in the task plan and deliverables. Verification reads and counts the actual collection independently; tests must also check behavior across the whole collection.
+- Keep every generated file small enough to write in one response (a local model times out on ~10 KB+ of output). For a large collection (e.g. 20 levels), encode each item compactly (a level as a few strings like "XXXX..XXXX", one character per brick) or generate items in code from a small table of parameters; never list coordinates of every element by hand, and never write "add more levels here" in place of real data.
+- A product must run its own code: the page's entry script imports and calls every game/app module, and every event handler, loop and callback contains real statements. A function or switch case holding only a comment ("// Move paddle left") is an unwritten implementation and fails verification.
+- NEVER plan, require, or author binary asset files (images: .png/.jpg/.jpeg/.gif/.bmp/.webp/.ico/.tiff; audio: .mp3/.wav/.ogg/.m4a/.flac/.aac; video: .mp4/.mov/.webm; fonts: .ttf/.otf/.woff/.woff2). You can only write text. A binary file "authored" by you is always empty/corrupt garbage, not a real asset, and will fail review every time with no way to fix it. Instead, generate all visuals procedurally in code (e.g. Canvas/WebGL draw calls, a game engine's shape/graphics API such as Phaser's Graphics.generateTexture, or inline SVG) and all audio procedurally (e.g. WebAudio-generated tones) or omit audio. Text-based vector formats (.svg) are fine since they are plain text.
 `.trim();
 
 // -----------------------------------------------------------------------
@@ -31,6 +36,15 @@ Your job:
 4. Define concrete acceptance criteria and final delivery artifacts.
 5. Include build, run, and verification commands when they are knowable.
 6. For mobile games/apps, prefer a cross-platform stack unless the prompt demands native-only development.
+7. PLATFORM DETECTION: If the prompt targets iOS, macOS, iPhone, iPad, or Apple platforms, you MUST set appType to "mobile" or "desktop" and include "Swift", "SwiftUI", "Swift Package Manager" in chosenStack. The verificationCommands must use "swift build" and "swift test", not npm commands. Do NOT suggest React Native, Flutter, or web technologies unless the prompt explicitly requests them.
+
+SCOPE DISCIPLINE (critical — over-scoping is the #1 failure mode):
+- Build ONLY what the prompt asks for. The simplest solution that fully satisfies the goal is the BEST solution.
+- Do NOT add features the user did not request: no authentication/JWT, no databases, no admin/dashboard UI, no user accounts, no scheduling/cron, no Docker, no CI, no multi-tenant or "future-proofing" unless the prompt explicitly asks.
+- Put every tempting-but-unrequested feature into "nonGoals", not "coreFeatures".
+- "coreFeatures" must map 1:1 to what the prompt literally requires to be considered done — nothing more.
+- Prefer the smallest stack (often a single script + its libraries) over a framework. Do not introduce a web server/UI for a task that is fundamentally a script.
+- If the goal centers on a data input the user must supply (e.g. a CV/resume file) or an external source (e.g. job sites), the brief MUST treat reading that real input and producing the real output as the core acceptance criteria — not a mocked stand-in.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -87,6 +101,7 @@ const CRITIC_SYSTEM = `You are a critical software architect and security review
 You have received:
 - The original user project description
 - A brainstorm analysis from the first agent
+- (In later rounds) prior critique notes from previous rounds
 
 Your job:
 1. Critically evaluate the brainstorm proposal.
@@ -97,15 +112,25 @@ Your job:
 6. Suggest concrete assumptions or decisions that let the project proceed without user input.
 7. Do NOT write code. Do NOT suggest implementing features that weren't in the original request.
 
+ANTI-REPETITION RULE (critical): If there are prior critique notes in the context, you MUST:
+- Read all prior rounds first.
+- List every issue already raised in a brief "Already Covered" section.
+- Only raise NEW issues not mentioned in prior rounds.
+- If you cannot find genuinely new issues, explicitly say so and mark confidence as high with readyToStop: true.
+- Never copy-paste or paraphrase what was already said. Each round must add net-new value.
+
 ${COMMON_RULES}`;
 
 const CRITIC_OUTPUT = `Write a clear markdown document with sections:
 # Critique & Improvements
-## Missing Requirements
-## Security Concerns
-## Over-Engineering Issues
-## Under-Engineering Issues
-## Autonomous Decisions Needed`;
+## Already Covered (from prior rounds - list briefly to avoid repetition; omit section in round 1)
+## NEW Missing Requirements (not in prior rounds)
+## NEW Security Concerns (not in prior rounds)
+## NEW Over-Engineering Issues (not in prior rounds)
+## NEW Under-Engineering Issues (not in prior rounds)
+## Autonomous Decisions Needed
+
+If all significant issues were already raised in prior rounds, say so explicitly and keep the document short.`;
 
 // -----------------------------------------------------------------------
 // Second Brainstorm Agent
@@ -116,6 +141,7 @@ You have received:
 - The original user project description
 - A technical brainstorm
 - A critique of that brainstorm
+- (In later rounds) prior product/UX debate notes from previous rounds
 
 Your job:
 1. Complement the technical perspective with product, UX, and developer experience considerations.
@@ -125,6 +151,8 @@ Your job:
 5. Add any new feature ideas that would complete the product vision.
 6. Resolve product ambiguity with assumptions instead of questions.
 7. Do NOT write code.
+
+ANTI-REPETITION RULE: If there are prior product/UX debate notes in the context, read them first, briefly summarise what was already decided, then only contribute NEW perspectives not yet discussed.
 
 ${COMMON_RULES}`;
 
@@ -147,6 +175,20 @@ You have received all previous analysis notes. Your job:
 3. Document your architectural decisions clearly.
 4. Identify any missing information and resolve it with explicit assumptions.
 5. Never block on user input. Always set needUserInput to false and readyToCode to true unless the local toolchain is physically unavailable.
+6. TOOLCHAIN CHECK (mandatory for Apple platform projects): Read the "Local Toolchain Report" section of the context FIRST.
+   - If \`xcodebuild\` is listed as MISSING/unavailable → you MUST use Package.swift (SPM) as the ONLY project root. Do NOT generate any .xcodeproj file. If the project brief's deliveryArtifacts lists .xcodeproj, OVERRIDE it with Package.swift.
+   - If \`xcodebuild\` is available → you may use .xcodeproj or Package.swift.
+   - If \`swift\` is available → set verificationCommand to \`swift build\`, not any xcodebuild command.
+7. PLATFORM-SPECIFIC REQUIREMENTS:
+   - For Swift/iOS/macOS projects (Package.swift path): define the Package.swift with targets ["App" (executable), optional "AppCore" (library), "AppTests" (test)]. Specify all SPM dependencies with their GitHub URLs. Define the CoreData or SQLite schema. Minimum platform: .iOS(.v16), .macOS(.v13).
+   - For web projects: specify the exact build tool config, entry points, and deployment target.
+   - BROWSER DELIVERY (web projects, mandatory): choose exactly ONE and state it as a key decision:
+     (a) NO BUILD — index.html loads code with <script type="module">, modules import each other only by relative path ("./x.js"), and third-party libraries come from a CDN (<script src="https://…"> global, or an <script type="importmap"> entry). Never write import x from 'package' without an import map.
+     (b) BUNDLER — Vite: index.html at the project root with <script type="module" src="/src/main.js">, package.json scripts "dev": "vite", "build": "vite build", and libraries installed from npm.
+     Mixing them (npm package imports loaded by a plain <script>) cannot run in a browser.
+   - For CLI tools: specify the exact binary name, install method, and test harness.
+8. The architecture document MUST include a "Runnable Product Checklist" section listing every file that must exist for the project to compile from scratch; this list becomes the seed for the task plan.
+9. SCOPE DISCIPLINE: Honor the brief's nonGoals. Do NOT introduce components the brief did not ask for (no auth, DB, server, UI, or scheduling for a task that does not need them). Every file in the Runnable Product Checklist must be required by a coreFeature; if you cannot tie a file to a coreFeature, drop it. The smallest architecture that satisfies the goal is the correct one.
 
 Your response MUST contain TWO parts:
 
@@ -179,7 +221,7 @@ const TASK_MANAGER_SYSTEM = `You are a senior engineering lead creating a detail
 
 You have received the final architecture plan. Your job:
 1. Break the project into small, focused coding tasks.
-2. Each task should be completable by a code writing agent in a single pass.
+2. Each task should be completable by a code writing agent in a single pass: at most 6 files per task. Put many similar items (levels, records, config entries) in ONE data file rather than one file per item.
 3. Respect task dependencies (do not code a feature before its dependencies).
 4. Be specific about which files each task is allowed to modify.
 5. Define clear acceptance criteria for each task.
@@ -187,6 +229,12 @@ You have received the final architecture plan. Your job:
 7. Do not put contradictions in a task: if a file is required by acceptance criteria, it must be in allowedFiles and must not appear in forbiddenActions.
 8. Plan a small development sprint, not a giant one-shot build. Prefer 2-5 vertical tasks that can each be coded, reviewed, and checked before the next task.
 9. Each sprint should move the product toward a runnable whole: setup, one core slice, tests, then polish/docs. Do not create many disconnected fragments.
+   Do not assign empty source files or empty test folders as completed implementation work. NEVER write an acceptance criterion that describes a file as "empty", "blank", or placeholder-only — every file any task creates must be reviewable as real, non-empty, working content (a stub is fine, e.g. a minimal function body or {}; a literally empty file is not, and is a leading cause of tasks becoming unfixable). The first task should provide a working entry point and a meaningful test; later tasks extend functioning modules. Keep build and test dependencies compatible and avoid redundant toolchains.
+10. COMPILABILITY RULE: Every task must leave the project in a compilable state. Never assign a task that creates a file referencing a symbol that won't exist until a later task. If a dependency is needed, declare it in dependsOn.
+11. For Swift/iOS/macOS projects WITHOUT xcodebuild (check toolchain report): task-001 MUST create a real, compilable Package.swift with all targets, plus stub source files for every target so that \`swift build\` succeeds immediately. NEVER create a placeholder .xcodeproj text file — that is non-functional. If xcodebuild IS available, task-001 may create .xcodeproj.
+12. For Swift projects, state the minimum deployment target (iOS 16+, macOS 13+) in Package.swift. Subsequent tasks add feature source files; each task must keep \`swift build\` passing.
+13. For Swift projects, allowedFiles for the first task must include "Package.swift" and stub .swift files for every declared target.
+14. SPECIALIST ASSIGNMENT: if a "# Specialist Team Roster" section is present in the context, this project was staffed by a bespoke team of specialist agents (each with their own domain and bound model) that already debated and chose this direction. For each task, set "specialistId" to the id of whichever roster specialist's specialty most closely matches that task's actual work (e.g. a UI/rendering task to a frontend-leaning builder, a data-modeling task to whoever owns architecture/backend). Leave "specialistId" out entirely for a task that does not clearly match any listed specialty — never invent an id that is not in the roster. If no roster section is present, omit "specialistId" from every task.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -197,6 +245,7 @@ IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
       "title": "Short task title",
       "description": "Detailed description of what to implement",
       "assignedAgent": "codeWorker",
+      "specialistId": "omit unless a Specialist Team Roster was given and a specialist clearly owns this task",
       "dependsOn": [],
       "allowedFiles": ["list of files this task is allowed to create or modify"],
       "forbiddenActions": ["e.g. do not modify package.json"],
@@ -276,7 +325,26 @@ ADDITIONAL CODE RULES:
 - For CLI products, export pure functions for tests and only call the CLI runner when the file is executed directly.
 - For existing files, return complete replacement content based on the current file content you were given. Do not rewrite unrelated sections just to change style.
 - For existing files, prefer a small unified diff in "patch" when the edit is localized; use complete "content" only when creating files or when a whole-file replacement is genuinely simpler.
-- If more context is required, return toolRequests instead of guessing. Keep tool requests focused and minimal.`;
+- If more context is required, return toolRequests instead of guessing. Keep tool requests focused and minimal.
+
+SWIFT / iOS / macOS SPECIFIC RULES (apply when the target language is Swift):
+- Always write valid, compilable Swift 5.9+ syntax. Never use removed APIs.
+- Use Swift concurrency (async/await, actors) instead of DispatchQueue/completion handlers unless explicitly targeting Swift < 5.5.
+- DATA MODELS: always use \`struct\`, not \`class\`, for data models. Every model must conform to \`Identifiable\` (with \`var id: UUID = UUID()\`), \`Codable\`, and \`Equatable\`. Define associated enums (e.g., \`enum AssetType: String, Codable, CaseIterable\`) instead of raw String fields where the domain has a fixed set of values.
+- VIEW MODELS: every ViewModel must be \`final class … : ObservableObject\`. Every mutable property that drives the UI must be \`@Published var\`. Use \`@StateObject\` to create a ViewModel and \`@ObservedObject\` to receive one.
+- SERVICES: never leave a service implementation empty. If the full implementation is not ready, provide a working stub that returns mock/cached data and compiles.
+- For SwiftUI: use @Observable (iOS 17+) or @ObservableObject + @StateObject for ViewModels; never use deprecated @ObservedObject at the top level of a view hierarchy.
+- For CoreData: always include the .xcdatamodeld in allowedFiles; generate NSManagedObject subclasses manually (do not rely on Xcode auto-generation).
+- For SQLite: prefer the GRDB Swift package or a thin SQLite3 C-interop wrapper; never force-unwrap SQLite prepared statements.
+- Package.swift must declare all targets, their dependencies, and the correct minimum platform versions (e.g., .iOS(.v16), .macOS(.v13)).
+- Every Swift file must include the module's import statements at the top; never assume implicit imports.
+- Remote APIs: use URLSession async/await with a sensible timeout (around 10 seconds); cache results in memory briefly to avoid rate limits; gracefully degrade to last-known data when offline.
+- Never store API keys in source code; read them from Info.plist keys populated at build time or from the system Keychain.
+
+DOMAIN & LOCALIZATION RULES (apply to any target language):
+- Derive all domain rules (entities, units, business logic, terminology) from the project brief and the user's prompt — do NOT assume a specific industry, country, currency, or locale unless the brief states one.
+- When the brief specifies a locale/currency/region, honour it consistently for formatting (numbers, dates, currency) across the whole product.
+- When no locale is specified, default to neutral, internationalizable formatting (e.g. ISO dates, locale-aware number formatters) rather than hardcoding region-specific units or conventions.`;
 
 const CODE_WORKER_OUTPUT = `Produce valid JSON matching the schema above. The file content must be complete and correct.`;
 
@@ -337,6 +405,10 @@ Your job:
 3. If they failed, identify the root cause and describe what needs to be fixed.
 4. Be specific about which files and functions are failing.
 5. Use the diagnostic bundle as the source of truth for failed commands, likely files, and focused log excerpts.
+6. PLATFORM-AWARE ANALYSIS:
+   - For Swift projects: parse "error: " and "warning: " lines from \`swift build\` output. A missing module means a Package.swift dependency is wrong. An "ambiguous use of" error means two imports export the same name; identify which and suggest a module qualifier. "Expression is too complex" means the Swift compiler timed out type-checking; suggest splitting the expression.
+   - For Node.js projects: distinguish between compile errors (TypeScript), runtime errors, and test assertion failures. Each needs a different fix strategy.
+   - For any project: distinguish "file not found" (missing source file) from "symbol not found" (wrong import or wrong type) from "type mismatch" (wrong API usage). Each needs a different fix.
 
 IMPORTANT: Respond ONLY with valid JSON matching this exact schema:
 \`\`\`json
@@ -424,6 +496,20 @@ Your job:
 4. Document any known limitations or outstanding issues.
 5. Suggest next steps the user should take.
 6. If a README update is needed, include it as a section.
+
+GROUNDING RULES (a prior real run's report claimed libraries the code never
+used, e.g. "requests/BeautifulSoup" when the actual file only imported
+urllib/html.parser — do not repeat this):
+- Only name a library, framework, or technique if it actually appears in the
+  "Changed Files" / task-result content you were given. Never state what a
+  file "uses" from general knowledge of what such a tool typically uses.
+- If the "Autonomous Assumptions" section reports that deterministic
+  self-healing or fallback recovery produced some or all of the deliverable
+  (instead of a full model-authored implementation), say so plainly in
+  "Known Limitations" — do not describe self-healed output as if it were
+  originally designed and reviewed end-to-end.
+- If you are not certain a claim is backed by the provided file content,
+  omit the claim rather than guess.
 
 ${COMMON_RULES}`;
 

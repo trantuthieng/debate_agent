@@ -54,17 +54,8 @@ export function getWebviewContent(nonce: string): string {
       padding: 2px 0 4px;
     }
 
-    .brand {
-      min-width: 0;
-    }
-
-    .brand-title {
-      margin: 0;
-      font-size: 1.05em;
-      font-weight: 650;
-      letter-spacing: 0;
-    }
-
+    .brand { min-width: 0; }
+    .brand-title { margin: 0; font-size: 1.05em; font-weight: 650; }
     .brand-subtitle {
       margin-top: 2px;
       color: var(--muted);
@@ -83,7 +74,6 @@ export function getWebviewContent(nonce: string): string {
       font-weight: 650;
       text-transform: uppercase;
     }
-
     .status-idle, .status-stopped { color: var(--muted); }
     .status-running { color: var(--info); border-color: color-mix(in srgb, var(--info) 55%, var(--border)); }
     .status-waiting { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
@@ -96,7 +86,6 @@ export function getWebviewContent(nonce: string): string {
       border-radius: 6px;
       overflow: hidden;
     }
-
     .panel-header {
       display: flex;
       align-items: center;
@@ -107,17 +96,8 @@ export function getWebviewContent(nonce: string): string {
       cursor: pointer;
       user-select: none;
     }
-
-    .panel-title {
-      margin: 0;
-      font-size: 0.92em;
-      font-weight: 650;
-    }
-
-    .panel-body {
-      padding: 9px;
-    }
-
+    .panel-title { margin: 0; font-size: 0.92em; font-weight: 650; }
+    .panel-body { padding: 9px; }
     .panel-body.collapsed { display: none; }
     .chevron { color: var(--muted); transition: transform 0.15s ease; }
     .collapsed .chevron { transform: rotate(-90deg); }
@@ -125,7 +105,7 @@ export function getWebviewContent(nonce: string): string {
     textarea {
       display: block;
       width: 100%;
-      min-height: 82px;
+      min-height: 72px;
       resize: vertical;
       color: var(--vscode-input-foreground);
       background: var(--vscode-input-background);
@@ -133,12 +113,7 @@ export function getWebviewContent(nonce: string): string {
       border-radius: 4px;
       padding: 7px 8px;
     }
-
-    textarea:focus, input:focus {
-      outline: 1px solid var(--accent);
-      border-color: var(--accent);
-    }
-
+    textarea:focus, input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
     input[type="text"] {
       width: 100%;
       color: var(--vscode-input-foreground);
@@ -148,13 +123,7 @@ export function getWebviewContent(nonce: string): string {
       padding: 6px 8px;
     }
 
-    .button-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 8px;
-    }
-
+    .button-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
     button {
       min-height: 28px;
       border: 1px solid transparent;
@@ -164,67 +133,28 @@ export function getWebviewContent(nonce: string): string {
       background: var(--vscode-button-background);
       cursor: pointer;
     }
-
     button:hover { background: var(--vscode-button-hoverBackground); }
     button:disabled { opacity: 0.55; cursor: not-allowed; }
-
-    button.secondary {
-      color: var(--vscode-button-secondaryForeground);
-      background: var(--vscode-button-secondaryBackground);
-    }
-
+    button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
     button.secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
-
     button.danger {
       color: var(--vscode-inputValidation-errorForeground, #fff);
       background: var(--vscode-inputValidation-errorBackground, #4b1d1d);
       border-color: var(--vscode-inputValidation-errorBorder, #8b3434);
     }
-
-    .current {
-      display: grid;
-      gap: 8px;
+    button.link {
+      background: none;
+      border: none;
+      color: var(--accent);
+      padding: 0;
+      min-height: auto;
+      font-size: 0.85em;
     }
 
-    .current-kicker {
-      color: var(--muted);
-      font-size: 0.78em;
-      text-transform: uppercase;
-      letter-spacing: 0;
-    }
+    .meter { height: 5px; border-radius: 999px; overflow: hidden; background: var(--panel-soft); border: 1px solid var(--border); }
+    .meter-fill { width: 0%; height: 100%; background: var(--accent); transition: width 0.2s ease; }
 
-    .current-title {
-      margin: 0;
-      font-size: 1.04em;
-      font-weight: 700;
-    }
-
-    .current-detail {
-      color: var(--muted);
-      font-size: 0.9em;
-    }
-
-    .meter {
-      height: 6px;
-      border-radius: 999px;
-      overflow: hidden;
-      background: var(--panel-soft);
-      border: 1px solid var(--border);
-    }
-
-    .meter-fill {
-      width: 0%;
-      height: 100%;
-      background: var(--accent);
-      transition: width 0.2s ease;
-    }
-
-    .chip-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-    }
-
+    .chip-row { display: flex; flex-wrap: wrap; gap: 5px; }
     .chip {
       border: 1px solid var(--border);
       border-radius: 999px;
@@ -238,169 +168,97 @@ export function getWebviewContent(nonce: string): string {
       white-space: nowrap;
     }
 
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 6px;
-    }
+    .stats-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+    .stat { min-width: 0; border: 1px solid var(--border); border-radius: 5px; padding: 7px; background: var(--panel); }
+    .stat-value { font-size: 1.1em; font-weight: 700; }
+    .stat-label { color: var(--muted); font-size: 0.75em; margin-top: 1px; }
 
-    .stat {
-      min-width: 0;
-      border: 1px solid var(--border);
-      border-radius: 5px;
-      padding: 7px;
-      background: var(--panel);
-    }
+    /* ---- Chain of thought: one unified, ordered reasoning/task trace ---- */
+    .chain-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; }
 
-    .stat-value {
-      font-size: 1.1em;
-      font-weight: 700;
-    }
-
-    .stat-label {
-      color: var(--muted);
-      font-size: 0.75em;
-      margin-top: 1px;
-    }
-
-    .pipeline-list, .task-list, .activity-list { list-style: none; padding: 0; margin: 0; }
-
-    .pipeline-item {
+    .chain-step {
       position: relative;
-      display: grid;
-      grid-template-columns: 16px 1fr auto;
-      gap: 7px;
-      align-items: start;
-      padding: 6px 0;
-      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+      padding: 0 0 12px 22px;
+      border-left: 2px solid var(--border);
+      margin-left: 7px;
     }
+    .chain-step:last-child { border-left-color: transparent; padding-bottom: 0; }
 
-    .pipeline-item:last-child { border-bottom: 0; }
-
-    .dot {
-      width: 10px;
-      height: 10px;
-      margin-top: 4px;
+    .chain-dot {
+      position: absolute;
+      left: -8px;
+      top: 1px;
+      width: 14px;
+      height: 14px;
       border-radius: 50%;
-      border: 1px solid var(--border);
+      border: 2px solid var(--panel);
       background: var(--panel-soft);
-    }
-
-    .dot-running { background: var(--info); box-shadow: 0 0 0 3px color-mix(in srgb, var(--info) 16%, transparent); }
-    .dot-completed { background: var(--success); }
-    .dot-failed { background: var(--danger); }
-    .dot-skipped { background: var(--muted); opacity: 0.7; }
-
-    .pipeline-label {
-      font-weight: 600;
-      font-size: 0.9em;
-    }
-
-    .pipeline-meta {
-      color: var(--muted);
-      font-size: 0.78em;
-      margin-top: 1px;
-    }
-
-    .status-text {
-      color: var(--muted);
-      font-size: 0.75em;
-      text-transform: uppercase;
-      white-space: nowrap;
-    }
-
-    .debate-grid {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 8px;
-    }
-
-    .debate-lane {
-      border: 1px solid var(--border);
-      border-radius: 5px;
-      padding: 8px;
-      background: var(--panel-soft);
-    }
-
-    .lane-head {
       display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 8px;
+      color: #fff;
+    }
+    .chain-dot.dot-running { background: var(--info); animation: chainPulse 1.3s ease-in-out infinite; }
+    .chain-dot.dot-completed { background: var(--success); }
+    .chain-dot.dot-completed::before { content: "\\2713"; }
+    .chain-dot.dot-failed { background: var(--danger); }
+    .chain-dot.dot-failed::before { content: "\\2715"; }
+    .chain-dot.dot-skipped { background: var(--muted); opacity: 0.65; }
+    @keyframes chainPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+
+    .chain-step-head {
+      display: flex;
+      align-items: baseline;
       justify-content: space-between;
       gap: 8px;
-      align-items: baseline;
-      margin-bottom: 5px;
+      cursor: pointer;
+      user-select: none;
     }
+    .chain-step-label { font-weight: 650; font-size: 0.92em; }
+    .chain-step[data-status="completed"] .chain-step-label,
+    .chain-step[data-status="skipped"] .chain-step-label { color: var(--muted); font-weight: 600; }
+    .chain-step-status { color: var(--muted); font-size: 0.75em; text-transform: uppercase; flex-shrink: 0; }
 
-    .lane-title { font-weight: 650; }
-    .lane-round { color: var(--muted); font-size: 0.78em; }
-    .lane-detail { color: var(--muted); font-size: 0.86em; }
+    .chain-step-detail { color: var(--muted); font-size: 0.85em; margin-top: 2px; }
 
-    .task-item {
-      display: grid;
-      grid-template-columns: 16px 1fr;
-      gap: 7px;
-      padding: 6px 0;
-      border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
-    }
-
-    .task-item:last-child { border-bottom: 0; }
-
-    .task-title {
-      font-weight: 600;
-      font-size: 0.9em;
-    }
-
-    .task-detail {
-      color: var(--muted);
-      font-size: 0.78em;
-      margin-top: 1px;
-    }
-
-    .activity-list {
+    .chain-sub-list {
+      list-style: none;
+      margin: 7px 0 0;
+      padding: 0;
       display: flex;
       flex-direction: column;
       gap: 6px;
-      max-height: 260px;
-      overflow-y: auto;
     }
+    .chain-step.collapsed .chain-sub-list { display: none; }
 
-    .activity-item {
+    .chain-sub-item {
       border: 1px solid var(--border);
       border-left-width: 3px;
       border-radius: 5px;
-      padding: 7px;
-      background: var(--panel);
+      padding: 6px 8px;
+      background: var(--panel-soft);
+      font-size: 0.85em;
     }
+    .chain-sub-item.sub-running { border-left-color: var(--info); }
+    .chain-sub-item.sub-completed { border-left-color: var(--success); }
+    .chain-sub-item.sub-failed { border-left-color: var(--danger); }
+    .chain-sub-item.sub-warn { border-left-color: var(--warn); }
+    .chain-sub-item.sub-info, .chain-sub-item.sub-skipped { border-left-color: var(--muted); }
+    .chain-sub-title { font-weight: 600; }
+    .chain-sub-body { color: var(--muted); margin-top: 1px; word-break: break-word; }
+    .chain-sub-meta { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
 
-    .activity-running { border-left-color: var(--info); }
-    .activity-completed { border-left-color: var(--success); }
-    .activity-failed { border-left-color: var(--danger); }
-    .activity-warn { border-left-color: var(--warn); }
-    .activity-info, .activity-skipped { border-left-color: var(--muted); }
+    .chain-task-mini { display: flex; align-items: center; gap: 6px; font-size: 0.85em; padding: 2px 0; }
+    .chain-task-mini .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--panel-soft); border: 1px solid var(--border); }
+    .chain-task-mini .dot-running { background: var(--info); }
+    .chain-task-mini .dot-completed { background: var(--success); }
+    .chain-task-mini .dot-failed { background: var(--danger); }
+    .chain-task-mini .dot-skipped { background: var(--muted); }
+    .chain-task-mini .task-mini-label { color: var(--text); }
+    .chain-task-mini.task-done .task-mini-label { color: var(--muted); }
 
-    .activity-title {
-      font-weight: 650;
-      font-size: 0.88em;
-      margin-bottom: 2px;
-    }
-
-    .activity-detail {
-      color: var(--muted);
-      font-size: 0.8em;
-      word-break: break-word;
-    }
-
-    .activity-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 4px;
-      margin-top: 6px;
-    }
-
-    .empty {
-      color: var(--muted);
-      font-size: 0.86em;
-      padding: 6px 0;
-    }
+    .empty { color: var(--muted); font-size: 0.86em; padding: 6px 0; }
 
     .log-container {
       max-height: 180px;
@@ -412,7 +270,6 @@ export function getWebviewContent(nonce: string): string {
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 0.8em;
     }
-
     .log-line { margin: 1px 0; white-space: pre-wrap; word-break: break-word; }
     .log-info { color: var(--vscode-terminal-foreground, #ccc); }
     .log-warn { color: var(--warn); }
@@ -425,7 +282,6 @@ export function getWebviewContent(nonce: string): string {
       margin-bottom: 8px;
       background: var(--panel-soft);
     }
-
     .patch-preview, .report-content {
       max-height: 260px;
       overflow-y: auto;
@@ -445,8 +301,7 @@ export function getWebviewContent(nonce: string): string {
 
     @media (max-width: 260px) {
       .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .pipeline-item { grid-template-columns: 14px 1fr; }
-      .status-text { display: none; }
+      .chain-step-status { display: none; }
     }
   </style>
 </head>
@@ -475,64 +330,13 @@ export function getWebviewContent(nonce: string): string {
       </div>
     </section>
 
-    <section class="panel" id="sec-current">
-      <div class="panel-header" data-section="sec-current">
-        <h2 class="panel-title">Current Work</h2>
-        <span class="chevron">v</span>
-      </div>
-      <div class="panel-body" id="sec-current-body">
-        <div class="current">
-          <div class="current-kicker" id="current-kicker">Idle</div>
-          <h2 class="current-title" id="current-title">Waiting for a prompt</h2>
-          <div class="current-detail" id="current-detail">The next run will show each model phase, debate round, task, and verification step here.</div>
-          <div class="meter"><div class="meter-fill" id="progress-fill"></div></div>
-          <div class="chip-row" id="current-chips"></div>
-        </div>
-      </div>
-    </section>
-
     <section class="stats-grid" aria-label="Workflow stats">
       <div class="stat"><div class="stat-value" id="stat-progress">0%</div><div class="stat-label">Progress</div></div>
       <div class="stat"><div class="stat-value" id="stat-active">0</div><div class="stat-label">Active</div></div>
       <div class="stat"><div class="stat-value" id="stat-done">0</div><div class="stat-label">Done</div></div>
       <div class="stat"><div class="stat-value" id="stat-failed">0</div><div class="stat-label">Failed</div></div>
     </section>
-
-    <section class="panel" id="sec-pipeline">
-      <div class="panel-header" data-section="sec-pipeline">
-        <h2 class="panel-title">Pipeline</h2>
-        <span class="chevron">v</span>
-      </div>
-      <div class="panel-body" id="sec-pipeline-body">
-        <ul class="pipeline-list" id="timeline-list">
-          <li class="empty">Waiting to start.</li>
-        </ul>
-      </div>
-    </section>
-
-    <section class="panel" id="sec-debate">
-      <div class="panel-header" data-section="sec-debate">
-        <h2 class="panel-title">Debate Board</h2>
-        <span class="chevron">v</span>
-      </div>
-      <div class="panel-body" id="sec-debate-body">
-        <div class="debate-grid" id="debate-board">
-          <div class="empty">Debate rounds will appear after the brainstorm phase starts.</div>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel" id="sec-tasks">
-      <div class="panel-header" data-section="sec-tasks">
-        <h2 class="panel-title">Tasks</h2>
-        <span class="chevron">v</span>
-      </div>
-      <div class="panel-body" id="sec-tasks-body">
-        <ul class="task-list" id="task-list">
-          <li class="empty">No tasks yet.</li>
-        </ul>
-      </div>
-    </section>
+    <div class="meter"><div class="meter-fill" id="progress-fill"></div></div>
 
     <section class="panel hidden" id="sec-questions">
       <div class="panel-header" data-section="sec-questions">
@@ -564,15 +368,15 @@ export function getWebviewContent(nonce: string): string {
       </div>
     </section>
 
-    <section class="panel" id="sec-activity">
-      <div class="panel-header" data-section="sec-activity">
-        <h2 class="panel-title">Activity Feed</h2>
+    <section class="panel" id="sec-chain">
+      <div class="panel-header" data-section="sec-chain">
+        <h2 class="panel-title">Reasoning &amp; Tasks</h2>
         <span class="chevron">v</span>
       </div>
-      <div class="panel-body" id="sec-activity-body">
-        <div class="activity-list" id="activity-list">
-          <div class="empty">No model activity yet.</div>
-        </div>
+      <div class="panel-body" id="sec-chain-body">
+        <ol class="chain-list" id="chain-list">
+          <li class="empty">Waiting to start.</li>
+        </ol>
       </div>
     </section>
 
@@ -581,7 +385,7 @@ export function getWebviewContent(nonce: string): string {
         <h2 class="panel-title">Logs</h2>
         <span class="chevron">v</span>
       </div>
-      <div class="panel-body" id="sec-logs-body">
+      <div class="panel-body panel-body collapsed" id="sec-logs-body">
         <div class="log-container" id="log-container">
           <div class="log-line log-info">Extension loaded. Ready.</div>
         </div>
@@ -613,6 +417,10 @@ export function getWebviewContent(nonce: string): string {
     let latestActivities = [];
     let currentPhase = 'idle';
     let currentMessage = 'Ready to start a new project.';
+    // Steps the boss collapsed/expanded by hand — preserved across re-renders
+    // so we don't fight their clicks; a step not in this map uses its default
+    // (expanded if running, collapsed otherwise).
+    const stepOverrides = {};
 
     wireEvents();
     renderAll();
@@ -646,6 +454,16 @@ export function getWebviewContent(nonce: string): string {
         const rejectButton = getActionButton(event, 'reject-command');
         if (runButton) { approveCommand(runButton.dataset.commandId, true); }
         if (rejectButton) { approveCommand(rejectButton.dataset.commandId, false); }
+      });
+
+      document.getElementById('chain-list').addEventListener('click', event => {
+        const head = event.target.closest('.chain-step-head');
+        if (!head) { return; }
+        const step = head.closest('.chain-step');
+        if (!step) { return; }
+        const key = step.dataset.key;
+        const collapsed = step.classList.toggle('collapsed');
+        stepOverrides[key] = collapsed;
       });
     }
 
@@ -682,9 +500,9 @@ export function getWebviewContent(nonce: string): string {
       currentPhase = 'intake';
       currentMessage = 'Checking workspace and Ollama before starting...';
       latestActivities = [];
+      for (const key of Object.keys(stepOverrides)) { delete stepOverrides[key]; }
       appendLog('Start requested. Checking workspace and Ollama...', 'info');
       renderAll();
-      renderActivities();
       vscode.postMessage({ type: 'startProject', prompt });
     }
 
@@ -695,7 +513,7 @@ export function getWebviewContent(nonce: string): string {
     function stopWorkflow() {
       currentMessage = 'Stop requested. Cancelling active work...';
       appendLog('Stop requested. Cancelling active work...', 'warn');
-      renderCurrentWork();
+      renderChain();
       vscode.postMessage({ type: 'stopWorkflow' });
     }
     function openNotes() { vscode.postMessage({ type: 'openNotes' }); }
@@ -747,24 +565,22 @@ export function getWebviewContent(nonce: string): string {
         case 'updatePhase':
           currentPhase = msg.phase;
           currentMessage = msg.message || phaseLabel(msg.phase);
-          renderCurrentWork();
+          renderHeader();
+          renderChain();
           break;
         case 'updateTasks':
           latestTasks = msg.tasks || [];
           renderStats();
-          renderTasks();
+          renderChain();
           break;
         case 'updateTimeline':
           latestTimeline = msg.timeline || [];
           renderStats();
-          renderTimeline();
-          renderCurrentWork();
+          renderChain();
           break;
         case 'updateActivities':
           latestActivities = msg.activities || [];
-          renderCurrentWork();
-          renderDebateBoard();
-          renderActivities();
+          renderChain();
           break;
         case 'appendLog':
           appendLog(msg.log, msg.level || 'info');
@@ -793,11 +609,7 @@ export function getWebviewContent(nonce: string): string {
     function renderAll() {
       renderHeader();
       renderStats();
-      renderCurrentWork();
-      renderTimeline();
-      renderDebateBoard();
-      renderTasks();
-      renderActivities();
+      renderChain();
     }
 
     function renderHeader() {
@@ -811,7 +623,7 @@ export function getWebviewContent(nonce: string): string {
 
     function updateButtons(status) {
       const running = status === 'running';
-      const resumable = status === 'waiting_for_user' || status === 'stopped';
+      const resumable = status === 'waiting_for_user' || status === 'stopped' || status === 'failed';
       document.getElementById('btn-start').disabled = running;
       document.getElementById('btn-resume').disabled = !resumable || running;
       document.getElementById('btn-stop').disabled = !running;
@@ -831,97 +643,69 @@ export function getWebviewContent(nonce: string): string {
       document.getElementById('progress-fill').style.width = progress + '%';
     }
 
-    function renderCurrentWork() {
-      const activity = latestActivities.find(item => item.status === 'running') || latestActivities[0];
-      const phase = activity?.phase || currentPhase;
-      const title = activity?.title || phaseLabel(phase);
-      const detail = activity?.detail || currentMessage || 'Waiting for model activity.';
-      document.getElementById('current-kicker').textContent = activity?.agentRole ? agentLabel(activity.agentRole) : phaseLabel(phase);
-      document.getElementById('current-title').textContent = title;
-      document.getElementById('current-detail').textContent = detail;
-
-      const chips = [];
-      if (activity?.round && activity?.totalRounds) { chips.push('Round ' + activity.round + '/' + activity.totalRounds); }
-      if (activity?.taskId) { chips.push(activity.taskId); }
-      if (activity?.files?.length) { chips.push(activity.files.length + ' file(s)'); }
-      chips.push((latestState?.status || 'idle').replace(/_/g, ' '));
-      document.getElementById('current-chips').innerHTML = chips.map(chip => '<span class="chip">' + escapeHtml(chip) + '</span>').join('');
-    }
-
-    function renderTimeline() {
-      const list = document.getElementById('timeline-list');
+    /**
+     * The single, unified "chain of thought" trace: one step per timeline
+     * phase (in order), each expandable to show the fine-grained activity
+     * entries — and, for the coding phase, the task list — that happened
+     * during it. Replaces the old separate Pipeline/Debate Board/Tasks/
+     * Activity Feed sections with one narrative the boss can read top to
+     * bottom, matching the chatbot's per-round debate trace.
+     */
+    function renderChain() {
+      const list = document.getElementById('chain-list');
       if (!latestTimeline.length) {
         list.innerHTML = '<li class="empty">Waiting to start.</li>';
         return;
       }
-      list.innerHTML = latestTimeline.map(entry => {
-        const meta = entry.agentRole ? agentLabel(entry.agentRole) : phaseLabel(entry.phase);
-        return '<li class="pipeline-item">' +
-          '<span class="dot dot-' + escapeHtml(entry.status || 'pending') + '"></span>' +
-          '<div><div class="pipeline-label">' + escapeHtml(entry.label) + '</div>' +
-          '<div class="pipeline-meta">' + escapeHtml(meta) + '</div></div>' +
-          '<span class="status-text">' + escapeHtml(entry.status || 'pending') + '</span>' +
+
+      list.innerHTML = latestTimeline.map((entry, index) => {
+        const key = entry.phase + '-' + index;
+        const status = entry.status || 'pending';
+        const isRunning = status === 'running';
+        const defaultCollapsed = !isRunning;
+        const collapsed = key in stepOverrides ? stepOverrides[key] : defaultCollapsed;
+
+        const activities = latestActivities.filter(item => item.phase === entry.phase).slice(-25);
+        const subItems = activities.map(renderActivitySub).join('');
+        const taskItems = entry.phase === 'coding' ? renderTaskMiniList() : '';
+        const body = subItems || taskItems
+          ? '<ul class="chain-sub-list">' + subItems + taskItems + '</ul>'
+          : (isRunning ? '<div class="chain-step-detail">' + escapeHtml(currentMessage || 'Working...') + '</div>' : '');
+
+        const meta = entry.agentRole ? agentLabel(entry.agentRole) : '';
+        return '<li class="chain-step' + (collapsed ? ' collapsed' : '') + '" data-key="' + escapeHtml(key) + '" data-status="' + escapeHtml(status) + '">' +
+          '<span class="chain-dot dot-' + escapeHtml(status) + '"></span>' +
+          '<div class="chain-step-head">' +
+          '<span class="chain-step-label">' + escapeHtml(entry.label) + (meta ? ' <span class="chain-step-status">' + escapeHtml(meta) + '</span>' : '') + '</span>' +
+          '<span class="chain-step-status">' + escapeHtml(status) + '</span>' +
+          '</div>' +
+          body +
           '</li>';
       }).join('');
     }
 
-    function renderDebateBoard() {
-      const board = document.getElementById('debate-board');
-      const critic = latestActivities.find(item => item.phase === 'critique');
-      const product = latestActivities.find(item => item.phase === 'second_brainstorm');
-      if (!critic && !product) {
-        board.innerHTML = '<div class="empty">Debate rounds will appear after the brainstorm phase starts.</div>';
-        return;
-      }
-      board.innerHTML = [
-        renderDebateLane('Critic', 'Requirements, security, risk, scope', critic),
-        renderDebateLane('Product', 'UX, workflow, developer experience, delivery', product)
-      ].join('');
+    function renderActivitySub(item) {
+      const chips = [];
+      if (item.round && item.totalRounds) { chips.push('Round ' + item.round + '/' + item.totalRounds); }
+      if (item.taskId) { chips.push(item.taskId); }
+      if (item.files && item.files.length) { chips.push(item.files.length + ' file(s)'); }
+      return '<li class="chain-sub-item sub-' + escapeHtml(item.status || 'info') + '">' +
+        '<div class="chain-sub-title">' + escapeHtml(item.title || '') + (item.agentRole ? ' — ' + escapeHtml(agentLabel(item.agentRole)) : '') + '</div>' +
+        '<div class="chain-sub-body">' + escapeHtml(item.detail || '') + '</div>' +
+        (chips.length ? '<div class="chain-sub-meta">' + chips.map(chip => '<span class="chip">' + escapeHtml(chip) + '</span>').join('') + '</div>' : '') +
+        '</li>';
     }
 
-    function renderDebateLane(title, fallback, activity) {
-      const round = activity?.round && activity?.totalRounds ? 'Round ' + activity.round + '/' + activity.totalRounds : (activity ? activity.status : 'pending');
-      const detail = activity?.detail || fallback;
-      return '<div class="debate-lane">' +
-        '<div class="lane-head"><div class="lane-title">' + escapeHtml(title) + '</div><div class="lane-round">' + escapeHtml(round) + '</div></div>' +
-        '<div class="lane-detail">' + escapeHtml(detail) + '</div>' +
-        '</div>';
-    }
-
-    function renderTasks() {
-      const list = document.getElementById('task-list');
-      if (!latestTasks.length) {
-        list.innerHTML = '<li class="empty">No tasks yet.</li>';
-        return;
-      }
-      list.innerHTML = latestTasks.map(task => {
+    function renderTaskMiniList() {
+      if (!latestTasks.length) { return ''; }
+      return latestTasks.map(task => {
         const status = task.status || 'pending';
-        const files = Array.isArray(task.allowedFiles) ? task.allowedFiles.slice(0, 3).join(', ') : '';
-        return '<li class="task-item">' +
-          '<span class="dot dot-' + statusToDot(status) + '"></span>' +
-          '<div><div class="task-title">' + escapeHtml('[' + task.id + '] ' + task.title) + '</div>' +
-          '<div class="task-detail">' + escapeHtml(status.replace(/_/g, ' ') + (files ? ' - ' + files : '')) + '</div></div>' +
+        const dotClass = statusToDot(status);
+        const done = status === 'completed' || status === 'skipped';
+        return '<li class="chain-task-mini' + (done ? ' task-done' : '') + '">' +
+          '<span class="dot dot-' + dotClass + '"></span>' +
+          '<span class="task-mini-label">[' + escapeHtml(task.id) + '] ' + escapeHtml(task.title) + '</span>' +
           '</li>';
-      }).join('');
-    }
-
-    function renderActivities() {
-      const list = document.getElementById('activity-list');
-      if (!latestActivities.length) {
-        list.innerHTML = '<div class="empty">No model activity yet.</div>';
-        return;
-      }
-      list.innerHTML = latestActivities.slice(0, 35).map(item => {
-        const chips = [];
-        chips.push(phaseLabel(item.phase));
-        if (item.agentRole) { chips.push(agentLabel(item.agentRole)); }
-        if (item.round && item.totalRounds) { chips.push('Round ' + item.round + '/' + item.totalRounds); }
-        if (item.taskId) { chips.push(item.taskId); }
-        return '<div class="activity-item activity-' + escapeHtml(item.status) + '">' +
-          '<div class="activity-title">' + escapeHtml(item.title) + '</div>' +
-          '<div class="activity-detail">' + escapeHtml(item.detail) + '</div>' +
-          '<div class="activity-meta">' + chips.map(chip => '<span class="chip">' + escapeHtml(chip) + '</span>').join('') + '</div>' +
-          '</div>';
       }).join('');
     }
 
@@ -939,8 +723,8 @@ export function getWebviewContent(nonce: string): string {
       box.className = 'question-box';
       box.id = 'qbox-' + question.id;
       box.innerHTML =
-        '<div class="activity-title">' + escapeHtml(agentLabel(question.agentRole)) + '</div>' +
-        '<div class="activity-detail">' + escapeHtml(question.question) + '</div>' +
+        '<div class="chain-sub-title">' + escapeHtml(agentLabel(question.agentRole)) + '</div>' +
+        '<div class="chain-sub-body">' + escapeHtml(question.question) + '</div>' +
         '<input type="text" id="answer-' + escapeHtml(question.id) + '" placeholder="Answer">' +
         '<div class="button-row"><button data-action="submit-answer" data-question-id="' + escapeHtml(question.id) + '">Submit</button></div>';
       container.appendChild(box);
@@ -953,8 +737,8 @@ export function getWebviewContent(nonce: string): string {
       box.className = 'patch-box';
       box.id = 'patch-' + patchId;
       box.innerHTML =
-        '<div class="activity-title">Approve file changes</div>' +
-        '<div class="activity-detail">' + escapeHtml((targetFiles || []).join(', ')) + '</div>' +
+        '<div class="chain-sub-title">Approve file changes</div>' +
+        '<div class="chain-sub-body">' + escapeHtml((targetFiles || []).join(', ')) + '</div>' +
         '<div class="patch-preview">' + escapeHtml((preview || '').substring(0, 3000)) + '</div>' +
         '<div class="button-row">' +
         '<button data-action="apply-patch" data-patch-id="' + escapeHtml(patchId) + '">Apply</button>' +
@@ -971,8 +755,8 @@ export function getWebviewContent(nonce: string): string {
       box.className = 'patch-box';
       box.id = 'command-' + commandId;
       box.innerHTML =
-        '<div class="activity-title">Approve command</div>' +
-        '<div class="activity-detail">' + escapeHtml(reason || '') + '</div>' +
+        '<div class="chain-sub-title">Approve command</div>' +
+        '<div class="chain-sub-body">' + escapeHtml(reason || '') + '</div>' +
         '<div class="patch-preview">' + escapeHtml(command || '') + '</div>' +
         '<div class="button-row">' +
         '<button data-action="run-command" data-command-id="' + escapeHtml(commandId) + '">Run</button>' +

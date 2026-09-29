@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { builtinModules } from 'module';
+import { createHash } from 'crypto';
 import type {
   AgentRole,
   AgentActivity,
@@ -8,6 +9,7 @@ import type {
   CodeWorkerOutput,
   ModelOptions,
   DeliveryManifest,
+  FileChange,
   FileSnapshot,
   GitRepositorySnapshot,
   ModelConfig,
@@ -15,6 +17,7 @@ import type {
   OrchestratorCallbacks,
   ProjectBrief,
   ProjectState,
+  RamOptimizationProposal,
   ReviewResult,
   SelfHealingConfig,
   TaskItem,
@@ -24,6 +27,7 @@ import type {
   TerminalRunResult,
   TimelineEntry,
   ToolchainReport,
+  ToolCallRequest,
   ToolCallResult,
   UserQuestion,
   WebFetchResult,
@@ -37,19 +41,42 @@ import { GitRepositoryReader } from '../git/GitRepositoryReader';
 import { getAgentPrompt, buildUserMessage } from '../prompts/agentPrompts';
 import { parseJsonResponse, prettyJson } from '../utils/json';
 import { logInfo, logWarn, logError } from '../utils/logging';
-import { UserAbortError, WorkflowError, formatError } from '../utils/errors';
+import { UserAbortError, WorkflowError, MissingCapabilityError, SelfWorkspaceGuardError, InsufficientResourcesError, formatError } from '../utils/errors';
 import { WebFetcherService } from '../services/webFetcherService';
+import { TelegramNotifierService } from '../services/telegramNotifierService';
 import { SearchService } from '../services/searchService';
 import { PatchService } from '../services/patchService';
 import { AppVerificationService } from '../services/appVerificationService';
+import { parseAcceptanceContract, describeAcceptanceContract, acceptanceContractInteraction, type AcceptanceContract } from '../services/acceptanceContract';
 import { GitHubIntegrationService } from '../services/githubIntegrationService';
 import { PlanController } from '../services/planController';
 import { SkillManager } from '../services/skillManager';
 import { WebSearchService } from '../services/webSearchService';
+import { ResearchService } from '../services/researchService';
+import { AssetLibraryService } from '../services/assetLibraryService';
+import { SystemResourceService } from '../services/systemResourceService';
+import { ModelReadinessService, isAutomaticTextModelCandidate } from '../services/modelReadinessService';
+import { VerificationPlanner } from '../services/verificationPlanner';
+import { CollectionAcceptanceService, type CollectionAcceptanceReport } from '../services/collectionAcceptanceService';
+import { AgentFactory } from '../dynamic/AgentFactory';
+import { DynamicTeam } from '../dynamic/DynamicTeam';
+import type { DynamicTeamDecision, DynamicTeamCheckpoint, AgentTeamPlan, AgentSpec } from '../types';
+import { RunLock } from '../workspace/RunLock';
 import { TerminalSessionRunner } from '../terminal/TerminalSessionRunner';
 import { AutonomousToolRegistry } from '../tools/AutonomousToolRegistry';
 import { ContextCache } from '../context/ContextCache';
 import type { ContextSection } from '../context/ContextCache';
+import { finalizeCompletedState } from './workflowState';
+import type { SecretVault } from '../connectors/SecretVault';
+import { ConnectorManager } from '../connectors/ConnectorManager';
+import { checkTypeScriptTask } from '../utils/typeScriptGate';
+import { findBrowserDeliveryIssues, findMissingScriptTargets } from '../utils/browserDelivery';
+import { TaskReviewScopes, findImporters, IMPORT_BREAKAGE } from '../utils/taskReviewScope';
+import { countExecutedTests } from '../utils/testRunEvidence';
+import type { BrowserInteraction } from '../services/browserSmokeService';
+import { findUnwiredModules, findCommentOnlyImplementations, findProjectCommentOnlyImplementations } from '../utils/implementationGaps';
+import { TEST_FILE, findLanguageMismatch, findTestScriptIssues, findUndeclaredPackageImports, isPlaceholderScript } from '../utils/testTaskContracts';
+import { findUnresolvedRequireImports, findBrowserIncompatibleNodeUsage, findUnreferencedExportingFiles, isBinaryAssetPath, toolchainMarkerStack, stackTextMentions } from '../utils/moduleContracts';
 
 interface ImprovementConsensus {
   agentRole: 'brainstorm' | 'critic' | 'secondBrainstorm';
@@ -57,6 +84,54 @@ interface ImprovementConsensus {
   confidence: 'low' | 'medium' | 'high';
   remainingWork: string[];
   nextSprintGoal: string;
+  rationale: string;
+}
+
+// A small, realistic sample CV used as a development/test fixture when a goal
+// asks to BUILD a tool that processes a user's CV at runtime — so the tool can
+// be developed and verified end-to-end without the boss's real document.
+const SAMPLE_RESUME_FIXTURE = `Jane Doe
+Email: jane.doe@example.com | Location: Remote
+
+SUMMARY
+Senior software engineer with 6 years of experience in backend and data systems.
+
+SKILLS
+Python, TypeScript, Node.js, PostgreSQL, Docker, AWS, REST APIs, web scraping
+
+EXPERIENCE
+Senior Backend Engineer — Acme Corp (2021-present)
+- Built data pipelines and REST APIs serving 1M+ requests/day.
+Software Engineer — Globex (2018-2021)
+- Developed internal tooling and automated reporting.
+
+EDUCATION
+B.Sc. Computer Science, State University (2018)
+`;
+
+// One judge's scorecard in the round-4 debate scoring panel. Each judge runs on
+// a different local model and rates the consolidated approach across weighted
+// criteria, then recommends the single best direction to proceed with.
+interface DebateScore {
+  agentRole: AgentRole;
+  scores: {
+    feasibility: number;   // can this be built locally with the chosen stack?
+    completeness: number;  // does it cover the user's actual request?
+    risk: number;          // higher = safer (fewer unmitigated risks)
+    ux: number;            // product / developer experience quality
+    quality: number;       // engineering quality of the proposed direction
+  };
+  overall: number;         // 0-10 weighted summary the judge assigns
+  recommendation: string;  // the direction this judge would proceed with
+  topRisk: string;
+}
+
+interface DebateDecision {
+  winningDirection: string;
+  weightedScore: number;       // 0-10 aggregate across all judges
+  judgeCount: number;
+  agreement: 'low' | 'medium' | 'high';
+  rankedRecommendations: Array<{ agentRole: AgentRole; overall: number; recommendation: string }>;
   rationale: string;
 }
 
@@ -73,6 +148,8 @@ class WaitForUserError extends Error {
 interface ProjectCheckResults {
   compileResult: TerminalRunResult | null;
   testResult: TerminalRunResult | null;
+  additionalResults?: TerminalRunResult[];
+  collectionAcceptance?: CollectionAcceptanceReport;
   output: string;
   failed: boolean;
   failedCommands: string[];
@@ -95,6 +172,12 @@ interface WorkflowRoute {
 // AgentOrchestrator
 // -----------------------------------------------------------------------
 export class AgentOrchestrator {
+  /** Fix attempt from which repairs switch to the fixer's stronger fallback model. */
+  private static readonly FIX_ESCALATION_ATTEMPT = 3;
+  /** Tasks whose fixer was escalated early because it stopped making progress. */
+  private readonly escalatedFixTasks = new Set<string>();
+  /** Failed tasks already re-run once because dependents were about to be skipped. */
+  private readonly _secondChanceTasks = new Set<string>();
   private readonly workspace: AgentWorkspace;
   private readonly fileManager: FileManager;
   private readonly gitReader: GitRepositoryReader;
@@ -108,6 +191,8 @@ export class AgentOrchestrator {
   private skillManager!: SkillManager;
   private githubIntegration!: GitHubIntegrationService;
   private webSearch!: WebSearchService;
+  private research!: ResearchService;
+  private assetLibrary!: AssetLibraryService;
   private modelConfig!: ModelConfig;
   private callbacks: OrchestratorCallbacks = {};
   private _aborted = false;
@@ -117,6 +202,14 @@ export class AgentOrchestrator {
   private _activityCounter = 0;
   private _promptFileContextCache: PromptFileContext | null = null;
   private readonly webFetcher = new WebFetcherService();
+  // Optional: pushes every phase change and failure to Telegram so the boss
+  // can follow an autonomous run from their phone. No-ops without
+  // TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID configured — see .env.example.
+  private readonly telegram = new TelegramNotifierService({
+    botToken: process.env.TELEGRAM_BOT_TOKEN,
+    chatId: process.env.TELEGRAM_CHAT_ID,
+    onWarn: message => logWarn(message),
+  });
   private _webContextCache: { prompt: string; context: string } | null = null;
   private readonly _changeBaselines = new WeakMap<CodeWorkerOutput, Map<string, FileSnapshot>>();
   private readonly _contextCache = new ContextCache();
@@ -124,17 +217,78 @@ export class AgentOrchestrator {
   // Per-run state for effort control and mid-task context injection
   private _taskPlanComplexity: 'low' | 'medium' | 'high' = 'medium';
   private _lastMicroCheckSummary = '';
+  /** Dependency manifests last installed by per-task verification. */
+  private _taskInstalledFingerprint = '';
+  /** Whether the browser smoke check passed at the previous per-task verification (null = not run yet). */
+  private _lastTaskSmokePassed: boolean | null = null;
+  /** Files and open runtime failures of each task across its review/fix loop (audit C01/C02). */
+  private readonly _taskReviewScopes = new TaskReviewScopes();
+  /** Files a task owns that it has not created yet, when it proposed no change (run 11, sprint 2). */
+  private readonly _missingTaskFiles = new Map<string, string[]>();
+  /** Most tests a green per-task `npm test` has run so far in this run (F8). */
+  private _passingTestFloor = 0;
+  /** Gate states already reported this run, so the warning is not repeated per task. */
+  private readonly _typeScriptGateWarned = new Set<string>();
+  /** Focused diagnostics for a test-fix attempt, shown to the fixer instead of the whole verification log. */
+  private readonly _testFixFocusText = new Map<string, string>();
 
-  // Pending approvals (patch / command) resolved via user interaction
+  // Pending approvals (patch / command / RAM optimization) resolved via user interaction
   private _pendingPatchResolvers = new Map<string, (approved: boolean) => void>();
   private _pendingCommandResolvers = new Map<string, (approved: boolean) => void>();
+  private _pendingRamOptimizationResolvers = new Map<string, (approved: boolean) => void>();
+  private _approvalCounter = 0;
+  /** How long to wait for a RAM-optimization answer before defaulting to "no" and continuing. Overridable in tests. */
+  private _ramOptimizationTimeoutMs = 60_000;
+  /** When true, the fixed 4-round debate is skipped (a dynamic team replaced it). */
+  private _skipFixedDebate = false;
+  /** Exact model names proven responsive by the current runtime preflight. */
+  private _readyModelRoster: string[] = [];
+  private _readyTieBreakerModels: string[] = [];
+  private _modelReadinessStatus: DynamicTeamDecision['modelReadiness'] = 'blocked';
+  /** Memoized result of {@link _currentTeamPlan} — the on-disk plan does not change mid-run. */
+  private _teamPlanCache: { goal: string; plan: AgentTeamPlan | null } | null = null;
+  private readonly connectorManager?: ConnectorManager;
+  /** Tracks "a live process currently owns this workspace's run" so resume() can tell a genuine crash apart from a second concurrent run. */
+  private _activeRunLock: RunLock | null = null;
+  private _runHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(workspaceRoot: string) {
+  constructor(workspaceRoot: string, secretVault?: SecretVault) {
     this.workspace = new AgentWorkspace(workspaceRoot);
     this.fileManager = new FileManager(workspaceRoot);
     this.gitReader = new GitRepositoryReader(workspaceRoot);
     this.searchService = new SearchService(workspaceRoot);
     this.patchService = new PatchService(workspaceRoot);
+    if (secretVault) { this.connectorManager = new ConnectorManager(secretVault, workspaceRoot); }
+  }
+
+  /**
+   * Marks this process as the live owner of the workspace's run, heartbeating
+   * periodically so a later resume() attempt (in this process or a fresh one
+   * after a crash) can tell "orphaned by a hard kill" apart from "genuinely
+   * still running." Call at the top of every top-level entry point that sets
+   * `_running = true`; pair with {@link _endRunOwnership} in its `finally`.
+   */
+  private _beginRunOwnership(): void {
+    const lock = new RunLock(this.workspace.runLockPath);
+    try {
+      lock.acquire();
+    } catch (error) {
+      // Entrypoints claim before their workflow try/finally. A failed claim
+      // must leave this instance retryable without touching the actual owner.
+      this._running = false;
+      this._activeRunLock = null;
+      throw error;
+    }
+    this._activeRunLock = lock;
+    this._runHeartbeatTimer = setInterval(() => this._activeRunLock?.heartbeat(), 20_000);
+    // Never keep the process/extension host alive just for this timer.
+    (this._runHeartbeatTimer as { unref?: () => void }).unref?.();
+  }
+
+  private _endRunOwnership(): void {
+    if (this._runHeartbeatTimer) { clearInterval(this._runHeartbeatTimer); this._runHeartbeatTimer = null; }
+    this._activeRunLock?.release();
+    this._activeRunLock = null;
   }
 
   // ------------------------------------------------------------------
@@ -148,7 +302,8 @@ export class AgentOrchestrator {
   isRunning(): boolean { return this._running; }
 
   /**
-   * Start a brand-new workflow with the given prompt.
+   * Start the legacy/maintenance workflow with the given prompt. New sidebar
+   * goals use runAutonomousGoal() so they cannot bypass runtime team creation.
    */
   async start(prompt: string): Promise<void> {
     if (this._running) {
@@ -157,10 +312,13 @@ export class AgentOrchestrator {
     }
     this._aborted = false;
     this._running = true;
+    this._skipFixedDebate = false;
+    this._beginRunOwnership();
 
     try {
       await this.workspace.initialize();
       this._loadConfig();
+      this._readyModelRoster = [];
 
       // Reset state for a new project
       this._activities = [];
@@ -168,21 +326,277 @@ export class AgentOrchestrator {
       this._promptFileContextCache = null;
       this._webContextCache = null;
       this._contextCache.clear();
+      this._resetRunScopedChecks();
       this._lastMicroCheckSummary = '';
       this._taskPlanComplexity = 'medium';
       const state = this._newState(prompt);
+      state.workflowMode = 'fixed';
       this.workspace.writeProjectState(state);
       this.workspace.writeUserPrompt(prompt);
 
       this._buildTimeline();
       this._emitTimeline();
 
+      await this._offerRamOptimizationIfNeeded();
+      this._preflightSystemResources();
+      await this._preflightCapabilities(prompt);
       await this._runWorkflow(state);
     } catch (err) {
       this._handleTopLevelError(err);
     } finally {
       this._running = false;
+      this._endRunOwnership();
     }
+  }
+
+  /**
+   * The "agent that creates agents". Given a single boss goal, a meta-agent
+   * designs a bespoke team of specialist agents (each with its own model, system
+   * prompt and tools), then runs them through the debate protocol
+   * (propose → critique → refine → score) to converge on the best direction.
+   *
+   * This is domain-agnostic — the meta-agent staffs whatever specialties the
+   * goal needs (research, strategy, engineering, content, ops, …), realizing the
+   * "one command from the boss, agents self-organize" vision without hardcoding
+   * any specific use case.
+   */
+  async designAndRunTeam(goal: string): Promise<DynamicTeamDecision> {
+    if (this._running) {
+      this._emit('info', 'A workflow is already running.');
+      throw new Error('A workflow is already running.');
+    }
+    this._running = true;
+    this._aborted = false;
+    this._beginRunOwnership();
+    try {
+      await this.workspace.initialize();
+      this._loadConfig();
+      this._readyModelRoster = [];
+      this.workspace.writeUserPrompt(goal);
+      this.workspace.initializeJournal(goal);
+      this._journal('start', 'Dynamic team requested', `**Goal:** ${goal}`);
+      await this._offerRamOptimizationIfNeeded();
+      this._preflightSystemResources();
+      await this._requireReadyDebateModels();
+      const { decision } = await this._designAndRunTeamInternal(goal);
+      return decision;
+    } catch (err) {
+      this._journal('error', 'Dynamic team failed', formatError(err));
+      throw err;
+    } finally {
+      this._running = false;
+      this._endRunOwnership();
+    }
+  }
+
+  /**
+   * Closes the "one command → finished product" loop: a meta-agent designs and
+   * debates a bespoke team, the winning direction seeds the build pipeline, and
+   * the proven sprint workflow (architect → task plan → code → review → quality
+   * audit → test → fix → deliver) turns it into a verified product. The dynamic
+   * team REPLACES the fixed 4-round debate, so it is not run twice.
+   */
+  async runAutonomousGoal(goal: string): Promise<void> {
+    if (this._running) {
+      this._emit('info', 'A workflow is already running.');
+      return;
+    }
+    this._running = true;
+    this._aborted = false;
+    this._beginRunOwnership();
+    try {
+      await this.workspace.initialize();
+      this._loadConfig();
+      this._readyModelRoster = [];
+
+      this._activities = [];
+      this._activityCounter = 0;
+      this._promptFileContextCache = null;
+      this._webContextCache = null;
+      this._contextCache.clear();
+      this._resetRunScopedChecks();
+      this._lastMicroCheckSummary = '';
+      this._taskPlanComplexity = 'medium';
+      const state = this._newState(goal);
+      state.workflowMode = 'autonomous';
+      state.autonomousStage = 'debate';
+      this.workspace.writeProjectState(state);
+      this.workspace.writeUserPrompt(goal);
+      this.workspace.initializeJournal(goal);
+      this._buildTimeline();
+      this._emitTimeline();
+      this._journal('start', 'Autonomous goal requested', `**Goal:** ${goal}\n\nThe meta-agent will staff a team, debate, then build the product.`);
+      await this._offerRamOptimizationIfNeeded();
+      this._preflightSystemResources();
+      await this._requireReadyDebateModels();
+
+      // Pre-flight: the model readiness gate above has already proven the exact
+      // five-model roster. Now enable safe capabilities and validate boss input.
+      // Stop early if the goal needs input only the boss can provide.
+      await this._preflightCapabilities(goal);
+
+      await this._runAutonomousDebate(state);
+      this._skipFixedDebate = true;
+      await this._runWorkflow(state);
+    } catch (err) {
+      this._handleTopLevelError(err);
+    } finally {
+      this._running = false;
+      this._skipFixedDebate = false;
+      this._endRunOwnership();
+    }
+  }
+
+  private async _runAutonomousDebate(
+    state: ProjectState,
+    resumeTeam?: { plan: AgentTeamPlan; checkpoint: DynamicTeamCheckpoint }
+  ): Promise<void> {
+    state.autonomousStage = 'debate';
+    this._setPhase(state, 'brainstorm', 'Meta-agent: designing the team before four rounds of debate...');
+    this._checkAborted();
+    const { plan, decision, transcript } = await this._designAndRunTeamInternal(state.projectGoal, state, resumeTeam);
+    this._checkAborted();
+    this._seedBuildFromTeam(plan, decision, transcript);
+    state.autonomousStage = 'build';
+    this._setPhase(state, 'briefing', 'Dynamic team decision complete; preparing the product brief...');
+    this._checkAborted();
+  }
+
+  /**
+   * Core of the dynamic team run (no lifecycle/_running management): design the
+   * team, run the debate, persist artifacts and journal everything. Reused by
+   * both {@link designAndRunTeam} and {@link runAutonomousGoal}.
+   */
+  private async _designAndRunTeamInternal(
+    goal: string,
+    workflowState?: ProjectState,
+    resumeTeam?: { plan: AgentTeamPlan; checkpoint: DynamicTeamCheckpoint }
+  ): Promise<{ plan: AgentTeamPlan; decision: DynamicTeamDecision; transcript: string }> {
+    const dynamicModelOptions = {
+      num_ctx: Math.min(this.modelConfig.defaultOptions.num_ctx ?? 16_384, 16_384),
+      num_predict: Math.min(this.modelConfig.defaultOptions.num_predict ?? 1_536, 4_096),
+    };
+
+    let plan: AgentTeamPlan;
+    if (resumeTeam) {
+      // Reuse the EXACT team the checkpoint was recorded against — the
+      // meta-agent's team design is not deterministic, so redesigning here
+      // would silently apply a partial-debate checkpoint to the wrong agents.
+      plan = resumeTeam.plan;
+      this._emit('log', `Reusing the previously designed ${plan.agents.length}-agent team to resume the in-progress debate...`, 'info');
+    } else {
+      const factory = new AgentFactory(this.ollama, {
+        roster: this._readyModelRoster.length > 0 ? this._readyModelRoster : this._modelRoster(),
+        toolNames: this.toolRegistry.definitions().map(d => d.name),
+        designerModel: this._agentConfig('brainstorm').model,
+        designerFallback: this._agentConfig('brainstorm').fallbackModel,
+        maxAgents: 6,
+        modelOptions: { ...dynamicModelOptions, num_predict: 1_536 },
+      });
+
+      this._emit('log', 'Meta-agent designing a bespoke team for the goal...', 'info');
+      plan = await factory.designTeam(goal, '', this.workspace.agentNotePath('dynamic_team_plan.json'));
+      this._checkAborted();
+      this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_plan.json'), prettyJson(plan));
+      this._journal('spawn', `Meta-agent spawned ${plan.agents.length} agents`, [
+        `**Rationale:** ${plan.rationale}`,
+        '',
+        ...plan.agents.map(a => `- **${a.name}** (\`${a.model}\`) — ${a.specialty}${a.tools.length ? ` · tools: ${a.tools.join(', ')}` : ''}`),
+      ].join('\n'));
+      plan.agents.forEach(a => this._recordActivity({
+        phase: 'brainstorm',
+        agentRole: 'brainstorm',
+        title: `Spawned agent: ${a.name}`,
+        detail: `${a.specialty} on ${a.model}`,
+        status: 'completed',
+      }));
+    }
+
+    const team = new DynamicTeam(
+      this.ollama,
+      this.toolRegistry,
+      3,
+      this._readyTieBreakerModels,
+      dynamicModelOptions,
+      this._dynamicDebateRetryPolicy()
+    );
+    const result = await team.run(plan, {
+      onRound: (round, label) => {
+        if (workflowState) {
+          this._setPhase(workflowState, round === 2 ? 'critique' : round === 3 ? 'second_brainstorm' : 'brainstorm', `Dynamic debate round ${round}/4: ${label}`);
+        }
+        this._journal('team', `Debate round ${round} — ${label}`);
+      },
+      onAgent: (round, agentId, summary) => this._emit('log', `[R${round}] ${agentId}: ${summary}`, 'info'),
+      onTranscriptUpdate: partial => this.workspace.writeFile(
+        this.workspace.agentNotePath('dynamic_team_debate.md'),
+        partial.replace('# Dynamic Team Debate', `# Dynamic Team Debate\n\n**Model readiness:** ${this._modelReadinessStatus}\n\n_(in progress — a crash here would lose only the round in flight, not the rounds already written)_`)
+      ),
+      // Fired after EVERY agent/judge turn — a crash loses at most the one
+      // turn in flight, never a whole round. writeFile is atomic (temp+rename)
+      // so a kill mid-write can never leave a torn/corrupt checkpoint.
+      onCheckpoint: checkpoint => this.workspace.writeFile(
+        this.workspace.agentNotePath('dynamic_team_checkpoint.json'),
+        prettyJson(checkpoint)
+      ),
+    }, resumeTeam?.checkpoint);
+    this._checkAborted();
+    const decision = { ...result.decision, modelReadiness: this._modelReadinessStatus };
+    const transcript = result.transcript.replace(
+      '# Dynamic Team Debate',
+      `# Dynamic Team Debate\n\n**Model readiness:** ${this._modelReadinessStatus}`
+    );
+
+    this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_debate.md'), transcript);
+    this.workspace.writeFile(this.workspace.agentNotePath('dynamic_team_decision.json'), prettyJson(decision));
+    // The completed decision + full transcript now supersede the in-progress
+    // per-turn checkpoint — drop it so a later resume never mistakes a stale
+    // partial checkpoint for the authoritative outcome.
+    this.workspace.deleteFile(this.workspace.agentNotePath('dynamic_team_checkpoint.json'));
+    const winnerName = plan.agents.find(a => a.id === decision.winningAgentId)?.name ?? decision.winningAgentId;
+    this._journal('team', `Team verdict: ${winnerName} wins (${decision.weightedScore}/10, ${decision.agreement} agreement)`,
+      decision.winningProposal);
+    this.workspace.appendMemoryEvent({
+      type: 'team',
+      phase: 'brainstorm',
+      summary: `Dynamic team converged: ${winnerName} (${decision.weightedScore}/10).`,
+      data: { goal, winningAgentId: decision.winningAgentId, agreement: decision.agreement },
+    });
+    this._emit('log', `Dynamic team complete: ${winnerName} wins (${decision.weightedScore}/10).`, 'info');
+    return { plan, decision, transcript };
+  }
+
+  /**
+   * Bridge the dynamic team's outcome into the build pipeline: the winning
+   * direction is written to the file the briefing phase reads as the
+   * authoritative decision, and the full debate is left as brainstorm context.
+   */
+  private _seedBuildFromTeam(plan: AgentTeamPlan, decision: DynamicTeamDecision, transcript: string): void {
+    const winnerName = plan.agents.find(a => a.id === decision.winningAgentId)?.name ?? decision.winningAgentId;
+    const decisionDoc = this._wrapNote('Debate Decision (from autonomous agent team)', [
+      `Winning direction (by ${winnerName}, ${decision.weightedScore}/10, ${decision.agreement} agreement):`,
+      '',
+      decision.winningProposal,
+      '',
+      '## Ranked alternatives',
+      ...decision.ranked.map((r, i) => `${i + 1}. (${r.score}/10) ${this._clipText(r.proposal, 400)}`),
+      '',
+      `## Rationale\n${decision.rationale}`,
+    ].join('\n'));
+
+    this.workspace.writeFile(this._debateDecisionPath, decisionDoc);
+    // Give the brief builder the team's reasoning as brainstorm/consensus context.
+    this.workspace.writeFile(this.workspace.brainstormPath, this._wrapNote('Brainstorm (autonomous agent team)', transcript));
+    this.workspace.appendRollingSummary(
+      `## Autonomous Team Decision\nWinning direction (${decision.weightedScore}/10, ${decision.agreement} agreement) by ${winnerName}: ${this._clipText(decision.winningProposal, 600)}`
+    );
+    this._journal('decision', 'Seeded build pipeline with the team verdict',
+      `The winning direction is now the authoritative brief input. Build sprints will implement it.`);
+  }
+
+  private _clipText(text: string, max: number): string {
+    const t = (text ?? '').replace(/\s+/g, ' ').trim();
+    return t.length > max ? `${t.slice(0, max)}…` : t;
   }
 
   /**
@@ -195,29 +609,256 @@ export class AgentOrchestrator {
     }
 
     const state = this.workspace.readProjectState();
-    if (state.status !== 'waiting_for_user' && state.status !== 'stopped') {
+    if (state.status === 'running') {
+      // A hard process kill (OOM-kill, SIGBUS, an extension-host crash) never
+      // gets a chance to mark the state 'failed' — it is left stuck exactly
+      // here forever. The run lock's heartbeat is what tells that apart from
+      // a second process genuinely still working on this same workspace: only
+      // an orphaned (missing/stale) lock is safe to reclaim automatically.
+      const orphaned = new RunLock(this.workspace.runLockPath).isStale();
+      if (!orphaned) {
+        this._emit('info', 'Cannot resume: current status is "running".');
+        return;
+      }
+      this._journal('warn', 'Recovered an orphaned run',
+        'No live process owns this workflow (the run lock was missing or stale) — the previous process likely crashed. Resuming from the last saved checkpoint instead of losing the run.');
+    } else if (!['waiting_for_user', 'stopped', 'failed'].includes(state.status)) {
       this._emit('info', `Cannot resume: current status is "${state.status}".`);
       return;
     }
 
     this._aborted = false;
     this._running = true;
+    this._skipFixedDebate = false;
+    this._beginRunOwnership();
 
     try {
       this._loadConfig();
+      this._readyModelRoster = [];
       this._promptFileContextCache = null;
       this._webContextCache = null;
       this._contextCache.clear();
+      this._resetRunScopedChecks();
       this._buildTimeline();
       this._emitTimeline();
+
+      const dynamicCheckpoint = state.workflowMode === 'fixed' ? null : this._readCurrentDynamicTeam(state);
+      state.workflowMode ??= dynamicCheckpoint ? 'autonomous' : 'fixed';
+      if (state.workflowMode === 'autonomous') {
+        state.autonomousStage ??= dynamicCheckpoint?.decision ? 'build' : 'debate';
+      }
+      this._prepareResumeTaskState(state);
       state.status = 'running';
       this.workspace.writeProjectState(state);
+      this._checkAborted();
+
+      // RAM headroom matters for a resumed run regardless of which pipeline
+      // it resumes into — not just the autonomous/dynamic-team path.
+      await this._offerRamOptimizationIfNeeded();
+      this._preflightSystemResources();
+      this._checkAborted();
+
+      if (state.workflowMode === 'autonomous') {
+        await this._preflightCapabilities(state.projectGoal);
+        this._checkAborted();
+        if (state.autonomousStage === 'debate') {
+          if (dynamicCheckpoint?.decision && dynamicCheckpoint.transcript) {
+            // Artifacts can finish just before a Stop/crash, while seeding the
+            // build has not yet been checkpointed. Reuse that completed debate.
+            this._seedBuildFromTeam(dynamicCheckpoint.plan, dynamicCheckpoint.decision, dynamicCheckpoint.transcript);
+            state.autonomousStage = 'build';
+            this._setPhase(state, 'briefing', 'Resuming the completed dynamic team decision...');
+          } else {
+            await this._requireReadyDebateModels();
+            this._checkAborted();
+            const resumeTeam = this._readDynamicTeamCheckpoint(state);
+            this._emit('log', resumeTeam
+              ? `Resuming the dynamic debate from round ${resumeTeam.checkpoint.round} (${resumeTeam.checkpoint.completedAgentIds.length} agent turn(s) already done in that round), reusing the same ${resumeTeam.plan.agents.length}-agent team...`
+              : 'Restarting the incomplete dynamic debate; no partial progress was saved.', 'info');
+            await this._runAutonomousDebate(state, resumeTeam ?? undefined);
+          }
+        } else if (dynamicCheckpoint?.decision && dynamicCheckpoint.transcript && !this.workspace.fileExists(this._debateDecisionPath)) {
+          this._seedBuildFromTeam(dynamicCheckpoint.plan, dynamicCheckpoint.decision, dynamicCheckpoint.transcript);
+        }
+        this._skipFixedDebate = true;
+      }
+      this._checkAborted();
       await this._runWorkflow(state);
     } catch (err) {
       this._handleTopLevelError(err);
     } finally {
       this._running = false;
+      this._skipFixedDebate = false;
+      this._endRunOwnership();
     }
+  }
+
+  /**
+   * Reads the in-progress per-turn debate checkpoint (written after every
+   * single agent/judge turn, not just once per round — see
+   * `DynamicTeamCheckpoint`) so `resume()` can continue a crashed debate from
+   * the next unfinished turn instead of rerunning every round from scratch.
+   * Mirrors {@link _readCurrentDynamicTeam}'s validation: only a checkpoint
+   * for THIS goal, saved after the current plan was generated, is trusted.
+   *
+   * Returns the EXACT plan the checkpoint was recorded against, not a freshly
+   * (re-)designed one — the checkpoint's `completedAgentIds`/`proposals` are
+   * positionally and by-id tied to that specific team, and the meta-agent's
+   * team design is not deterministic across calls.
+   */
+  private _readDynamicTeamCheckpoint(state: ProjectState): { plan: AgentTeamPlan; checkpoint: DynamicTeamCheckpoint } | null {
+    try {
+      const plan: AgentTeamPlan = JSON.parse(this.workspace.readFile(this.workspace.agentNotePath('dynamic_team_plan.json')) ?? 'null');
+      const plannedAt = Date.parse(plan?.generatedAt);
+      if (!plan || plan.goal !== state.projectGoal || !Number.isFinite(plannedAt) ||
+          !Array.isArray(plan.agents) || plan.agents.length < 5) { return null; }
+      const checkpoint: DynamicTeamCheckpoint = JSON.parse(this.workspace.readFile(this.workspace.agentNotePath('dynamic_team_checkpoint.json')) ?? 'null');
+      if (!checkpoint || checkpoint.goal !== state.projectGoal) { return null; }
+      const updatedAt = Date.parse(checkpoint.updatedAt);
+      if (!Number.isFinite(updatedAt) || updatedAt < plannedAt) { return null; }
+      if (![1, 2, 3, 4].includes(checkpoint.round) || !Array.isArray(checkpoint.completedAgentIds)) { return null; }
+      return { plan, checkpoint };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Only current-goal artifacts from this run can identify legacy autonomous runs. */
+  private _readCurrentDynamicTeam(state: ProjectState): {
+    plan: AgentTeamPlan; decision?: DynamicTeamDecision; transcript?: string;
+  } | null {
+    try {
+      const plan: AgentTeamPlan = JSON.parse(this.workspace.readFile(this.workspace.agentNotePath('dynamic_team_plan.json')) ?? 'null');
+      const createdAt = Date.parse(state.createdAt);
+      const plannedAt = Date.parse(plan?.generatedAt);
+      if (!plan || plan.goal !== state.projectGoal || !Number.isFinite(createdAt) || !Number.isFinite(plannedAt) ||
+          plannedAt < createdAt || !Array.isArray(plan.agents) || plan.agents.length < 5) { return null; }
+      const checkpoint: { plan: AgentTeamPlan; decision?: DynamicTeamDecision; transcript?: string } = { plan };
+      try {
+        const decision: DynamicTeamDecision = JSON.parse(this.workspace.readFile(this.workspace.agentNotePath('dynamic_team_decision.json')) ?? 'null');
+        const transcript = this.workspace.readFile(this.workspace.agentNotePath('dynamic_team_debate.md')) ?? '';
+        const decidedAt = Date.parse(decision?.generatedAt);
+        if (decision?.goal === state.projectGoal && Number.isFinite(decidedAt) && decidedAt >= plannedAt &&
+            plan.agents.some(agent => agent.id === decision.winningAgentId) && decision.winningProposal?.trim() &&
+            Array.isArray(decision.ranked) && decision.ranked.length > 0 &&
+            [1, 2, 3, 4].every(round => new RegExp(`^## Round ${round} \\u2014 `, 'm').test(transcript))) {
+          checkpoint.decision = decision;
+          checkpoint.transcript = transcript;
+        }
+      } catch { /* A partial debate is resumable by running its full protocol again. */ }
+      return checkpoint;
+    } catch { return null; }
+  }
+
+  /**
+   * The dynamic team plan for the CURRENT run, if this goal was staffed by
+   * one — memoized per goal since it never changes mid-run and every coding
+   * task otherwise re-reads/re-parses the same on-disk JSON. Returns null
+   * for a run that never went through AgentFactory (a fixed 4-round debate,
+   * or a maintenance prompt that skipped debate entirely), which is the
+   * common case and must incur no behavior change.
+   */
+  private _currentTeamPlan(state: ProjectState): AgentTeamPlan | null {
+    if (this._teamPlanCache && this._teamPlanCache.goal === state.projectGoal) {
+      return this._teamPlanCache.plan;
+    }
+    const plan = this._readCurrentDynamicTeam(state)?.plan ?? null;
+    this._teamPlanCache = { goal: state.projectGoal, plan };
+    return plan;
+  }
+
+  /** Human-readable roster for the task manager to assign tasks against. Empty when no team was designed. */
+  private _specialistRosterContext(plan: AgentTeamPlan | null): string {
+    if (!plan || plan.agents.length === 0) { return ''; }
+    return plan.agents
+      .map(a => `- id: "${a.id}" — ${a.name} (${a.specialty}). Mission: ${a.mission}`)
+      .join('\n');
+  }
+
+  /** The team specialist that owns `task`, if any — a valid, current-run specialistId only. */
+  private _specialistForTask(task: TaskItem, state: ProjectState): AgentSpec | null {
+    if (!task.specialistId) { return null; }
+    const plan = this._currentTeamPlan(state);
+    return plan?.agents.find(a => a.id === task.specialistId) ?? null;
+  }
+
+  /**
+   * The team specialist whose `teamRole` naturally owns a fixed PLANNING
+   * phase (briefing/architecture/task-planning), when a dynamic team was
+   * designed for this run — e.g. the "architect" teamRole specialist who
+   * already argued for this project's direction now also formalizes it into
+   * the architecture doc, instead of a different, unrelated model doing it
+   * from a cold start. `_ensureMandatoryCoverage` in AgentFactory guarantees
+   * one agent per required teamRole, so this reliably finds a match whenever
+   * `plan` is non-null. Returns null for any run that never went through
+   * AgentFactory (the common case), leaving that phase's behavior unchanged.
+   */
+  private _specialistForPlanningRole(
+    role: 'briefBuilder' | 'architect' | 'taskManager',
+    state: ProjectState
+  ): AgentSpec | null {
+    const plan = this._currentTeamPlan(state);
+    if (!plan) { return null; }
+    const preferredTeamRoles: Record<typeof role, NonNullable<AgentSpec['teamRole']>[]> = {
+      briefBuilder: ['strategist', 'researcher'],
+      architect: ['architect'],
+      taskManager: ['strategist'],
+    };
+    for (const teamRole of preferredTeamRoles[role]) {
+      const match = plan.agents.find(a => a.teamRole === teamRole);
+      if (match) { return match; }
+    }
+    return null;
+  }
+
+  /**
+   * Frames a specialist's identity/mission ON TOP OF a role's required
+   * output contract — never in place of it. The specialist's own freeform
+   * debate-persona systemPrompt is deliberately NOT substituted here: it was
+   * written for open-ended argument, not for the strict JSON/output schema
+   * the orchestrator must be able to parse and apply, so only structured
+   * fields (name/specialty/mission) are folded in.
+   */
+  private _specialistFraming(specialist: AgentSpec): string {
+    return [
+      `SPECIALIST ASSIGNMENT: the team assigned this work to "${specialist.name}" (${specialist.specialty}), who already helped design this project's direction.`,
+      `Their mission on this team: ${specialist.mission}`,
+      'Bring that expertise and judgment to this specific piece of work, in addition to — never instead of — every rule and output format required below.',
+    ].join('\n');
+  }
+
+  private _prepareResumeTaskState(state: ProjectState): void {
+    // Verification evidence describes the files before Stop. A user may have
+    // edited them, so consensus must not finish using a stale browser/test pass.
+    if (state.sprintStage === 'retrospective') {
+      state.sprintStage = 'testing';
+      state.currentPhase = 'testing';
+    }
+    const stage = state.sprintStage ?? this._resumePhase(state);
+    if (stage !== 'coding') { return; }
+    const plan = this._loadTaskPlan();
+    if (!plan) { return; }
+    const completed = new Set(state.completedTasks);
+    for (const task of plan.tasks) {
+      if (task.status === 'completed' || completed.has(task.id)) {
+        task.status = 'completed';
+      } else {
+        task.status = 'pending';
+        delete task.error;
+        delete task.reviewResult;
+        delete task.startedAt;
+        delete task.completedAt;
+        task.retryCount = 0;
+      }
+    }
+    state.sprintStage = 'coding';
+    state.currentPhase = 'coding';
+    state.currentTaskId = null;
+    state.fixRetryCount = 0;
+    state.completedTasks = plan.tasks.filter(task => task.status === 'completed').map(task => task.id);
+    state.failedTasks = [];
+    state.activeTasks = plan.tasks.filter(task => task.status !== 'completed').map(task => task.id);
+    this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(plan));
   }
 
   /**
@@ -285,6 +926,17 @@ export class AgentOrchestrator {
   }
 
   /**
+   * Approve or reject a pending pre-run RAM optimization proposal.
+   */
+  resolveRamOptimization(id: string, approved: boolean): void {
+    const resolver = this._pendingRamOptimizationResolvers.get(id);
+    if (resolver) {
+      resolver(approved);
+      this._pendingRamOptimizationResolvers.delete(id);
+    }
+  }
+
+  /**
    * Get the current project state.
    */
   getState(): ProjectState {
@@ -305,6 +957,8 @@ export class AgentOrchestrator {
 
     const completedPhases: WorkflowPhase[] = phase !== 'idle' && phase !== 'intake' ? ['intake'] : [];
 
+    this.workspace.initializeJournal(state.projectGoal || this.workspace.readUserPrompt());
+
     try {
       this.workspace.appendMemoryEvent({
         type: 'phase',
@@ -312,6 +966,8 @@ export class AgentOrchestrator {
         summary: `Workflow route selected: ${route.kind}. ${route.reason}`,
         data: { route },
       });
+      this._journal('start', `Workflow started — route: ${route.kind}`,
+        `${route.reason}\n\n${route.skipDebate ? 'Debate is skipped for this focused maintenance task.' : 'Running the full multi-round debate before building.'}`);
       // The workflow starts with debate/brainstorming, then turns that consensus
       // into an executable brief and small implementation sprints.
       if (!route.skipDebate && !this._phaseAlreadyDone(phase, 'brainstorm', completedPhases)) {
@@ -329,14 +985,23 @@ export class AgentOrchestrator {
       } else if (route.skipDebate) {
         this._updateTimeline('second_brainstorm', 'skipped');
       }
+      // Round 3: the original proposer reads every critique and responds/revises.
+      // Round 4: a multi-model judging panel scores the consolidated approach and
+      // picks the single best direction before it is frozen into the brief.
+      if (!route.skipDebate && !this._phaseAlreadyDone(phase, 'briefing', completedPhases)) {
+        await this._phaseDebateResponse(state);
+        await this._phaseDebateScoring(state);
+      }
       if (!this._phaseAlreadyDone(phase, 'briefing', completedPhases)) {
         await this._phaseBriefing(state);
       }
+      // Focused maintenance keeps its existing checks; new products get a locked walk-through.
+      if (!route.skipDebate) { await this._phaseAcceptanceContract(state); }
       if (!this._phaseAlreadyDone(phase, 'toolchain_discovery', completedPhases)) {
         await this._phaseToolchainDiscovery(state);
       }
 
-      let sprint = 1;
+      let sprint = Math.max(1, state.developmentSprint ?? 1);
       let consensusReached = false;
       const maxSprints = this._maxDevelopmentSprints();
       while (sprint <= maxSprints && !consensusReached) {
@@ -344,12 +1009,24 @@ export class AgentOrchestrator {
         this.workspace.appendRollingSummary(`## Development Sprint ${sprint}\nPlanning, coding, reviewing, and testing the next smallest useful product increment.`);
         this._emit('log', `Starting development sprint ${sprint}/${maxSprints}.`, 'info');
 
-        await this._phaseArchitecture(state);
-        await this._phaseTaskPlanning(state);
-        this._scopeTaskPlanForSprint(sprint);
-        await this._phaseCoding(state);
-        await this._phaseDependencyInstall(state);
-        await this._phaseTesting(state);
+        const stages = ['architecture', 'task_planning', 'coding', 'dependency_install', 'testing', 'retrospective'] as const;
+        const resumeStage = Math.max(0, stages.indexOf(state.sprintStage ?? 'architecture'));
+        state.developmentSprint = sprint;
+        for (let index = resumeStage; index < stages.length - 1; index++) {
+          const stage = stages[index];
+          state.sprintStage = stage;
+          this.workspace.writeProjectState(state);
+          if (stage === 'architecture') { await this._phaseArchitecture(state); }
+          if (stage === 'task_planning') {
+            await this._phaseTaskPlanning(state);
+            this._scopeTaskPlanForSprint(sprint);
+          }
+          if (stage === 'coding') { await this._phaseCoding(state); }
+          if (stage === 'dependency_install') { await this._phaseDependencyInstall(state); }
+          if (stage === 'testing') { await this._phaseTesting(state); }
+          state.sprintStage = stages[index + 1];
+          this.workspace.writeProjectState(state);
+        }
 
         const consensus = await this._phaseImprovementConsensus(state, sprint);
         consensusReached = this._consensusReadyToStop(consensus);
@@ -361,15 +1038,30 @@ export class AgentOrchestrator {
         if (sprint >= maxSprints) {
           this.workspace.appendAssumption(
             'brainstorm',
-            `Reached the maximum autonomous development sprint limit (${maxSprints}). Stopping with the best verified product so far.`
+            `Reached the maximum autonomous development sprint limit (${maxSprints}) with remaining work. The product is incomplete.`
           );
-          break;
+          const remaining = [...new Set(consensus.flatMap(item => item.remainingWork))];
+          throw new WorkflowError(
+            `Product remains incomplete after ${maxSprints} development sprint(s): ${remaining.join('; ') || 'the reviewers did not reach completion consensus'}. Files and verification evidence are preserved for resume.`,
+            'testing'
+          );
         }
 
         this._prepareNextDevelopmentSprint(state, sprint, consensus);
         sprint += 1;
+        state.developmentSprint = sprint;
+        state.sprintStage = 'architecture';
+        this.workspace.writeProjectState(state);
       }
 
+      if (!consensusReached) {
+        throw new WorkflowError(`Completion blocked: sprint ${sprint} exceeds the configured development budget ${maxSprints} without completion consensus.`, 'testing');
+      }
+      // A model vote cannot erase failed/skipped work from the final sprint.
+      const unfinished = this._loadTaskPlan()?.tasks.filter(task => task.status !== 'completed') ?? [];
+      if (state.failedTasks.length > 0 || unfinished.length > 0) {
+        throw new WorkflowError(`Completion blocked by unfinished tasks: ${[...new Set([...state.failedTasks, ...unfinished.map(task => task.id)])].join(', ')}.`, 'final_integration');
+      }
       if (!this._phaseAlreadyDone(phase, 'artifact_delivery', completedPhases)) {
         await this._phaseArtifactDelivery(state);
       }
@@ -377,14 +1069,12 @@ export class AgentOrchestrator {
         await this._phaseFinalIntegration(state);
       }
 
-      // Completed!
-      state.status = 'completed';
-      state.currentPhase = 'completed';
-      state.currentTaskId = null;
-      state.fixRetryCount = 0;
+      finalizeCompletedState(state);
       this.workspace.writeProjectState(state);
       this.callbacks.onStateUpdate?.(state);
       this._updateTimeline('completed', 'completed');
+      this._journal('done', 'Workflow completed successfully',
+        `Completed ${state.completedTasks.length} task(s). See the final report note for the full handoff.`);
       this._emit('phase', 'completed', 'Workflow completed successfully!');
     } catch (err) {
       if (err instanceof WaitForUserError) {
@@ -398,9 +1088,14 @@ export class AgentOrchestrator {
         this.workspace.writeProjectState(state);
         this.callbacks.onStateUpdate?.(state);
         err.questions.forEach(q => this.callbacks.onQuestionNeeded?.(q));
+        this._journal('warn', 'Paused — waiting for the boss',
+          err.questions.map(q => `❓ ${q.question}`).join('\n'));
         this._emit('phase', 'waiting_for_user', `Waiting for user: ${err.questions.length} question(s)`);
         return;
       }
+      // Journaling happens once, centrally, in _handleTopLevelError (every
+      // caller of _runWorkflow funnels its catch there) — not here too, or a
+      // failure from inside this try block would get a duplicate journal entry.
       throw err;
     }
   }
@@ -422,14 +1117,25 @@ export class AgentOrchestrator {
     const brainstorm = this.workspace.readFile(this.workspace.brainstormPath) ?? '';
     const critique = this.workspace.readFile(this.workspace.criticPath) ?? '';
     const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
+    const debateResponse = this.workspace.readFile(this._debateResponsePath) ?? '';
+    const debateDecision = this.workspace.readFile(this._debateDecisionPath) ?? '';
     const context = this._assembleContext([
       this._sec('# User Prompt', prompt, 1),
+      // The round-4 decision is the authoritative outcome, so it gets top priority.
+      this._sec('# Debate Decision (authoritative winning direction)', debateDecision, 2),
+      this._sec('# Proposer Response (converged direction)', debateResponse, 4),
       this._sec('# Brainstorm Consensus', brainstorm, 5),
       this._sec('# Critique Consensus', critique, 6),
       this._sec('# Product Consensus', secondBrainstorm, 7),
     ]);
-    const { model, fallbackModel } = this._agentConfig('briefBuilder');
-    const messages = this._buildMessages('briefBuilder', context);
+    const briefSpecialist = this._specialistForPlanningRole('briefBuilder', state);
+    const { model, fallbackModel } = briefSpecialist
+      ? { model: briefSpecialist.model, fallbackModel: briefSpecialist.fallbackModel }
+      : this._agentConfig('briefBuilder');
+    const messages = this._buildMessages('briefBuilder', context, briefSpecialist);
+    if (briefSpecialist) {
+      this._emit('log', `Project brief routed to team specialist "${briefSpecialist.name}" (${briefSpecialist.model}).`, 'info');
+    }
 
     let brief: ProjectBrief;
     try {
@@ -455,9 +1161,118 @@ export class AgentOrchestrator {
       `Stack: ${brief.chosenStack.join(', ')}\n\n` +
       `Acceptance: ${brief.acceptanceCriteria.join('; ')}`
     );
+    this._journal('brief', 'Project brief locked', [
+      `**Goal:** ${brief.goal}`,
+      `**App type:** ${brief.appType}`,
+      `**Stack:** ${brief.chosenStack.join(', ')}`,
+      `**Core features:** ${brief.coreFeatures.join('; ')}`,
+      `**Acceptance criteria:**\n${brief.acceptanceCriteria.map(c => `- ${c}`).join('\n')}`,
+    ].join('\n'));
 
     this._updateTimeline('briefing', 'completed');
     this._emit('log', 'Autonomous project brief complete.', 'info');
+  }
+
+  /**
+   * Lock a browser acceptance walk-through before any code exists (ECC
+   * generator/evaluator split): planners write it from the brief, coders build
+   * to it, and the final checks replay it. Coders cannot edit it, so a product
+   * cannot pass by weakening its own test. Failure to write a valid contract
+   * is not fatal; the run then relies on the other gates.
+   */
+  private async _phaseAcceptanceContract(state: ProjectState): Promise<void> {
+    this._checkAborted();
+    if (this.workspace.fileExists(this.workspace.acceptanceContractPath)) { return; }
+    if (process.env.DEBATE_ACCEPTANCE_SCRIPT) {
+      this._journal('info', 'Acceptance contract skipped', 'A human-written acceptance script (DEBATE_ACCEPTANCE_SCRIPT) is configured and takes precedence.');
+      return;
+    }
+    const brief = this.workspace.readFile(this.workspace.projectBriefPath) ?? '';
+    const specialist = this._specialistForPlanningRole('briefBuilder', state);
+    const { model, fallbackModel } = specialist
+      ? { model: specialist.model, fallbackModel: specialist.fallbackModel }
+      : this._agentConfig('briefBuilder');
+    const instructions = [
+      'You are the independent QA lead. Before any code exists, write the acceptance walk-through that a real browser will replay against the finished product.',
+      'The builders will read it and must make it pass; they cannot change it. Cover the main user journey and the brief\'s acceptance criteria with observable checks.',
+      'If the product has no browser page (CLI, API, library, native app), return {"applicable": false, "reason": "..."}.',
+      'Otherwise return {"applicable": true, "steps": [...]} using ONLY these step objects:',
+      '  {"do":"press","key":"ArrowLeft","holdMs":300}   keys: letters, digits, " ", Enter, Escape, Arrow*',
+      '  {"do":"click","selector":"#add-note"}  or  {"do":"click","x":640,"y":450}',
+      '  {"do":"type","selector":"#title","text":"Groceries"}   (clicks the field, then types)',
+      '  {"do":"wait","ms":500}',
+      '  {"do":"reload"}   (persistence checks)',
+      '  {"do":"dialog","accept":false}   (how later confirm() dialogs are answered; default accept)',
+      '  {"do":"remember","name":"before","expression":"document.querySelectorAll(\'.note\').length"}',
+      '  {"do":"expect","label":"the new note is listed","expression":"document.body.innerText.includes(\'Groceries\')","timeoutMs":3000}',
+      '  {"do":"screenshot","name":"after-add"}',
+      'Expressions are JavaScript evaluated in the page; they may read remembered values as memo.<name>. An expect passes when its expression becomes truthy before the timeout.',
+      'Rules: at least 3 expect steps, and at least one expect after a press/click/type; at most 60 steps and 180 seconds in total.',
+      'Name every selector, key, global, or window.* test hook you rely on precisely: the builders will implement exactly those. Prefer ids/data-testid and visible text over layout details.',
+      'A canvas game should expose a read-only window.__gameState snapshot that expectations can read. Use test hooks only to skip parts a script cannot play quickly (e.g. finishing many levels), never to fake the behaviour under test.',
+      'Respond with ONLY the JSON object.',
+    ].join('\n');
+    let feedback = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const messages: OllamaMessage[] = [
+        { role: 'system', content: instructions },
+        { role: 'user', content: `# Project Brief\n${brief}${feedback ? `\n\n# Your previous contract was rejected\n${feedback}\nReturn a corrected contract.` : ''}` },
+      ];
+      let raw: unknown;
+      try {
+        raw = await this._callWithFallbackJson<unknown>('briefBuilder', model, fallbackModel, messages,
+          this.workspace.acceptanceContractPath + '.draft', [this.workspace.projectBriefPath]);
+      } catch (err) {
+        if (err instanceof UserAbortError) { throw err; }
+        feedback = `The response was not valid JSON: ${formatError(err)}`;
+        continue;
+      }
+      const { contract, errors } = parseAcceptanceContract(raw);
+      if (!contract) {
+        feedback = errors.map(error => `- ${error}`).join('\n');
+        continue;
+      }
+      this._lockAcceptanceContract(state, contract);
+      return;
+    }
+    this._journal('warn', 'No acceptance contract', `The planner could not produce a valid browser walk-through; the run relies on the other gates.\n${feedback}`);
+  }
+
+  private _lockAcceptanceContract(state: ProjectState, contract: AcceptanceContract): void {
+    const text = prettyJson(contract);
+    this.workspace.writeFile(this.workspace.acceptanceContractPath, text);
+    state.acceptanceContractSha256 = createHash('sha256').update(text).digest('hex');
+    this.workspace.writeProjectState(state);
+    const lines = describeAcceptanceContract(contract);
+    if (contract.applicable) {
+      try {
+        const brief = JSON.parse(this.workspace.readFile(this.workspace.projectBriefPath) ?? '') as ProjectBrief;
+        brief.acceptanceWalkthrough = lines;
+        brief.acceptanceCriteria = [...(brief.acceptanceCriteria ?? []),
+          'The locked acceptanceWalkthrough passes when replayed in a real browser with real key presses and clicks.'];
+        this.workspace.writeFile(this.workspace.projectBriefPath, prettyJson(brief));
+      } catch {
+        // A non-JSON brief still gets the contract enforced at the final checks.
+      }
+    }
+    this._journal('brief', contract.applicable ? 'Acceptance walk-through locked' : 'No browser walk-through applies', lines.join('\n'));
+  }
+
+  /** The locked contract, or undefined when absent, not applicable, or changed since locking. */
+  private _loadAcceptanceContract(): AcceptanceContract | undefined {
+    const text = this.workspace.readFile(this.workspace.acceptanceContractPath);
+    if (!text) { return undefined; }
+    const expected = this.workspace.readProjectState().acceptanceContractSha256;
+    if (!expected || createHash('sha256').update(text).digest('hex') !== expected) {
+      this._journal('warn', 'Acceptance contract ignored', 'The contract file changed after it was locked, so it is not trusted.');
+      return undefined;
+    }
+    try {
+      const { contract } = parseAcceptanceContract(JSON.parse(text));
+      return contract?.applicable ? contract : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async _phaseBrainstorm(state: ProjectState): Promise<void> {
@@ -486,6 +1301,7 @@ export class AgentOrchestrator {
 
     this.workspace.writeFile(this.workspace.brainstormPath, this._wrapNote('Brainstorm Analysis', output));
     this.workspace.appendRollingSummary(`## Brainstorm Complete\n${output.substring(0, 500)}`);
+    this._journal('brainstorm', 'Round 1 — Initial proposal', output);
     this._recordActivity({
       phase: 'brainstorm',
       agentRole: 'brainstorm',
@@ -543,6 +1359,7 @@ export class AgentOrchestrator {
       const wrapped = this._wrapNote(`Critique Round ${round}`, output);
       this.workspace.writeFile(roundPath, wrapped);
       priorRounds += `\n\n${wrapped}`;
+      this._journal('critique', `Round 2 — Critique (round ${round}/${this._debateRounds()})`, output);
       this._recordActivity({
         phase: 'critique',
         agentRole: 'critic',
@@ -606,6 +1423,7 @@ export class AgentOrchestrator {
       const wrapped = this._wrapNote(`Second Brainstorm Round ${round}`, output);
       this.workspace.writeFile(roundPath, wrapped);
       priorRounds += `\n\n${wrapped}`;
+      this._journal('product', `Round 2 — Product/UX debate (round ${round}/${this._debateRounds()})`, output);
       this._recordActivity({
         phase: 'second_brainstorm',
         agentRole: 'secondBrainstorm',
@@ -622,6 +1440,287 @@ export class AgentOrchestrator {
     this._emit('log', 'Second brainstorm complete.', 'info');
   }
 
+  // Path of the round-3 rebuttal note (proposer responds to all critiques).
+  private get _debateResponsePath(): string {
+    return this.workspace.agentNotePath('04_debate_response.md');
+  }
+
+  // Path of the round-4 panel decision (markdown summary).
+  private get _debateDecisionPath(): string {
+    return this.workspace.agentNotePath('05_debate_decision.md');
+  }
+
+  /**
+   * Round 3 of the debate: the original proposer (brainstorm model) reads the
+   * critique and product-debate notes and answers them point by point, defending
+   * or revising the proposal. This closes the loop so critique is two-way.
+   */
+  private async _phaseDebateResponse(state: ProjectState): Promise<void> {
+    this._checkAborted();
+    if (this.workspace.fileExists(this._debateResponsePath)) { return; }
+    this._setPhase(state, 'second_brainstorm', 'Debate round 3: proposer responds to critiques...');
+
+    const prompt = this._userPromptWithFileContext();
+    const promptFiles = this._promptReferencedFilePaths();
+    const brainstorm = this.workspace.readFile(this.workspace.brainstormPath) ?? '';
+    const critique = this.workspace.readFile(this.workspace.criticPath) ?? '';
+    const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
+    const { model, fallbackModel } = this._agentConfig('brainstorm');
+
+    const context = this._assembleContext([
+      this._sec('# User Prompt', prompt, 1),
+      this._sec('# Your Original Proposal', brainstorm, 3),
+      this._sec('# Critique Raised Against It', critique, 4),
+      this._sec('# Product / UX Feedback', secondBrainstorm, 5),
+    ]);
+    const messages: OllamaMessage[] = [
+      {
+        role: 'system',
+        content: [
+          'You are the original proposing architect in a multi-agent debate.',
+          'Other agents have critiqued your proposal. Respond to that feedback directly.',
+          'For each significant critique: either defend your original choice with a concrete reason, or revise it and state the new decision.',
+          'Do not repeat the whole proposal. Focus on the points under dispute and converge on a single coherent direction.',
+          'Do NOT write code. Do not ask the user questions; resolve ambiguity with explicit assumptions.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: `${context}\n\n---\n\nOUTPUT: A markdown document with sections:\n# Debate Response\n## Accepted Critiques (with the revised decision)\n## Defended Decisions (with justification)\n## Converged Direction (the single approach to proceed with)\n## Updated Assumptions`,
+      },
+    ];
+
+    let output: string;
+    try {
+      output = await this._callWithFallback('brainstorm', model, fallbackModel, messages,
+        this._debateResponsePath,
+        [this.workspace.userPromptPath, ...promptFiles, this.workspace.brainstormPath, this.workspace.criticPath, this.workspace.secondBrainstormPath]);
+    } catch (err) {
+      output = this._fallbackAgentNote('brainstorm', context, err);
+      this.workspace.appendAssumption('brainstorm', `Self-healed failed debate response: ${formatError(err)}`);
+      this._emit('log', 'Debate response failed; continuing with a deterministic self-healed note.', 'warn');
+    }
+
+    this.workspace.writeFile(this._debateResponsePath, this._wrapNote('Debate Response (Round 3)', output));
+    this._journal('response', 'Round 3 — Proposer responds to critiques', output);
+    this._recordActivity({
+      phase: 'second_brainstorm',
+      agentRole: 'brainstorm',
+      title: 'Debate round 3 complete',
+      detail: 'Proposer answered every critique and converged on a single direction.',
+      status: 'completed',
+    });
+    this._emit('log', 'Debate response (round 3) complete.', 'info');
+  }
+
+  /**
+   * Round 4 of the debate: a panel of distinct local models independently scores
+   * the consolidated approach across weighted criteria and recommends the single
+   * best direction. The scores are aggregated into one decision used by the brief.
+   */
+  private async _phaseDebateScoring(state: ProjectState): Promise<void> {
+    this._checkAborted();
+    if (this.workspace.fileExists(this._debateDecisionPath)) { return; }
+    this._setPhase(state, 'second_brainstorm', 'Debate round 4: judging panel scores the approach...');
+
+    const prompt = this._userPromptWithFileContext();
+    const promptFiles = this._promptReferencedFilePaths();
+    const brainstorm = this.workspace.readFile(this.workspace.brainstormPath) ?? '';
+    const critique = this.workspace.readFile(this.workspace.criticPath) ?? '';
+    const secondBrainstorm = this.workspace.readFile(this.workspace.secondBrainstormPath) ?? '';
+    const response = this.workspace.readFile(this._debateResponsePath) ?? '';
+
+    const baseContext = this._assembleContext([
+      this._sec('# User Prompt', prompt, 1),
+      this._sec('# Brainstorm Proposal', brainstorm, 3),
+      this._sec('# Critique', critique, 4),
+      this._sec('# Product / UX Perspective', secondBrainstorm, 5),
+      this._sec('# Proposer Response (converged direction)', response, 3),
+    ]);
+
+    // Five distinct models, each judging from its own lens, satisfy the
+    // "at least 5 agents of different models vote" requirement. A runtime guard
+    // guarantees the diversity even when two roles share a primary model.
+    const panelRoles: AgentRole[] = ['brainstorm', 'critic', 'secondBrainstorm', 'architect', 'reviewer'];
+    const lenses: Record<string, string> = {
+      brainstorm: 'overall technical soundness',
+      critic: 'risks, security, and correctness',
+      secondBrainstorm: 'product value and user/developer experience',
+      architect: 'architectural feasibility on a local-first stack',
+      reviewer: 'implementation quality and completeness',
+    };
+
+    const { assignments: panelModels, distinctCount } = this._assignDiversePanelModels(panelRoles);
+    if (distinctCount < panelRoles.length) {
+      const warning =
+        `Debate panel could only assign ${distinctCount} distinct model(s) for ${panelRoles.length} judges. ` +
+        `Install more local models (the roster currently exposes ${this._modelRoster().length}) so every judge votes on a different model.`;
+      this._emit('log', warning, 'warn');
+      this._journal('warn', 'Debate panel model diversity below target', warning);
+      this.workspace.appendAssumption('debate', warning);
+    } else {
+      this._journal('decision', 'Debate panel assembled',
+        panelRoles.map(r => `- **${r}** → \`${panelModels.get(r)!.model}\` (${lenses[r]})`).join('\n'));
+    }
+
+    const panel: DebateScore[] = [];
+    for (const role of panelRoles) {
+      this._checkAborted();
+      const { model, fallbackModel } = panelModels.get(role)!;
+      const outputPath = this.workspace.agentNotePath(`05_debate_score_${role}.json`);
+      const messages: OllamaMessage[] = [
+        {
+          role: 'system',
+          content: [
+            `You are a debate judge focused on ${lenses[role] ?? 'overall quality'}.`,
+            'Score the converged approach honestly on a 0-10 scale per criterion (10 = excellent).',
+            'For "risk", a HIGHER score means SAFER (fewer unmitigated risks).',
+            'Then recommend the single best direction to proceed with. Respond only with valid JSON.',
+          ].join('\n'),
+        },
+        {
+          role: 'user',
+          content: [
+            baseContext,
+            '',
+            'Return exactly this JSON shape:',
+            '{',
+            `  "agentRole": "${role}",`,
+            '  "scores": { "feasibility": 0, "completeness": 0, "risk": 0, "ux": 0, "quality": 0 },',
+            '  "overall": 0,',
+            '  "recommendation": "the single direction you would proceed with",',
+            '  "topRisk": "the most important remaining risk"',
+            '}',
+          ].join('\n'),
+        },
+      ];
+
+      let score: DebateScore;
+      try {
+        score = await this._callWithFallbackJson<DebateScore>(
+          role, model, fallbackModel, messages, outputPath,
+          [this.workspace.userPromptPath, ...promptFiles, this.workspace.brainstormPath, this.workspace.criticPath, this.workspace.secondBrainstormPath]
+        );
+      } catch (err) {
+        score = this._fallbackDebateScore(role, err);
+        this.workspace.appendAssumption(role, `Self-healed failed debate score: ${formatError(err)}`);
+      }
+      score = this._normalizeDebateScore(role, score);
+      panel.push(score);
+      this.workspace.writeFile(outputPath, prettyJson(score));
+      this._recordActivity({
+        phase: 'second_brainstorm',
+        agentRole: role,
+        title: `Debate score: ${role}`,
+        detail: `Overall ${score.overall}/10 — ${score.recommendation.slice(0, 80)}`,
+        status: 'completed',
+      });
+    }
+
+    const decision = this._aggregateDebateScores(panel);
+    this.workspace.writeFile(
+      this._debateDecisionPath,
+      this._wrapNote('Debate Decision (Round 4 — Scoring & Vote)', [
+        `Winning direction: ${decision.winningDirection}`,
+        `Weighted score: ${decision.weightedScore}/10`,
+        `Panel agreement: ${decision.agreement} (${decision.judgeCount} judges)`,
+        '',
+        '## Ranked Recommendations',
+        ...decision.rankedRecommendations.map((r, i) => `${i + 1}. (${r.overall}/10, ${r.agentRole}) ${r.recommendation}`),
+        '',
+        `## Rationale\n${decision.rationale}`,
+      ].join('\n'))
+    );
+    this.workspace.appendRollingSummary(
+      `## Debate Decision\nWinning direction (score ${decision.weightedScore}/10, ${decision.agreement} agreement): ${decision.winningDirection}`
+    );
+    this._journal('decision', `Round 4 — Panel verdict: ${decision.weightedScore}/10 (${decision.agreement} agreement)`,
+      [
+        `**Winning direction:** ${decision.winningDirection}`,
+        '',
+        '**Ranked recommendations:**',
+        ...decision.rankedRecommendations.map((r, i) => `${i + 1}. (${r.overall}/10 — ${r.agentRole}) ${r.recommendation}`),
+        '',
+        decision.rationale,
+      ].join('\n'));
+    this._emit('log', `Debate scoring complete: ${decision.weightedScore}/10 (${decision.agreement} agreement).`, 'info');
+  }
+
+  /**
+   * Pure aggregation of the round-4 panel: averages the weighted scores, ranks
+   * each judge's recommendation by its overall score, and selects the highest as
+   * the winning direction. Exposed for unit testing (no model calls).
+   */
+  private _aggregateDebateScores(panel: DebateScore[]): DebateDecision {
+    if (panel.length === 0) {
+      return {
+        winningDirection: 'No panel scores were produced; proceed with the proposer response.',
+        weightedScore: 0,
+        judgeCount: 0,
+        agreement: 'low',
+        rankedRecommendations: [],
+        rationale: 'The scoring panel returned no usable results.',
+      };
+    }
+
+    const ranked = [...panel]
+      .map(p => ({ agentRole: p.agentRole, overall: p.overall, recommendation: p.recommendation }))
+      .sort((a, b) => b.overall - a.overall);
+
+    const overalls = panel.map(p => p.overall);
+    const mean = overalls.reduce((sum, v) => sum + v, 0) / overalls.length;
+    const variance = overalls.reduce((sum, v) => sum + (v - mean) ** 2, 0) / overalls.length;
+    const spread = Math.sqrt(variance);
+    // Tight spread of high-ish scores => the judges agree.
+    const agreement: DebateDecision['agreement'] = spread <= 1.0 ? 'high' : spread <= 2.0 ? 'medium' : 'low';
+
+    const winner = ranked[0];
+    return {
+      winningDirection: winner.recommendation,
+      weightedScore: Math.round(mean * 10) / 10,
+      judgeCount: panel.length,
+      agreement,
+      rankedRecommendations: ranked,
+      rationale: `Selected the highest-scored direction (${winner.overall}/10 from ${winner.agentRole}). `
+        + `Panel mean ${Math.round(mean * 10) / 10}/10 with ${agreement} agreement (score spread ${Math.round(spread * 100) / 100}).`,
+    };
+  }
+
+  private _normalizeDebateScore(role: AgentRole, value: Partial<DebateScore> | null | undefined): DebateScore {
+    const clamp = (n: unknown): number => {
+      const num = Number(n);
+      if (!Number.isFinite(num)) { return 5; }
+      return Math.max(0, Math.min(10, Math.round(num * 10) / 10));
+    };
+    const s = value?.scores ?? {};
+    const scores = {
+      feasibility: clamp((s as Record<string, unknown>).feasibility),
+      completeness: clamp((s as Record<string, unknown>).completeness),
+      risk: clamp((s as Record<string, unknown>).risk),
+      ux: clamp((s as Record<string, unknown>).ux),
+      quality: clamp((s as Record<string, unknown>).quality),
+    };
+    const derived = (scores.feasibility + scores.completeness + scores.risk + scores.ux + scores.quality) / 5;
+    const overall = value?.overall === undefined ? clamp(derived) : clamp(value.overall);
+    return {
+      agentRole: role,
+      scores,
+      overall,
+      recommendation: String(value?.recommendation ?? 'Proceed with the converged direction from the debate.').trim(),
+      topRisk: String(value?.topRisk ?? 'No specific risk reported.').trim(),
+    };
+  }
+
+  private _fallbackDebateScore(role: AgentRole, err: unknown): DebateScore {
+    return this._normalizeDebateScore(role, {
+      agentRole: role,
+      scores: { feasibility: 5, completeness: 5, risk: 5, ux: 5, quality: 5 },
+      overall: 5,
+      recommendation: 'Proceed with the converged direction from the debate response (scoring model unavailable).',
+      topRisk: `Scoring model failed: ${formatError(err)}`,
+    });
+  }
+
   private async _phaseToolchainDiscovery(state: ProjectState): Promise<void> {
     this._checkAborted();
     this._setPhase(state, 'toolchain_discovery', 'Inspecting local toolchain...');
@@ -634,7 +1733,11 @@ export class AgentOrchestrator {
       ['pnpm', 'pnpm --version'],
       ['yarn', 'yarn --version'],
       ['git', 'git --version'],
+      ['python3', 'python3 --version'],
+      ['python', 'python --version'],
+      ['pip3', 'pip3 --version'],
       ['java', 'java -version'],
+      ['swift', 'swift --version'],
       ['xcodebuild', 'xcodebuild -version'],
       ['android-sdk', 'adb version'],
       ['flutter', 'flutter --version'],
@@ -738,6 +1841,30 @@ export class AgentOrchestrator {
     };
 
     this.workspace.writeFile(this.workspace.toolchainReportPath, prettyJson(report));
+
+    // Inject hard constraints into assumptions so every downstream agent reads them.
+    // A real run shipped a browser/Phaser.js game whose fixer nonetheless invented
+    // a Package.swift and got "swift test" wired up as the verification command —
+    // because this constraint used to fire whenever Swift CLI tools were merely
+    // *present on the machine*, worded as "All Apple platform projects MUST...",
+    // which a model reading it out of context applied to whatever it was building,
+    // Apple platform or not. Gate it on the brief's OWN chosen stack actually
+    // being a native Apple target, not on what happens to be installed.
+    const swiftCheck = checks.find(c => c.name === 'swift');
+    const xcodebuildCheck = checks.find(c => c.name === 'xcodebuild');
+    if (swiftCheck?.available && !xcodebuildCheck?.available && this._targetsNativeApplePlatform()) {
+      this.workspace.appendAssumption(
+        'toolchain',
+        `TOOLCHAIN CONSTRAINT: this project targets a native Apple platform, and Swift ${swiftCheck.version ?? ''} is ` +
+        `available via Command Line Tools, but xcodebuild is NOT available. ` +
+        `Use Package.swift (Swift Package Manager) as the project root. ` +
+        `Do NOT generate .xcodeproj files — they are non-functional without full Xcode. ` +
+        `Use "swift build" for compilation and "swift test" for tests. ` +
+        `(This constraint applies ONLY because this specific project targets iOS/macOS/watchOS/tvOS — ` +
+        `it is irrelevant to any other project on this machine.)`
+      );
+    }
+
     this.workspace.appendRollingSummary(
       `## Toolchain Discovery\nAvailable: ${checks.filter(c => c.available).map(c => c.name).join(', ') || 'none'}\n` +
       `Missing: ${report.missing.join(', ') || 'none'}\n` +
@@ -746,6 +1873,25 @@ export class AgentOrchestrator {
 
     this._updateTimeline('toolchain_discovery', 'completed');
     this._emit('log', 'Toolchain discovery complete.', 'info');
+  }
+
+  /**
+   * True only when the project's OWN brief both targets an Apple OS and chose
+   * a native (Swift/UIKit/AppKit) stack for it — not merely because Swift CLI
+   * tools happen to be installed on this machine. Requiring both signals keeps
+   * a cross-platform target (e.g. React Native on "iOS, Android") from being
+   * mistaken for a native app just because "iOS" appears in targetPlatforms.
+   */
+  private _targetsNativeApplePlatform(): boolean {
+    const raw = this.workspace.readFile(this.workspace.projectBriefPath);
+    if (!raw) { return false; }
+    let brief: ProjectBrief;
+    try { brief = JSON.parse(raw) as ProjectBrief; } catch { return false; }
+    const platforms = (Array.isArray(brief.targetPlatforms) ? brief.targetPlatforms : []).join(' ').toLowerCase();
+    const stack = (Array.isArray(brief.chosenStack) ? brief.chosenStack : []).join(' ').toLowerCase();
+    const applePlatform = /\b(ios|ipados|macos|watchos|tvos|visionos)\b/.test(platforms);
+    const nativeStack = /\bswift(ui)?\b|\buikit\b|\bappkit\b|\bxcode\b/.test(stack);
+    return applePlatform && nativeStack;
   }
 
   private async _phaseArchitecture(state: ProjectState): Promise<void> {
@@ -765,6 +1911,7 @@ export class AgentOrchestrator {
     const context = this._assembleContext([
       this._sec('# User Prompt', prompt, 1),
       this._sec('# Autonomous Project Brief', brief, 2),
+      this._sec('# Existing Product and Next Sprint', this._sprintPlanningContext(state), 2),
       this._sec('# Local Toolchain Report', toolchain, 3),
       this._sec('# Git Repository Snapshot', gitSnapshot, 4),
       this._sec('', brainstorm, 5),
@@ -774,8 +1921,14 @@ export class AgentOrchestrator {
       this._sec('', assumptions, 9),
     ]);
 
-    const { model, fallbackModel } = this._agentConfig('architect');
-    const messages = this._buildMessages('architect', context);
+    const architectSpecialist = this._specialistForPlanningRole('architect', state);
+    const { model, fallbackModel } = architectSpecialist
+      ? { model: architectSpecialist.model, fallbackModel: architectSpecialist.fallbackModel }
+      : this._agentConfig('architect');
+    const messages = this._buildMessages('architect', context, architectSpecialist);
+    if (architectSpecialist) {
+      this._emit('log', `Architecture routed to team specialist "${architectSpecialist.name}" (${architectSpecialist.model}).`, 'info');
+    }
 
     let architectPlan: ArchitectPlan | null = null;
     let output: string;
@@ -861,6 +2014,11 @@ export class AgentOrchestrator {
       detail: (architectPlan?.summary ?? 'Architecture plan is ready for task planning.'),
       status: 'completed',
     });
+    this._journal('architect', 'Architecture decided', [
+      architectPlan?.summary ? `**Summary:** ${architectPlan.summary}` : '',
+      architectPlan?.technology?.length ? `**Technology:** ${architectPlan.technology.join(', ')}` : '',
+      architectPlan?.keyDecisions?.length ? `**Key decisions:**\n${architectPlan.keyDecisions.map(d => `- ${d}`).join('\n')}` : '',
+    ].filter(Boolean).join('\n'));
     this._updateTimeline('architecture', 'completed');
     this._emit('log', 'Architecture complete.', 'info');
   }
@@ -878,10 +2036,13 @@ export class AgentOrchestrator {
     const assumptions = this.workspace.readFile(this.workspace.assumptionsPath) ?? '';
     const decisions = this.workspace.readFile(this.workspace.decisionsPath) ?? '';
     const openQns = this.workspace.readFile(this.workspace.openQuestionsPath) ?? '';
+    const teamPlan = this._currentTeamPlan(state);
     const context = this._assembleContext([
       this._sec('# User Prompt And Referenced Files', prompt, 1),
       this._sec('# Autonomous Project Brief', brief, 2),
+      this._sec('# Existing Product and Next Sprint', this._sprintPlanningContext(state), 2),
       this._sec('', architectMd, 2),
+      this._sec('# Specialist Team Roster', this._specialistRosterContext(teamPlan), 2),
       this._sec('# Local Toolchain Report', toolchain, 3),
       this._sec('# Git Repository Snapshot', gitSnapshot, 4),
       this._sec('', decisions, 5),
@@ -889,8 +2050,14 @@ export class AgentOrchestrator {
       this._sec('', assumptions, 9),
     ]);
 
-    const { model, fallbackModel } = this._agentConfig('taskManager');
-    const messages = this._buildMessages('taskManager', context);
+    const taskManagerSpecialist = this._specialistForPlanningRole('taskManager', state);
+    const { model, fallbackModel } = taskManagerSpecialist
+      ? { model: taskManagerSpecialist.model, fallbackModel: taskManagerSpecialist.fallbackModel }
+      : this._agentConfig('taskManager');
+    const messages = this._buildMessages('taskManager', context, taskManagerSpecialist);
+    if (taskManagerSpecialist) {
+      this._emit('log', `Task planning routed to team specialist "${taskManagerSpecialist.name}" (${taskManagerSpecialist.model}).`, 'info');
+    }
 
     let taskPlan: TaskPlan | null = null;
     let output: string;
@@ -916,7 +2083,10 @@ export class AgentOrchestrator {
       if (!Array.isArray(taskPlan.tasks) || taskPlan.tasks.length === 0) {
         throw new Error('Task plan contains no tasks.');
       }
-      taskPlan.tasks = taskPlan.tasks.map((t, index) => this._normalizeTaskItem(t, index, now));
+      const validSpecialistIds = new Set((teamPlan?.agents ?? []).map(a => a.id));
+      taskPlan.tasks = this._splitOversizedTasks(
+        taskPlan.tasks.map((t, index) => this._normalizeTaskItem(t, index, now, validSpecialistIds))
+      );
       taskPlan.totalTasks = taskPlan.tasks.length;
       taskPlan.createdAt = taskPlan.createdAt || now;
     } catch (err) {
@@ -951,6 +2121,8 @@ export class AgentOrchestrator {
       status: 'completed',
     });
     this._emit('log', `Task plan created: ${taskPlan.totalTasks} tasks.`, 'info');
+    this._journal('plan', `Task plan ready — ${taskPlan.totalTasks} task(s), ${taskPlan.estimatedComplexity} complexity`,
+      taskPlan.tasks.map((t, i) => `${i + 1}. **${t.id}** — ${t.title}\n   ${t.description}`).join('\n'));
     this._updateTimeline('task_planning', 'completed');
   }
 
@@ -993,6 +2165,17 @@ export class AgentOrchestrator {
 
         const unmetDeps = task.dependsOn.filter(dep => !state.completedTasks.includes(dep));
         if (unmetDeps.length === 0) {
+          // Dependency-ready, but don't run it in the SAME parallel wave as a
+          // task that writes one of the same files: concurrent edits to a shared
+          // file (e.g. requirements.txt) trip the patch guard's "changed after
+          // the agent read it" protection and hard-fail the loser. Defer it to
+          // the next wave so it rebases on the freshly written file instead.
+          const taskFiles = new Set(task.allowedFiles ?? []);
+          const sharesFileWithWave = wave.some(w => (w.allowedFiles ?? []).some(f => taskFiles.has(f)));
+          if (sharesFileWithWave) {
+            this._emit('log', `Task "${task.id}" deferred to next wave: shares a file with a task already in this wave.`, 'info');
+            continue;
+          }
           wave.push(task);
           continue;
         }
@@ -1009,21 +2192,51 @@ export class AgentOrchestrator {
           continue;
         }
 
-        if (failedDeps.length > 0 && this._selfHealingConfig().enabled) {
-          this._emit('log', `Task "${task.id}" continuing despite failed dependencies [${failedDeps.join(', ')}] via self-healing.`, 'warn');
-          this.workspace.appendAssumption(
-            'codeWorker',
-            `Task ${task.id} continued although dependencies failed: ${failedDeps.join(', ')}. Assumption: downstream tasks should recreate any missing setup they need.`
-          );
-          wave.push(task);
-        } else {
-          this._emit('log', `Task "${task.id}" skipped: unmet dependencies [${unmetDeps.join(', ')}]`, 'warn');
-          task.status = 'skipped';
-          state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+        // Before cascading a skip through every dependent (benchmark run 10:
+        // one failed setup task skipped all 10 others), re-run each failed
+        // prerequisite once, from the files it already wrote, with the stronger
+        // fixer model.
+        const retryable = failedDeps.filter(dep => state.failedTasks.includes(dep) && !this._secondChanceTasks.has(dep));
+        if (retryable.length > 0) {
+          for (const dep of retryable) {
+            const depTask = taskPlan.tasks.find(t => t.id === dep);
+            if (!depTask) { continue; }
+            this._secondChanceTasks.add(dep);
+            this.escalatedFixTasks.add(dep);
+            state.failedTasks = state.failedTasks.filter(id => id !== dep);
+            if (!state.activeTasks.includes(dep)) { state.activeTasks.push(dep); }
+            const previousError = depTask.error ?? 'unknown error';
+            depTask.status = 'pending';
+            depTask.error = undefined;
+            terminalIds.delete(dep);
+            if (!wave.includes(depTask)) { wave.push(depTask); }
+            this._emit('log', `Task "${dep}" failed but ${task.id} depends on it; retrying it once with the stronger fixer before skipping dependents.`, 'warn');
+            this.workspace.appendAssumption('codeWorker', `Task ${dep} got one retry (stronger fixer, existing files kept) because dependents were about to be skipped. Previous failure: ${previousError.slice(0, 300)}`);
+          }
+          task.status = 'pending';
           this.workspace.writeProjectState(state);
           this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
           this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+          continue;
         }
+
+        // A prerequisite hard-failed (failed or skipped). Running this task now
+        // would build on missing foundations (e.g. importing modules a failed
+        // task never created), producing a broken shell that wastes the rest of
+        // the run. Skip it and cascade the skip to its own dependents.
+        this._emit('log', `Task "${task.id}" skipped: prerequisite(s) failed [${failedDeps.join(', ')}]`, 'warn');
+        this.workspace.appendAssumption(
+          'codeWorker',
+          `Task ${task.id} skipped because prerequisite task(s) failed: ${failedDeps.join(', ')}. Downstream work must not rely on foundations that were never built.`
+        );
+        task.status = 'skipped';
+        skippedIds.add(task.id);
+        terminalIds.add(task.id);
+        state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+        this.workspace.writeProjectState(state);
+        this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+        this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+        this._journal('warn', `Task ${task.id} skipped (failed prerequisite)`, `Prerequisite(s) failed: ${failedDeps.join(', ')}. Its dependents will also be skipped.`);
       }
 
       if (wave.length === 0) { break; }
@@ -1049,9 +2262,10 @@ export class AgentOrchestrator {
       this.workspace.writeProjectState(state);
       this.callbacks.onTaskUpdate?.(taskPlan.tasks);
 
-      // === PARALLEL: run code workers for all wave tasks simultaneously ===
+      // Schedule independent workers together; OllamaClient serializes model
+      // generation so multiple context caches cannot overcommit local RAM.
       if (wave.length > 1) {
-        this._emit('log', `Parallel execution: ${wave.length} independent tasks [${wave.map(t => t.id).join(', ')}]`, 'info');
+        this._emit('log', `Scheduling ${wave.length} independent tasks [${wave.map(t => t.id).join(', ')}]; local model generation runs sequentially.`, 'info');
       }
       const workerOutcomes = await Promise.allSettled(
         wave.map(task => this._executeCodeWorker(task, architectMd, rollingSummary, state))
@@ -1061,6 +2275,12 @@ export class AgentOrchestrator {
       for (let wi = 0; wi < wave.length; wi++) {
         this._checkAborted();
         const task = wave[wi];
+        // Resilience: any UNEXPECTED throw while processing one task (e.g. a
+        // malformed model response that slips past normalization) must degrade
+        // that single task to "failed" and let the run continue — never kill a
+        // multi-hour autonomous build over one task. Control-flow signals
+        // (pause-for-user, abort) are re-thrown untouched.
+        try {
         const outcome = workerOutcomes[wi];
 
         let workerResult: CodeWorkerOutput | null = null;
@@ -1103,12 +2323,32 @@ export class AgentOrchestrator {
           throw new WaitForUserError(questions);
         }
 
+        let scopeNote = '';
+        if (!workerResultAlreadyApplied && workerResult.files.length === 0) {
+          const existing = this._existingTaskReviewOutput(task, workerResult);
+          if (existing) {
+            workerResult = existing;
+            workerResultAlreadyApplied = true;
+            this._emit('log', `Task "${task.id}" proposed no changes; reviewing its existing files before accepting or fixing it.`, 'info');
+          }
+        }
+
         // Apply file changes (safe mode = ask approval for large changes)
         if (!workerResultAlreadyApplied && workerResult.files.length > 0) {
           const expandedAllowedFiles = this._selfHealAllowedFiles(task, workerResult, 'codeWorker');
           if (expandedAllowedFiles.length > 0) {
             this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
             this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+          }
+          // Benchmark run 10: part 2 of a split task re-emitted part 1's five
+          // files as "create"; the baseline guard then blocked the WHOLE patch
+          // and the task failed without a fix loop, skipping 10 dependents.
+          // Keep the applicable changes and hand the rest to review/fix.
+          const droppedScope = this._dropOutOfScopeChanges(task, workerResult);
+          const droppedConflicts = this._dropConflictingChanges(task, workerResult, 'codeWorker');
+          if (droppedScope.length + droppedConflicts.length > 0) {
+            scopeNote = `[scope] The code worker also returned ${[...droppedScope, ...droppedConflicts].join(', ')}, which belong to other tasks or already exist; those changes were ignored. Write only this task's files (${task.allowedFiles.join(', ')}) and adapt them to the existing files as they are.`;
+            if (workerResult.files.length === 0) { workerResultAlreadyApplied = true; }
           }
           const validationErrors = this._validateTaskFileChanges(task, workerResult);
           if (validationErrors.length > 0) {
@@ -1141,6 +2381,33 @@ export class AgentOrchestrator {
             this.callbacks.onTaskUpdate?.(taskPlan.tasks);
             continue;
           }
+        } else if (!workerResultAlreadyApplied) {
+          // A model can return structurally valid JSON while omitting every file.
+          // Give known product types the same deterministic recovery opportunity
+          // as malformed/failed model calls before failing the task honestly.
+          const recoveryResult = await this._tryDeterministicTaskRecovery(task, state, taskPlan);
+          if (recoveryResult) {
+            workerResult = recoveryResult;
+            workerResultAlreadyApplied = true;
+          } else {
+            task.status = 'failed';
+            task.error = 'Code worker reported success but produced no file changes (nothing written to disk).';
+            this._recordFailedTask(state, task.id);
+            state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+            this.workspace.writeProjectState(state);
+            this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+            this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+            this._emit('error', `Task "${task.id}" produced no file changes; deterministic recovery was unavailable.`);
+            this._recordActivity({
+              phase: 'coding',
+              agentRole: 'codeWorker',
+              title: `Task ${task.id} produced no files`,
+              detail: task.error,
+              status: 'failed',
+              taskId: task.id,
+            });
+            continue;
+          }
         }
 
         // Run reviewer
@@ -1154,14 +2421,27 @@ export class AgentOrchestrator {
           taskId: task.id,
           files: workerResult.files.map(file => file.path),
         });
+        this._taskReviewScopes.reset(task.id);
         let review = await this._executeReviewer(task, workerResult, state);
+        if (scopeNote) {
+          review.issues = [...review.issues, scopeNote];
+          if (workerResult.files.length === 0) { review.needsFix = true; review.approved = false; }
+        }
 
         if (review.needsFix) {
           // Try to fix
           const maxRetries = this.modelConfig.maxFixRetries;
           let fixed = false;
+          // Escalation guard: if the fixer keeps hitting the SAME issues, it is
+          // stuck in a loop and burning retries with no strategy change. Bail out
+          // early so the run can stop/skip cleanly instead of spinning.
+          let lastIssueSignature = this._issueSignature(review);
+          let noProgressStreak = 0;
+          const maxNoProgress = 2;
+          let attemptsUsed = 0;
           for (let attempt = 1; attempt <= maxRetries; attempt++) {
             this._checkAborted();
+            attemptsUsed = attempt;
             this._emit('log', `Fix attempt ${attempt}/${maxRetries} for task "${task.id}"`, 'warn');
             this._setPhase(state, 'fixing', `Fixing task: ${task.title} (attempt ${attempt})`);
             this._recordActivity({
@@ -1188,10 +2468,26 @@ export class AgentOrchestrator {
                 this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
                 this.callbacks.onTaskUpdate?.(taskPlan.tasks);
               }
-              const validationErrors = this._validateTaskFileChanges(task, fixResult);
-              if (validationErrors.length > 0) {
-                this._emit('error', `Fixer produced unsafe file changes for task "${task.id}": ${validationErrors.join('; ')}`);
-                break;
+              // Benchmark run 8: a test-writing task's fixer also edited main.js,
+              // index.html and styles.css (another task's files); that used to
+              // fail the whole task on attempt 1. Drop only the out-of-scope
+              // changes, keep the rest, and tell the next attempt why.
+              const outOfScope = this._dropOutOfScopeChanges(task, fixResult);
+              if (outOfScope.length > 0) {
+                review.issues = [
+                  ...review.issues.filter(issue => !issue.startsWith('[scope] ')),
+                  `[scope] The previous fix tried to change ${outOfScope.join(', ')}, which this task may not modify. ` +
+                  `Solve the problem inside this task's own files (${task.allowedFiles.join(', ')}), adapting them to the other modules as they are.`,
+                ];
+                if (fixResult.files.length === 0) { continue; }
+              }
+              const conflicts = this._dropConflictingChanges(task, fixResult, 'fixer');
+              if (conflicts.length > 0 && fixResult.files.length === 0) {
+                review.issues = [
+                  ...review.issues.filter(issue => !issue.startsWith('[scope] ')),
+                  `[scope] The previous fix only re-created existing files (${conflicts.join(', ')}). Modify this task's files instead.`,
+                ];
+                continue;
               }
               const patchId = `${task.id}-fix-${attempt}-${Date.now()}`;
               const applied = await this._applyCodeChanges(patchId, fixResult, state);
@@ -1214,6 +2510,34 @@ export class AgentOrchestrator {
               break;
             }
             Object.assign(review, reReview);
+
+            // Detect a stuck loop: same issues recurring across attempts.
+            const signature = this._issueSignature(reReview);
+            if (signature && signature === lastIssueSignature) {
+              noProgressStreak += 1;
+              // Stuck before the scheduled escalation: switch to the stronger
+              // fixer model once instead of giving up on the weaker one.
+              if (
+                noProgressStreak >= maxNoProgress &&
+                attempt < AgentOrchestrator.FIX_ESCALATION_ATTEMPT &&
+                !this.escalatedFixTasks.has(task.id) &&
+                this._canEscalateFixer(task, state)
+              ) {
+                this.escalatedFixTasks.add(task.id);
+                noProgressStreak = 0;
+                this._emit('log', `Fixer for task "${task.id}" made no progress; escalating to the stronger fixer model before giving up.`, 'warn');
+                continue;
+              }
+              if (noProgressStreak >= maxNoProgress) {
+                this._emit('log', `Fixer for task "${task.id}" made no progress over ${noProgressStreak + 1} attempts (identical issues); stopping retries to avoid a stuck loop.`, 'warn');
+                this._journal('warn', `Fixer escalation on ${task.id}`,
+                  `The same issues recurred ${noProgressStreak + 1}×, so retries were stopped early instead of spinning to the limit: ${reReview.issues.slice(0, 3).join('; ')}`);
+                break;
+              }
+            } else {
+              noProgressStreak = 0;
+              lastIssueSignature = signature;
+            }
           }
 
           if (!fixed) {
@@ -1231,9 +2555,9 @@ export class AgentOrchestrator {
                 reviewedAt: new Date().toISOString(),
               };
             } else {
-              this._emit('log', `Task "${task.id}" could not be fixed after ${maxRetries} attempts.`, 'warn');
+              this._emit('log', `Task "${task.id}" could not be fixed after ${attemptsUsed} of ${maxRetries} fix attempt(s).`, 'warn');
               task.status = 'failed';
-              task.error = `Failed after ${maxRetries} fix attempts. Last issues: ${review.issues.join('; ')}`;
+              task.error = `Failed after ${attemptsUsed} fix attempt(s). Last issues: ${review.issues.join('; ')}`;
               this._recordFailedTask(state, task.id);
               state.activeTasks = state.activeTasks.filter(id => id !== task.id);
               this.workspace.writeProjectState(state);
@@ -1275,6 +2599,21 @@ export class AgentOrchestrator {
           files: workerResult.files.map(file => file.path),
         });
 
+        } catch (err) {
+          if (err instanceof WaitForUserError || err instanceof UserAbortError) { throw err; }
+          task.status = 'failed';
+          task.error = `Unexpected error while processing task: ${formatError(err)}`;
+          this._recordFailedTask(state, task.id);
+          state.activeTasks = state.activeTasks.filter(id => id !== task.id);
+          this.workspace.writeProjectState(state);
+          this.workspace.writeFile(this.workspace.taskPlanPath, prettyJson(taskPlan));
+          this.callbacks.onTaskUpdate?.(taskPlan.tasks);
+          this._emit('error', `Task "${task.id}" crashed unexpectedly and was marked failed so the run can continue: ${formatError(err)}`);
+          this._journal('error', `Task ${task.id} crashed`,
+            `An unexpected error occurred while processing this task; it was marked failed (its dependents will cascade-skip) so the autonomous run can continue and still deliver the verified subset. ${formatError(err)}`);
+          continue;
+        }
+
       }
       // Run micro-sprint checks once per wave (not per task) to avoid redundant
       // compile/test runs when multiple tasks complete in the same wave.
@@ -1288,6 +2627,28 @@ export class AgentOrchestrator {
 
     state.currentTaskId = null;
     this.workspace.writeProjectState(state);
+
+    // Viability gate: if the coding phase produced nothing usable (every task
+    // failed or was skipped), do NOT march on to deliver a final report over a
+    // broken/empty project. Stop with an honest status instead.
+    const planned = taskPlan.tasks.length;
+    const completed = state.completedTasks.length;
+    const failed = state.failedTasks.length;
+    const skipped = taskPlan.tasks.filter(t => t.status === 'skipped').length;
+    if (planned > 0 && completed === 0) {
+      const msg =
+        `Build is not viable: 0/${planned} tasks completed (${failed} failed, ${skipped} skipped). ` +
+        `A core task failed and its dependents were skipped, so there is no working product to deliver. ` +
+        `Inspect the failed task diagnostics; completed files are preserved for Resume.`;
+      this._journal('error', 'Build not viable — stopping', msg);
+      this._updateTimeline('coding', 'failed');
+      throw new WorkflowError(msg);
+    }
+    if (planned > 0 && completed < Math.ceil(planned / 2)) {
+      this._journal('warn', 'Partial build',
+        `Only ${completed}/${planned} tasks completed (${failed} failed, ${skipped} skipped). Delivering the verified subset; the product may be incomplete.`);
+    }
+
     this._updateTimeline('coding', 'completed');
   }
 
@@ -1302,48 +2663,189 @@ export class AgentOrchestrator {
       return;
     }
 
-    if (!this.fileManager.fileExists('package.json')) {
-      this.workspace.writeFile(this.workspace.dependencyInstallLogPath, 'No package.json found; dependency install skipped.\n');
+    const hasPackageJson = this.fileManager.fileExists('package.json');
+    const hasRequirements = (this.fileManager.readWorkspaceFile('requirements.txt') ?? '').trim().length > 0;
+    if (!hasPackageJson && !hasRequirements) {
+      this.workspace.writeFile(this.workspace.dependencyInstallLogPath,
+        'No package.json or non-empty requirements.txt found; dependency install skipped.\n');
       this._updateTimeline('dependency_install', 'skipped');
-      this._emit('log', 'No package.json found; dependency install skipped.', 'info');
+      this._emit('log', 'No package.json or non-empty requirements.txt found; dependency install skipped.', 'info');
       return;
     }
 
-    const pm = this.terminal.detectPackageManager();
-    const command = pm === 'yarn' ? 'yarn install' : pm === 'pnpm' ? 'pnpm install' : 'npm install';
-    this._recordActivity({
-      phase: 'dependency_install',
-      title: 'Installing dependencies',
-      detail: command,
-      status: 'running',
-    });
-    const result = await this.terminal.runSafeCommand(command, 600_000);
-    this.workspace.writeFile(
-      this.workspace.dependencyInstallLogPath,
-      this._formatCommandResult('Dependency Install', result)
-    );
-
-    if (!result.success) {
-      this._recordActivity({
-        phase: 'dependency_install',
-        title: 'Dependency install failed',
-        detail: command,
-        status: 'failed',
-      });
-      throw new WorkflowError(`Dependency install failed: ${command}`, 'dependency_install');
+    const logs: string[] = [];
+    const saveLog = (): void => this.workspace.writeFile(this.workspace.dependencyInstallLogPath, logs.join('\n\n'));
+    const pip3Available = !!this._readToolchainReport()?.checks?.some(c => c.name === 'pip3' && c.available);
+    if (hasRequirements && !pip3Available) {
+      logs.push('## Python Dependency Install\n_pip3 is not available on this machine; skipped. Install Python 3 with pip to enable this._');
+      this._recordActivity({ phase: 'dependency_install', title: 'Python dependency install skipped', detail: 'pip3 not available', status: 'warn' });
     }
 
-    this._updateTimeline('dependency_install', 'completed');
-    this._recordActivity({
-      phase: 'dependency_install',
-      title: 'Dependencies installed',
-      detail: command,
-      status: 'completed',
-    });
-    this._emit('log', 'Dependency install complete.', 'info');
+    const configuredRetries = Number(this.modelConfig.maxFixRetries);
+    const maxRetries = Number.isFinite(configuredRetries) ? Math.max(0, Math.min(20, Math.floor(configuredRetries))) : 0;
+    const allowedFiles = [
+      ...(hasPackageJson ? ['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml'] : []),
+      ...(hasRequirements && pip3Available ? ['requirements.txt'] : []),
+    ];
+    let failures: string[] = [];
+    let repairFeedback = '';
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      this._checkAborted();
+      if (attempt > 0) {
+        this._emit('log', `Dependency fix attempt ${attempt}/${maxRetries}`, 'warn');
+        this._recordActivity({ phase: 'dependency_install', agentRole: 'fixer',
+          title: `Dependency fix ${attempt}/${maxRetries}`, detail: failures.join('\n').slice(0, 1000),
+          status: 'running', round: attempt, totalRounds: maxRetries });
+        const task: TaskItem = {
+          id: `dependency-fix-${attempt}`,
+          title: 'Repair dependency installation',
+          description: 'Resolve the actual package-manager errors below by selecting compatible dependency versions. ' +
+            'Return complete file content, not unified diffs. Preserve all existing package scripts, declared dependencies, ' +
+            'and user requirements. Never bypass resolution using --force, --legacy-peer-deps, --ignore-scripts, ' +
+            '--no-deps, or package-manager configuration. Do not run tools or commands; the orchestrator will reinstall.',
+          assignedAgent: 'fixer', dependsOn: [], allowedFiles,
+          forbiddenActions: ['Delete dependency manifests', 'Remove dependency declarations or verification scripts', 'Bypass dependency resolution'],
+          acceptanceCriteria: ['Every required dependency install exits successfully without bypass flags',
+            'Original scripts and dependency declarations remain intact'],
+          status: 'in_progress', createdAt: new Date().toISOString(),
+        };
+        const review: ReviewResult = {
+          taskId: task.id, approved: false, needsFix: true,
+          issues: [...failures.map(evidence => this._truncateMiddle(evidence, 12_000, '\n[Install output compacted; full log is preserved.]\n')),
+            ...(repairFeedback ? [repairFeedback] : [])],
+          suggestions: [], securityConcerns: [],
+          fixSuggestions: ['Use the current manifest contents and actual error evidence. Correct incompatible version ranges, then let installation verify the fix.'],
+          reviewedAt: new Date().toISOString(),
+        };
+        try {
+          // Disable the generic worker tool loop for this narrow repair: only
+          // validated manifest changes and our known install commands may run.
+          const fix = await this._executeFixer(task, review, state, false);
+          this._checkAborted();
+          if (!fix) {
+            repairFeedback = 'The fixer returned no usable output. Produce complete corrected manifest content.';
+          } else {
+            this._normalizeAutonomousWorkerOutput('fixer', task, fix);
+            const validationErrors = this._validateDependencyRepair(task, fix);
+            if (validationErrors.length > 0) {
+              repairFeedback = `Repair rejected before applying: ${validationErrors.join('; ')}`;
+            } else if (fix.files.length === 0) {
+              repairFeedback = 'The fixer proposed no file changes. Installation will be retried to check for a transient failure.';
+            } else {
+              const applied = await this._applyCodeChanges(`dependency-fix-${attempt}-${Date.now()}`, fix, state);
+              repairFeedback = applied ? '' : 'Repair could not be applied. Re-read current manifests and return complete corrected content.';
+            }
+          }
+        } catch (err) {
+          if (err instanceof UserAbortError) { throw err; }
+          this._checkAborted();
+          repairFeedback = `Repair attempt failed: ${formatError(err)}. Re-read current manifests before retrying.`;
+        }
+        logs.push(`## Dependency Repair ${attempt}/${maxRetries}\n${repairFeedback || 'Validated dependency repair applied.'}`);
+        saveLog();
+      }
+
+      // Re-run every declared ecosystem after each attempt. An LLM claim, an
+      // applied patch, or a missing manifest can never stand in for exit code 0.
+      failures = [];
+      const pm = this.terminal.detectPackageManager();
+      const commands = [
+        ...(hasPackageJson ? [{ label: 'Node Dependency Install', manifest: 'package.json', command:
+          pm === 'yarn' ? 'yarn install' : pm === 'pnpm' ? 'pnpm install' : 'npm install' }] : []),
+        ...(hasRequirements && pip3Available ? [{ label: 'Python Dependency Install', manifest: 'requirements.txt', command: 'pip3 install -r requirements.txt' }] : []),
+      ];
+      for (const { label, manifest, command } of commands) {
+        this._checkAborted();
+        this._recordActivity({ phase: 'dependency_install', title: label, detail: command, status: 'running' });
+        let result: TerminalRunResult;
+        try {
+          if (!(this.fileManager.readWorkspaceFile(manifest) ?? '').trim()) {
+            throw new Error(`Required dependency manifest ${manifest} is missing or empty.`);
+          }
+          result = await this._runConfiguredInstall(command, 600_000);
+        } catch (err) {
+          if (err instanceof UserAbortError) { throw err; }
+          this._checkAborted();
+          result = { command, exitCode: -1, stdout: '', stderr: formatError(err), durationMs: 0, success: false };
+        }
+        this._checkAborted();
+        const evidence = this._formatCommandResult(`${label} — Install Attempt ${attempt + 1}`, result);
+        logs.push(evidence);
+        saveLog();
+        if (!result.success || result.exitCode !== 0) { failures.push(evidence); }
+        this._recordActivity({ phase: 'dependency_install', title: `${label} ${result.success && result.exitCode === 0 ? 'completed' : 'failed'}`,
+          detail: command, status: result.success && result.exitCode === 0 ? 'completed' : 'failed' });
+      }
+      saveLog();
+      if (failures.length === 0) {
+        this._updateTimeline('dependency_install', commands.length > 0 ? 'completed' : 'skipped');
+        this._emit('log', commands.length > 0 ? 'Dependency install complete.' : 'No dependencies to install.', 'info');
+        return;
+      }
+    }
+
+    this._updateTimeline('dependency_install', 'failed');
+    throw new WorkflowError(
+      `Dependency install still fails after ${maxRetries} fix attempt(s). See ${this.workspace.dependencyInstallLogPath}.`, 'dependency_install');
+  }
+
+  private _dependencyManifestFingerprint(): string {
+    return JSON.stringify(['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'requirements.txt']
+      .map(file => [file, this.fileManager.readWorkspaceFile(file)]));
+  }
+
+  private _validateDependencyRepair(task: TaskItem, output: CodeWorkerOutput): string[] {
+    const errors = this._validateTaskFileChanges(task, output);
+    const seen = new Set<string>();
+    for (const change of output.files) {
+      if (seen.has(change.path)) { errors.push(`Duplicate file change for ${change.path}.`); }
+      seen.add(change.path);
+      if (change.patch?.trim() || !['create', 'modify'].includes(change.action) || typeof change.content !== 'string') {
+        errors.push(`${change.path}: return complete replacement content so the manifest can be validated before applying.`);
+        continue;
+      }
+      if (/legacy-peer-deps|ignore-scripts|(?:^|[\s"'])--(?:force|no-deps)(?:[\s"'=]|$)/im.test(change.content)) {
+        errors.push(`${change.path}: dependency or script bypasses are not allowed.`);
+      }
+      if (change.path === 'package.json') {
+        try {
+          const next = JSON.parse(change.content);
+          if (!next || typeof next !== 'object' || Array.isArray(next)) { throw new Error('Expected a JSON object.'); }
+          let before: Record<string, unknown> | null = null;
+          try { before = JSON.parse(this.fileManager.readWorkspaceFile('package.json') ?? '{}'); } catch { /* Repair invalid JSON. */ }
+          if (before && this._stableJson(before.scripts ?? {}) !== this._stableJson(next.scripts ?? {})) {
+            errors.push('package.json: preserve all existing package scripts unchanged.');
+          }
+          for (const group of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+            for (const name of Object.keys((before?.[group] ?? {}) as Record<string, unknown>)) {
+              if (typeof next[group]?.[name] !== 'string' || !next[group][name].trim()) {
+                errors.push(`package.json: preserve the declared dependency ${group}.${name}.`);
+              }
+            }
+          }
+        } catch (err) {
+          errors.push(`package.json: invalid manifest JSON (${formatError(err)}).`);
+        }
+      }
+      if (change.path === 'requirements.txt') {
+        const requirements = change.content.split(/\r?\n/).filter(line => line.trim() && !line.trim().startsWith('#'));
+        if (requirements.length === 0) { errors.push('requirements.txt: do not remove all dependency declarations.'); }
+        const packageNames = (content: string): string[] => content.split(/\r?\n/)
+          .map(line => /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(?=\s|[\[<>=!~@;]|$)/.exec(line)?.[1]?.toLowerCase().replace(/[-_.]+/g, '-'))
+          .filter((name): name is string => !!name);
+        const nextNames = new Set(packageNames(change.content));
+        for (const name of packageNames(this.fileManager.readWorkspaceFile('requirements.txt') ?? '')) {
+          if (!nextNames.has(name)) { errors.push(`requirements.txt: preserve the declared dependency ${name}.`); }
+        }
+      }
+    }
+    return errors;
   }
 
   private async _runMicroSprintChecks(task: TaskItem, _state: ProjectState): Promise<void> {
+    // Per-task verification already ran the real checks during review.
+    if (this.modelConfig.perTaskVerification !== false && this.fileManager.fileExists('package.json')) { return; }
     const hasPackageChecks =
       this.terminal.hasPackageScript('compile') ||
       this.terminal.hasPackageScript('build') ||
@@ -1383,8 +2885,12 @@ export class AgentOrchestrator {
   private async _phaseTesting(state: ProjectState): Promise<void> {
     this._checkAborted();
     this._setPhase(state, 'testing', 'Tester Agent: Running tests...');
+    // Focus text is keyed test-fix-<n>; a previous sprint's must not leak
+    // into this one (audit D03).
+    this._testFixFocusText.clear();
 
-    const pm = this.terminal.detectPackageManager();
+    let pm = this.terminal.detectPackageManager();
+    let installedDependencies = this._dependencyManifestFingerprint();
     this._recordActivity({
       phase: 'testing',
       agentRole: 'tester',
@@ -1394,6 +2900,7 @@ export class AgentOrchestrator {
     });
     let checks = await this._runProjectChecks(pm);
     this.workspace.writeFile(this.workspace.testResultLogPath, checks.output);
+    if (this._deferIncompleteCollectionScope(checks)) { return; }
 
     let testerOutput = await this._analyzeProjectChecks(checks);
 
@@ -1403,9 +2910,68 @@ export class AgentOrchestrator {
       const maxRetries = this.modelConfig.maxFixRetries;
       let passedAfterFix = !checks.failed;
       let fixerUnavailable = false;
+      let repairFeedback = '';
+      // Benchmark run 7: each full-log, all-files repair made things worse
+      // (161 → 167 errors). Track an error score, keep pre-images of every
+      // applied repair, and roll back to the best state when repairs keep
+      // making it worse.
+      let bestScore = this._verificationErrorScore(checks);
+      let previousScore = bestScore;
+      let bestAttempt = 0;
+      let worseningStreak = 0;
+      let rollbacks = 0;
+      let attemptsRun = 0;
+      // Audit C06: a state that runs fewer checks or tests cannot count as
+      // better (a compiler that dies early, or deleted tests, lower the score).
+      let inventoryFloor = this._verificationInventory(checks);
+      // Per attempt: each file's content before the repair, and what the repair
+      // (plus any dependency self-heal during its recheck) left there. The
+      // snapshot includes the dependency manifests and lockfiles, which the
+      // recheck's install may rewrite although the fixer never named them.
+      const preImages = new Map<number, Map<string, { before: string | null; after?: string | null }>>();
+      const rollBackTo = (target: number, fromAttempt: number): void => {
+        for (let i = fromAttempt; i > target; i--) {
+          for (const [file, image] of preImages.get(i) ?? []) {
+            const current = this.fileManager.fileExists(file) ? this.fileManager.readWorkspaceFile(file) : null;
+            if (image.after !== undefined && current !== image.after) {
+              // Someone else changed it since this repair: do not overwrite.
+              this._journal('warn', 'Rollback skipped a file', `${file} changed after test-fix attempt ${i}, so it was left as it is instead of being restored.`);
+              continue;
+            }
+            this._restoreWorkspaceFile(file, image.before);
+          }
+          preImages.delete(i);
+        }
+      };
+      const recordAfterImages = (attempt: number): void => {
+        for (const [file, image] of preImages.get(attempt) ?? []) {
+          image.after = this.fileManager.fileExists(file) ? this.fileManager.readWorkspaceFile(file) : null;
+        }
+      };
+      const recheck = async (): Promise<void> => {
+        if (this._dependencyManifestFingerprint() !== installedDependencies) {
+          // A restart during this nested phase must repeat installation before
+          // tests; a fresh in-memory fingerprint alone cannot prove it finished.
+          state.sprintStage = 'dependency_install';
+          this.workspace.writeProjectState(state);
+          await this._phaseDependencyInstall(state);
+          installedDependencies = this._dependencyManifestFingerprint();
+          pm = this.terminal.detectPackageManager();
+          state.sprintStage = 'testing';
+          this._setPhase(state, 'testing', 'Rechecking the project after dependency changes...');
+        }
+        checks = await this._runProjectChecks(pm);
+        // A repair can regress an initially passing project. Success always
+        // describes the current files/check inventory, never an earlier check.
+        passedAfterFix = !checks.failed && !this._inventoryShrank(this._verificationInventory(checks), inventoryFloor);
+        this.workspace.writeFile(this.workspace.testResultLogPath, checks.output);
+      };
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         this._checkAborted();
+        attemptsRun = attempt;
+        state.fixRetryCount = attempt;
+        this.workspace.writeProjectState(state);
         this._emit('log', `Test fix attempt ${attempt}/${maxRetries}`, 'warn');
         this._setPhase(state, 'fixing', `Fixing test failures (attempt ${attempt})`);
         this._recordActivity({
@@ -1420,19 +2986,36 @@ export class AgentOrchestrator {
 
         const allowedFiles = this._collectTestFixAllowedFiles(checks, testerOutput);
         if (allowedFiles.length === 0) {
-          throw new WorkflowError('Cannot fix project checks because no safe target files were identified.', 'testing');
+          // Same reasoning as the "could not apply" branch below: this attempt
+          // could not proceed, but that is not proof no LATER attempt could
+          // (a subsequent tester analysis can surface different failing files).
+          // Aborting the whole run on attempt 1 of an N-attempt budget over this
+          // is exactly the failure mode that lost a real, mostly-working build.
+          this._emit('log', `Test fix attempt ${attempt} found no safe target files to fix; continuing self-healing attempts.`, 'warn');
+          this.workspace.appendFile(
+            this.workspace.testerPath,
+            `\n\n---\n\n## Fix Attempt ${attempt} Had No Safe Target Files\n\nNo changed or prompt-referenced file existed on disk to safely target. The workflow will retry with a fresh fix attempt.\n`
+          );
+          continue;
         }
 
+        // Small local models cannot repair a whole log across 12+ files at
+        // once; give each attempt only the first failing file cluster.
+        const focus = this._testFixFocus(checks, allowedFiles);
+        const fakeTaskId = `test-fix-${attempt}`;
+        if (focus) { this._testFixFocusText.set(fakeTaskId, focus.diagnostics); } else { this._testFixFocusText.delete(fakeTaskId); }
         const fakeTask: TaskItem = {
-          id: `test-fix-${attempt}`,
+          id: fakeTaskId,
           title: 'Fix test failures',
           description:
+            (focus ? `Fix ONLY the errors below in this attempt; later attempts handle the rest. Files in scope: ${focus.files.join(', ')}.\n\n` : '') +
             `${testerOutput.fixDescription ?? 'Fix all test and compile errors'}\n\n` +
             'Preserve the original user requirements, package scripts, and real test coverage. ' +
-            'Do not replace failing tests with placeholders or unrelated examples.',
+            'Do not replace failing tests with placeholders or unrelated examples. ' +
+            'Return full corrected file contents in content; omit patch/diff fields. Resolve relative imports from the importing file directory, not from the workspace root.',
           assignedAgent: 'fixer',
           dependsOn: [],
-          allowedFiles,
+          allowedFiles: focus?.files ?? allowedFiles,
           forbiddenActions: [],
           acceptanceCriteria: [
             'All configured compile/build/test commands pass',
@@ -1449,6 +3032,7 @@ export class AgentOrchestrator {
           issues: [
             ...checks.failedCommands.map(command => `Command failed: ${command}`),
             ...testerOutput.errors,
+            ...(repairFeedback ? [repairFeedback] : []),
           ],
           suggestions: [],
           securityConcerns: [],
@@ -1457,8 +3041,9 @@ export class AgentOrchestrator {
           reviewedAt: new Date().toISOString(),
         };
 
-        const fixResult = await this._executeFixer(fakeTask, fakeReview, state);
+        const fixResult = await this._executeFixer(fakeTask, fakeReview, state, false);
         if (!fixResult) {
+          repairFeedback = 'The previous repair returned no usable output. Return complete corrected files for the concrete diagnostics.';
           fixerUnavailable = true;
           this._emit('log', `Fixer produced no output for test fix attempt ${attempt}; continuing self-healing attempts.`, 'warn');
           this.workspace.appendFile(
@@ -1471,34 +3056,119 @@ export class AgentOrchestrator {
 
         if (fixResult.files.length > 0) {
           this._selfHealAllowedFiles(fakeTask, fixResult, 'fixer');
+          const outOfScope = this._dropOutOfScopeChanges(fakeTask, fixResult);
+          if (outOfScope.length > 0 && fixResult.files.length === 0) {
+            repairFeedback = `The previous repair only changed files outside this attempt's scope (${outOfScope.join(', ')}). Fix the listed errors inside: ${fakeTask.allowedFiles.join(', ')}.`;
+            this.workspace.appendFile(
+              this.workspace.testerPath,
+              `\n\n---\n\n## Fix Attempt ${attempt} Produced Unsafe File Changes\n\nEvery proposed change was outside the attempt's scope (${outOfScope.join(', ')}); nothing was applied and the workflow will retry.\n`
+            );
+            continue;
+          }
           const validationErrors = this._validateTaskFileChanges(fakeTask, fixResult);
           if (validationErrors.length > 0) {
-            throw new WorkflowError(
-              `Fixer produced unsafe file changes: ${validationErrors.join('; ')}`,
-              'testing'
+            repairFeedback = `Previous repair was rejected: ${validationErrors.join('; ')}. Correct the full file contents within the allowed scope.`;
+            // The equivalent per-task coding-phase fixer loop treats this as a
+            // reason to discard just this attempt's patch and move on (`break`,
+            // then deterministic recovery), never as a reason to kill the whole
+            // run. This loop used to be stricter for no good reason — a single
+            // unsafe patch proposal is exactly as recoverable as a fragile diff
+            // or an empty fixer response, both handled by retrying above.
+            this._emit('log', `Test fix attempt ${attempt} produced unsafe file changes (${validationErrors.join('; ')}); discarding it and continuing self-healing attempts.`, 'warn');
+            this.workspace.appendFile(
+              this.workspace.testerPath,
+              `\n\n---\n\n## Fix Attempt ${attempt} Produced Unsafe File Changes\n\n${validationErrors.join('\n')}\n\nThe proposed patch was discarded (not applied) and the workflow will retry with a fresh fix attempt.\n`
             );
+            continue;
+          }
+          this._dropConflictingChanges(fakeTask, fixResult, 'fixer');
+          if (fixResult.files.length === 0) {
+            repairFeedback = 'The previous repair only re-created files that already exist. Modify the files in scope with complete content.';
+            continue;
           }
           const patchId = `test-fix-${attempt}-${Date.now()}`;
+          const snapshotFiles = new Set([
+            ...fixResult.files.map(file => this._normalizeRelativePath(file.path)),
+            // Include absent lockfiles: installation may create them, and a
+            // rollback must remove those new files before restoring dependencies.
+            ...AgentOrchestrator.DEPENDENCY_FILES,
+          ]);
+          const preImage = new Map([...snapshotFiles].map(file =>
+            [file, { before: this.fileManager.fileExists(file) ? this.fileManager.readWorkspaceFile(file) : null }] as
+              [string, { before: string | null; after?: string | null }]));
           const applied = await this._applyCodeChanges(patchId, fixResult, state);
+          if (applied) { preImages.set(attempt, preImage); }
           if (!applied) {
-            throw new WorkflowError(`Could not apply test fix attempt ${attempt}.`, 'testing');
+            repairFeedback = `Previous repair for ${fixResult.files.map(file => file.path).join(', ')} could not be applied. Return complete file contents in content, with no patch field.`;
+            // A real run hit exactly this: the fixer's only proposed change was a
+            // fragile diff to package.json that failed to apply, and this used to
+            // throw and kill the entire workflow on attempt 2 of an 8-attempt
+            // budget. One attempt producing nothing applicable is not different in
+            // kind from the fixer producing no output at all (handled above by
+            // `continue`) — both just mean this attempt didn't move things
+            // forward, so retry instead of aborting the whole run over it.
+            this._emit('log', `Test fix attempt ${attempt} produced no applicable file changes; continuing self-healing attempts.`, 'warn');
+            this.workspace.appendFile(
+              this.workspace.testerPath,
+              `\n\n---\n\n## Fix Attempt ${attempt} Could Not Be Applied\n\nEvery proposed file change failed to apply (e.g. a fragile diff even after fuzzy relocation). The workflow will retry with a fresh fix attempt.\n`
+            );
+            continue;
           }
         }
 
-        checks = await this._runProjectChecks(pm);
-        this.workspace.writeFile(this.workspace.testResultLogPath, checks.output);
+        await recheck();
+        recordAfterImages(attempt);
         this.workspace.appendFile(
           this.workspace.testerPath,
           `\n\n---\n\n## Verification After Fix Attempt ${attempt}\n\n${checks.output}\n`
         );
+        if (this._deferIncompleteCollectionScope(checks)) { return; }
 
-        if (!checks.failed) {
+        const inventory = this._verificationInventory(checks);
+        const shrank = this._inventoryShrank(inventory, inventoryFloor);
+        if (!checks.failed && !shrank) {
           this._emit('log', 'Tests passed after fix.', 'info');
           passedAfterFix = true;
           break;
         }
+        if (shrank) {
+          this._emit('log', `Test fix attempt ${attempt} ran less than before (${shrank}); it does not count as progress.`, 'warn');
+        }
+
+        const score = shrank ? Number.MAX_SAFE_INTEGER : this._verificationErrorScore(checks);
+        if (!shrank) { inventoryFloor = this._inventoryMax(inventoryFloor, inventory); }
+        this._emit('log', `Test fix attempt ${attempt}: error score ${previousScore} → ${shrank ? 'rejected' : score} (best ${bestScore}).`, 'info');
+        worseningStreak = score > previousScore ? worseningStreak + 1 : 0;
+        previousScore = score;
+        if (score < bestScore) { bestScore = score; bestAttempt = attempt; }
+        let rolledBack = false;
+        if (worseningStreak >= 2) {
+          rollBackTo(bestAttempt, attempt);
+          rollbacks += 1;
+          worseningStreak = 0;
+          rolledBack = true;
+          this._emit('log', `Test repairs made things worse twice in a row; rolled back to the best state (after attempt ${bestAttempt}, score ${bestScore}).`, 'warn');
+          this._journal('warn', 'Test-fix rollback', `Two consecutive repairs raised the error score; restored the state after attempt ${bestAttempt}.`);
+          await recheck();
+          previousScore = this._verificationErrorScore(checks);
+          if (!checks.failed && !this._inventoryShrank(this._verificationInventory(checks), inventoryFloor)) {
+            // The restored state passes: that is a success, not a failure (audit C06).
+            this._emit('log', 'The restored best state passes the checks.', 'info');
+            passedAfterFix = true;
+            break;
+          }
+          if (rollbacks >= 2) {
+            this._emit('log', 'Test repairs kept making things worse after a rollback; stopping test-fix attempts at the best state.', 'warn');
+            break;
+          }
+        }
 
         testerOutput = await this._analyzeProjectChecks(checks);
+        repairFeedback = rolledBack
+          ? `The last two repairs made the project worse and were rolled back. Take a different, smaller approach: fix only the first error below.`
+          : shrank
+          ? `The previous repair made the project run less (${shrank}). Never delete, skip or weaken tests or checks; fix the code they exercise.`
+          : `The previous repair to ${fixResult.files.map(file => file.path).join(', ') || '(no files)'} was insufficient. The checks still fail: ${checks.failedCommands.join(', ')}. Do not repeat the same change; use the current file contents and exact resolved-path diagnostics below.`;
         this.workspace.appendFile(
           this.workspace.testerPath,
           `\n\n## Tester Analysis After Fix Attempt ${attempt}\n\n${prettyJson(testerOutput)}\n`
@@ -1509,19 +3179,20 @@ export class AgentOrchestrator {
         }
       }
 
+      const currentShrank = this._inventoryShrank(this._verificationInventory(checks), inventoryFloor);
+      if (!passedAfterFix && (currentShrank || this._verificationErrorScore(checks) > bestScore)) {
+        // Leave the best state on disk, not the last (worse) repair.
+        rollBackTo(bestAttempt, attemptsRun);
+        await recheck();
+        this._emit('log', `Restored the best test-fix state (after attempt ${bestAttempt}).`, 'warn');
+        if (!checks.failed && !this._inventoryShrank(this._verificationInventory(checks), inventoryFloor)) { passedAfterFix = true; }
+      }
       if (!passedAfterFix) {
-        if (fixerUnavailable && this._selfHealingConfig().enabled) {
-          this._emit('log', `Verification still failing after fixer agent failures; continuing workflow with warnings: ${checks.failedCommands.join(', ')}`, 'warn');
-          this.workspace.appendFile(
-            this.workspace.testerPath,
-            `\n\n## Self-Healing Verification Warning\n\nVerification is still failing, but the fixer agent was unavailable. The workflow continued so artifacts and final report can still be produced.\n\nFailed commands: ${checks.failedCommands.join(', ') || 'unknown'}\n`
-          );
-        } else {
-          throw new WorkflowError(
-            `Project checks still fail after ${maxRetries} fix attempt(s): ${checks.failedCommands.join(', ')}`,
-            'testing'
-          );
-        }
+        const fixerNote = fixerUnavailable ? ' The fixer model produced no usable output.' : '';
+        throw new WorkflowError(
+          `Project checks still fail after ${attemptsRun} fix attempt(s): ${checks.failedCommands.join(', ')}.${fixerNote}`,
+          'testing'
+        );
       }
     }
 
@@ -1534,6 +3205,23 @@ export class AgentOrchestrator {
       status: checks.failed ? 'warn' : 'completed',
     });
     this._emit('log', 'Testing phase complete.', 'info');
+  }
+
+  /** A working vertical slice can need more content without being broken code. */
+  private _deferIncompleteCollectionScope(checks: ProjectCheckResults): boolean {
+    const incomplete = checks.collectionAcceptance?.checks.filter(check => check.status !== 'passed') ?? [];
+    if (!checks.failed || checks.failedCommands.length === 0
+      || checks.failedCommands.some(command => command !== 'collection acceptance')
+      || incomplete.length === 0 || incomplete.some(check => check.failureKind !== 'too-few')) { return false; }
+    const remaining = incomplete.map(check => check.diagnostic);
+    const note = `Runtime/build/test checks passed for the current slice, but the original product scope is incomplete. Plan the missing collection entries in the next development sprint:\n${remaining.map(item => `- ${item}`).join('\n')}\nFinal completion remains blocked until the full requested counts pass.`;
+    this.workspace.appendFile(this.workspace.testerPath, `\n\n## Incomplete Collection Scope\n${note}\n`);
+    this.workspace.appendRollingSummary(`## Remaining Collection Scope\n${note}`);
+    this._updateTimeline('testing', 'completed');
+    this._recordActivity({ phase: 'testing', agentRole: 'tester', title: 'Working slice needs the remaining collection content',
+      detail: remaining.join('; '), status: 'warn' });
+    this._emit('log', 'Verified slice remains incomplete; planning another development sprint instead of exhausting code-fix retries.', 'warn');
+    return true;
   }
 
   private async _phaseArtifactDelivery(state: ProjectState): Promise<void> {
@@ -1621,6 +3309,8 @@ export class AgentOrchestrator {
   private async _runProjectChecks(packageManager: 'npm' | 'pnpm' | 'yarn'): Promise<ProjectCheckResults> {
     this._ensureCapabilityServices();
     const skippedChecks: string[] = [];
+    const verificationPlan = new VerificationPlanner(this.workspace.rootDir).plan(packageManager);
+    this.workspace.writeFile(this.workspace.verificationPlanPath, prettyJson(verificationPlan));
 
     let compileResult: TerminalRunResult | null = null;
     let compileScript: 'compile' | 'build' | null = null;
@@ -1655,6 +3345,24 @@ export class AgentOrchestrator {
       }
     }
 
+    // Execute every stack-specific command the artifact planner discovered,
+    // excluding commands already run through the legacy Node/native slots.
+    const alreadyRun = new Set([
+      compileResult?.command,
+      testResult?.command,
+      nativeResult?.command,
+    ].filter((command): command is string => Boolean(command)));
+    const additionalResults: TerminalRunResult[] = [];
+    for (const planned of verificationPlan.commands) {
+      if (alreadyRun.has(planned.command)) { continue; }
+      const command = planned.stack === 'python' && planned.command.startsWith('python3 ')
+        ? `${this._pythonInterpreter() ?? 'python3'}${planned.command.slice('python3'.length)}`
+        : planned.command;
+      const result = await this.terminal.runSafeCommand(command, 300_000);
+      additionalResults.push(result);
+      alreadyRun.add(planned.command);
+    }
+
     const failedCommands: string[] = [];
     if (compileResult && !compileResult.success) {
       failedCommands.push(compileResult.command);
@@ -1662,8 +3370,29 @@ export class AgentOrchestrator {
     if (testResult && !testResult.success) {
       failedCommands.push(testResult.command);
     }
+    // A green test command that executed no test proves nothing (audit C04).
+    // An unknown count (unrecognised runner) is reported, not failed.
+    const testCount = testResult ? countExecutedTests(`${testResult.stdout ?? ''}\n${testResult.stderr ?? ''}`) : null;
+    if (testResult?.success && testCount?.executed === 0) {
+      failedCommands.push(testResult.command);
+    }
     if (nativeResult && !nativeResult.success) {
       failedCommands.push(nativeResult.command);
+    }
+    for (const result of additionalResults) {
+      if (!result.success) { failedCommands.push(result.command); }
+    }
+    // Synthetic/legacy projects can still be verified by an explicitly found
+    // native command even if the planner has no manifest signature for them.
+    if (verificationPlan.stacks.length === 0 && (compileResult || testResult || nativeResult)) {
+      verificationPlan.blockingIssues = verificationPlan.blockingIssues.filter(issue =>
+        issue !== 'No supported artifact stack was detected.' &&
+        issue !== 'No artifact-aware verification command could be planned.'
+      );
+      this.workspace.writeFile(this.workspace.verificationPlanPath, prettyJson(verificationPlan));
+    }
+    if (verificationPlan.blockingIssues.length > 0) {
+      failedCommands.push('artifact-aware verification plan');
     }
 
     const qualityGate = this._runStaticQualityGate();
@@ -1671,18 +3400,34 @@ export class AgentOrchestrator {
       failedCommands.push('static quality gate');
     }
 
+    // Benchmark run 11: tests passed on modules nothing loaded, behind an
+    // empty entry loop and comment-only key handlers. A product must run its
+    // own code: every source module reachable from a page, no stub bodies.
+    const implementationGaps = this._implementationGaps();
+    if (implementationGaps.issues.length > 0) {
+      failedCommands.push('implementation gaps');
+    }
+
+    const collectionAcceptance = await new CollectionAcceptanceService(this.workspace.rootDir)
+      .verify(this.workspace.readUserPrompt());
+    this.workspace.writeFile(path.join(this.workspace.logsDir, 'collection_acceptance.json'), prettyJson(collectionAcceptance));
+    if (collectionAcceptance.failed || collectionAcceptance.unverified) {
+      failedCommands.push('collection acceptance');
+    }
+
     const appVerification = await new AppVerificationService(
       this.workspace.rootDir,
       this.terminal,
       this.terminalSessions,
       this.modelConfig.appVerification
-    ).verify();
+    ).verify(this._acceptanceInteraction());
     this.workspace.writeFile(this.workspace.appVerificationPath, prettyJson(appVerification));
     if (appVerification.failed) {
       failedCommands.push('app smoke verification');
     }
 
-    if (this.modelConfig.requireVerificationScripts && !compileResult && !testResult && !nativeResult) {
+    const hasArtifactVerification = Boolean(compileResult || testResult || nativeResult || additionalResults.length > 0 || appVerification.checks.length > 0);
+    if (this.modelConfig.requireVerificationScripts && !hasArtifactVerification) {
       failedCommands.push('missing compile/build/test script');
     }
 
@@ -1691,14 +3436,28 @@ export class AgentOrchestrator {
         ? this._formatCommandResult('Compile / Build', compileResult)
         : '## Compile / Build\n_No compile or build script found_',
       testResult
-        ? this._formatCommandResult('Tests', testResult)
+        ? this._formatCommandResult('Tests', testResult) + (testCount?.executed === 0
+          ? `\n\n**Failed:** the test command exited 0 but executed 0 tests${testCount.skipped ? ` (${testCount.skipped} skipped or todo)` : ''}.`
+          : testCount?.executed == null ? '\n\n_Executed test count: unknown (runner summary not recognised)._'
+          : `\n\nExecuted tests: ${testCount.executed}${testCount.skipped ? ` (${testCount.skipped} skipped)` : ''}`)
         : '## Tests\n_No test script found_',
       nativeResult
         ? this._formatCommandResult('Native Project Verification', nativeResult)
         : '## Native Project Verification\n_No native project verification command found_',
+      ...additionalResults.map(result => this._formatCommandResult(`Artifact Check — ${result.command}`, result)),
+      [
+        '## Artifact-aware Verification Plan',
+        `Detected stacks: ${verificationPlan.stacks.join(', ') || 'none'}`,
+        `Commands: ${verificationPlan.commands.map(command => command.command).join(', ') || 'none'}`,
+        verificationPlan.blockingIssues.length > 0
+          ? `Blocking issues:\n${verificationPlan.blockingIssues.map(issue => `- ${issue}`).join('\n')}`
+          : 'No structural or placeholder-test blockers found.',
+      ].join('\n'),
       qualityGate.output,
+      implementationGaps.output,
+      `## Quantitative Collection Acceptance\n${prettyJson(collectionAcceptance)}`,
       this._formatAppVerificationResult(appVerification),
-      this.modelConfig.requireVerificationScripts && !compileResult && !testResult && !nativeResult
+      this.modelConfig.requireVerificationScripts && !hasArtifactVerification
         ? '## Verification Gate\nFailed: generated project must include at least one compile, build, or test script.'
         : '',
     ].join('\n\n');
@@ -1716,7 +3475,9 @@ export class AgentOrchestrator {
         compileCommand: compileResult?.command,
         testCommand: testResult?.command,
         nativeCommand: nativeResult?.command,
+        artifactVerificationPlan: verificationPlan,
         staticQualityIssues: qualityGate.issues,
+        collectionAcceptance,
         appVerification,
       },
     });
@@ -1724,6 +3485,8 @@ export class AgentOrchestrator {
     return {
       compileResult,
       testResult,
+      additionalResults,
+      collectionAcceptance,
       output,
       failed: failedCommands.length > 0,
       failedCommands,
@@ -1731,18 +3494,27 @@ export class AgentOrchestrator {
     };
   }
 
+  private _isXcodebuildAvailable(): boolean {
+    const report = this._readToolchainReport();
+    if (!report) { return false; }
+    return report.checks.some(c => c.name === 'xcodebuild' && c.available);
+  }
+
   private _nativeVerificationCommand(): string | null {
     if (this.fileManager.fileExists('Package.swift')) {
-      return 'swift test';
+      return 'swift build';
     }
 
     const workspace = this._findWorkspaceEntryByExtension('.xcworkspace');
     if (workspace) {
+      // Only emit xcodebuild commands when the tool is actually available
+      if (!this._isXcodebuildAvailable()) { return null; }
       return `xcodebuild -list -workspace ${this._quoteShell(workspace)}`;
     }
 
     const project = this._findWorkspaceEntryByExtension('.xcodeproj');
     if (project) {
+      if (!this._isXcodebuildAvailable()) { return null; }
       return `xcodebuild -list -project ${this._quoteShell(project)}`;
     }
 
@@ -1751,6 +3523,31 @@ export class AgentOrchestrator {
       return `${gradleWrapper} test`;
     }
 
+    // Python projects: byte-compile every source file. This is dependency-free
+    // (no pip install needed) and catches syntax errors / truncated files — the
+    // cheapest honest smoke test for an interpreted project.
+    const python = this._pythonInterpreter();
+    if (python) {
+      const pyFiles = this.fileManager.listWorkspaceFiles('', ['.py']);
+      if (pyFiles.length > 0) {
+        return `${python} -m compileall -q .`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Resolve a usable Python interpreter from the toolchain report, preferring
+   * `python3` (macOS ships only `python3`, not `python`). Returns null if no
+   * interpreter was detected, so callers skip Python verification gracefully.
+   */
+  private _pythonInterpreter(): string | null {
+    const report = this._readToolchainReport();
+    const available = (name: string): boolean =>
+      !!report?.checks?.some(c => c.name === name && c.available);
+    if (available('python3')) { return 'python3'; }
+    if (available('python')) { return 'python'; }
     return null;
   }
 
@@ -1761,22 +3558,26 @@ export class AgentOrchestrator {
     const jsFiles = this.fileManager.listWorkspaceFiles('', ['.js', '.mjs', '.cjs']);
     const testFiles = this.fileManager.listWorkspaceFiles('test', ['.js', '.mjs', '.cjs']);
     const packageJson = this.fileManager.readWorkspaceFile('package.json');
-    const hasPackageVerification =
-      this.terminal.hasPackageScript('compile') ||
-      this.terminal.hasPackageScript('build') ||
-      this.terminal.hasPackageScript('test');
+    const packageSwift = this.fileManager.readWorkspaceFile('Package.swift');
     const hasNativeVerification = this._nativeVerificationCommand() !== null;
 
-    const looksLikeNodeProject =
-      jsFiles.some(file => file.startsWith('src/') || file.startsWith('test/')) ||
-      /node\.js|npm|cli|command line|terminal/.test(prompt + projectBrief);
+    // Swift/Apple project detection: skip Node quality checks for these.
+    const looksLikeSwiftProject =
+      packageSwift !== null ||
+      /swift|swiftui|ios|macos|iphone|ipad|xcode|cocoa/.test(prompt + projectBrief);
 
-    if (looksLikeNodeProject && !packageJson && !hasPackageVerification && !hasNativeVerification) {
-      issues.push('Node.js project is missing package.json, so install/run/test scripts cannot be verified.');
+    const looksLikeNodeProject =
+      !looksLikeSwiftProject && (
+        jsFiles.some(file => file.startsWith('src/') || file.startsWith('test/')) ||
+        /node\.js|npm|cli|command line|terminal/.test(prompt + projectBrief)
+      );
+
+    if (looksLikeSwiftProject && !packageSwift && !hasNativeVerification) {
+      issues.push('Swift project is missing Package.swift. The first task must create a valid Package.swift with all targets declared.');
     }
 
     let parsedPackage: { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } | null = null;
-    if (packageJson) {
+    if (packageJson && !looksLikeSwiftProject) {
       try {
         parsedPackage = JSON.parse(packageJson);
       } catch (err) {
@@ -1971,6 +3772,7 @@ export class AgentOrchestrator {
       `Failed commands: ${failedCommands.join(', ') || 'none recorded'}`,
       `Skipped checks: ${skippedChecks.join(', ') || 'none recorded'}`,
       `Likely files: ${mentionedFiles.join(', ') || 'none detected'}`,
+      ...this._resolvedImportDiagnostics(text),
       '',
       'Relevant output excerpts:',
       excerpts || '_No focused diagnostic lines found._',
@@ -1988,6 +3790,24 @@ export class AgentOrchestrator {
       .slice(0, 120);
     const joined = selected.join('\n');
     return joined.length > 12_000 ? `${joined.slice(0, 12_000)}\n[Diagnostic excerpt truncated.]` : joined;
+  }
+
+  private _resolvedImportDiagnostics(text: string): string[] {
+    const hints: string[] = [];
+    const files = this.fileManager.listWorkspaceFiles('');
+    for (const match of text.matchAll(/Cannot find module ['"]([^'"]+)['"] from ['"]([^'"]+)['"]/g)) {
+      const [, specifier, importer] = match;
+      if (!specifier.startsWith('.') || !files.includes(importer)) { continue; }
+      const candidates = files.filter(file => path.posix.basename(file) === path.posix.basename(specifier));
+      if (candidates.length !== 1) { continue; }
+      const target = candidates[0];
+      let correct = path.posix.relative(path.posix.dirname(importer), target);
+      if (!correct.startsWith('.')) { correct = `./${correct}`; }
+      const actual = path.posix.normalize(path.posix.join(path.posix.dirname(importer), specifier));
+      hints.push(`Resolved import: ${importer} imports ${specifier}, which resolves to ${actual}. The existing matching file is ${target}; its relative specifier from this importer is ${correct}. Check its exports and the project's ESM/CommonJS test configuration as well.`);
+      if (hints.length >= 8) { break; }
+    }
+    return [...new Set(hints)];
   }
 
   private _formatCommandResult(label: string, result: TerminalRunResult): string {
@@ -2115,24 +3935,49 @@ export class AgentOrchestrator {
 
   private async _prefetchWebSearch(): Promise<void> {
     this._ensureCapabilityServices();
-    if (!this.modelConfig.webSearch?.enabled) { return; }
-    const prompt = this.workspace.readUserPrompt();
-    const shouldSearch =
-      /\b(latest|current|docs?|documentation|api reference|version|breaking change|library|framework)\b/i.test(prompt);
-    if (!shouldSearch) { return; }
+    const webOn = this.research.webEnabled;
+    const repoOn = this.research.repoReadsEnabled;
+    if (!webOn && !repoOn) { return; }
 
-    this._emit('log', 'Running policy-controlled web search for current documentation context.', 'info');
-    const report = await this.webSearch.searchAndFetch(prompt);
-    this.workspace.writeFile(this.workspace.webSearchPath, prettyJson(report));
+    const prompt = this.workspace.readUserPrompt();
+    // Research is no longer gated by a narrow keyword whitelist. It runs whenever
+    // it can add value: when the prompt explicitly asks for current/external
+    // knowledge, OR for any new-project build (grounding in current best
+    // practices and existing high-quality code raises final quality). Focused
+    // maintenance edits stay local unless they signal a research need.
+    const explicitlyWantsResearch =
+      /\b(latest|current|docs?|documentation|api reference|version|breaking change|library|framework|best practice|example|how to|research|compare|alternativ)\b/i.test(prompt);
+    const route = this._selectWorkflowRoute(this.workspace.readProjectState());
+    const shouldResearch = explicitlyWantsResearch || route.kind === 'full_project';
+    if (!shouldResearch) { return; }
+
+    const sections: string[] = ['# External Research Context', ''];
+    const citations: string[] = [];
+
+    if (webOn) {
+      this._emit('log', 'Running policy-controlled web research for current, cited context.', 'info');
+      const outcome = await this.research.webResearch(prompt);
+      sections.push(ResearchService.format(outcome), '');
+      citations.push(...outcome.findings.map(f => `${f.source} (retrieved ${f.retrievedAt})`));
+    }
+
+    if (repoOn) {
+      this._emit('log', 'Discovering high-quality public code examples to learn from.', 'info');
+      const outcome = await this.research.findCodeExamples(prompt);
+      sections.push(ResearchService.format(outcome), '');
+      citations.push(...outcome.findings.map(f => `${f.source}${f.updatedAt ? ` (updated ${f.updatedAt})` : ''}`));
+    }
+
+    if (citations.length === 0) { return; }
+
+    this.workspace.writeFile(this.workspace.webSearchPath, sections.join('\n'));
+    this._journal('research', `Gathered ${citations.length} external source(s)`,
+      citations.map(c => `- ${c}`).join('\n'));
     this.workspace.appendMemoryEvent({
       type: 'search',
       phase: 'briefing',
-      summary: `Web search fetched ${report.fetched.filter(item => item.success).length} page(s).`,
-      data: {
-        query: report.query,
-        hits: report.hits.map(hit => hit.url),
-        warnings: report.warnings,
-      },
+      summary: `External research gathered ${citations.length} cited source(s) (web=${webOn}, repos=${repoOn}).`,
+      data: { query: prompt, citations },
     });
   }
 
@@ -2288,6 +4133,7 @@ export class AgentOrchestrator {
 
   private _collectTestFixAllowedFiles(checks: ProjectCheckResults, testerOutput: TesterOutput): string[] {
     const files = new Set<string>();
+    if (checks.failedCommands.includes('collection acceptance')) { files.add('acceptance.json'); }
 
     for (const file of this._collectChangedFiles()) {
       if (this.fileManager.fileExists(file)) {
@@ -2315,6 +4161,17 @@ export class AgentOrchestrator {
       files.add('package.json');
     }
 
+    // The browser smoke check loads the served page, but its failures
+    // ("Cannot use import statement outside a module") never name the HTML
+    // file — so a page the planner never listed (benchmark run 6: index.html
+    // created by the first test fixer) was hidden from every later fixer,
+    // which then spent 4+ attempts editing the wrong files.
+    for (const entry of ['index.html', 'public/index.html', 'src/index.html']) {
+      if (this.fileManager.fileExists(entry)) {
+        files.add(entry);
+      }
+    }
+
     const text = [
       checks.output,
       testerOutput.rawOutput ?? '',
@@ -2332,9 +4189,446 @@ export class AgentOrchestrator {
     return [...files].sort();
   }
 
+  /** Lines of a command output that mention any of the files (plus up to 3 continuation lines). */
+  /** Output with absolute workspace paths (including those of a copy of this workspace) made relative. */
+  private _stripWorkspaceRoot(output: string): string {
+    const root = this.workspace.rootDir.replace(/\\/g, '/');
+    const folder = path.posix.basename(root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return output.split(`${root}/`).join('').replace(new RegExp(`/[^\\s'"()]*/${folder}/`, 'g'), '');
+  }
+
+  /**
+   * Lines of a command output that name any of the files, plus up to 3
+   * continuation lines. Bundler module summaries ("./src/x.ts 3 KiB [built]
+   * [code generated] [9 errors]") list every module and are skipped; a
+   * continuation stops at a line naming a different source file.
+   */
+  private _diagnosticLinesFor(output: string, files: string[], maxLines = 40): string[] {
+    const lines = this._stripWorkspaceRoot(output).split(/\r?\n/);
+    const summary = /\[(built|code generated|cached)\]|orphan modules|modules by path/i;
+    const namesOtherFile = (line: string) => /[\w.-]+\/[\w./-]+\.(m?[jt]sx?|cjs|json|css|html?|vue|svelte)\b/.test(line)
+      && !files.some(file => line.includes(file));
+    const picked: string[] = [];
+    lines.forEach((line, index) => {
+      if (summary.test(line) || !files.some(file => line.includes(file))) { return; }
+      picked.push(line);
+      for (const next of lines.slice(index + 1, index + 4)) {
+        if (summary.test(next) || namesOtherFile(next)) { break; }
+        picked.push(next);
+      }
+    });
+    return [...new Set(picked)].slice(0, maxLines);
+  }
+
+  /** The error-looking lines of an output (paths made relative), else its tail. */
+  private _errorEvidence(output: string, lines = 12): string {
+    const all = this._stripWorkspaceRoot(output).split(/\r?\n/).filter(line => line.trim());
+    const errors = all.filter(line => /\berror\b|exception|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|cannot|not found|undefined is not/i.test(line)
+      && !/\[(built|code generated|cached)\]/.test(line));
+    return (errors.length > 0 ? errors : all.slice(-lines)).slice(0, lines).join('\n');
+  }
+
+  /**
+   * Real build / test / browser checks after one task, attributed to that task.
+   * Dependencies are installed whenever the manifests changed. A failure counts
+   * against the task only when its output names the task's files, the task
+   * wrote the tests that fail, the task changed the build setup, or (browser)
+   * the page broke right after this task changed web files.
+   */
+  private async _taskRuntimeIssues(task: TaskItem, changedPaths: string[]): Promise<string[]> {
+    if (this.modelConfig.perTaskVerification === false) { return []; }
+    const pm = this.terminal.detectPackageManager();
+    // A no-build static page may have no package.json at all; it still gets
+    // the browser check below.
+    const hasPackageJson = this.fileManager.fileExists('package.json');
+    const tail = (text: string, lines = 30) => this._stripWorkspaceRoot(text).split(/\r?\n/).filter(Boolean).slice(-lines).join('\n');
+    const outputOf = (result: TerminalRunResult) => `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+    const run = async (command: string, timeoutMs: number): Promise<TerminalRunResult> => {
+      try { return await this.terminal.runSafeCommand(command, timeoutMs); } catch (err) {
+        if (err instanceof UserAbortError) { throw err; }
+        return { command, exitCode: -1, stdout: '', stderr: formatError(err), durationMs: 0, success: false };
+      }
+    };
+    const issues: string[] = [];
+    const summary: string[] = [];
+    const scope = this._taskReviewScopes.get(task.id);
+    scope.unverified = [];
+    // Files that import what this task changed or deleted: an export the task
+    // removed breaks them although the task never touched them (audit C02).
+    let importers: string[] | null = null;
+    const importerBreakage = (output: string): string[] => {
+      importers ??= findImporters(this.workspace.rootDir, [...changedPaths, ...scope.deleted],
+        this._projectSourceFiles().filter(file => !changedPaths.includes(file)));
+      if (importers.length === 0) { return []; }
+      const lines = this._diagnosticLinesFor(output, importers);
+      return IMPORT_BREAKAGE.test(lines.join('\n')) ? lines : [];
+    };
+
+    const fingerprint = this._dependencyManifestFingerprint();
+    const nodeModules = fs.existsSync(path.join(this.workspace.rootDir, 'node_modules'));
+    if (hasPackageJson && this.modelConfig.autoInstallDependencies && (!nodeModules || fingerprint !== this._taskInstalledFingerprint)) {
+      const command = pm === 'yarn' ? 'yarn install' : pm === 'pnpm' ? 'pnpm install' : 'npm install';
+      this._emit('log', `Per-task verification for ${task.id}: installing dependencies.`, 'info');
+      let install: TerminalRunResult;
+      try { install = await this._runConfiguredInstall(command, 600_000); } catch (err) {
+        if (err instanceof UserAbortError) { throw err; }
+        install = { command, exitCode: -1, stdout: '', stderr: formatError(err), durationMs: 0, success: false };
+      }
+      summary.push(`${command}: ${install.success ? 'ok' : 'FAILED'}`);
+      if (!install.success) {
+        if (changedPaths.includes('package.json')) {
+          issues.push(`[runtime] \`${command}\` fails after this task's package.json change:\n${tail(outputOf(install))}`);
+        } else {
+          // Not this task's fault, but nothing was checked either: say so
+          // instead of letting the task look verified (audit C02).
+          const note = `\`${command}\` failed, so the build/test/browser checks for ${task.id} did not run; the task is unverified, not clean.`;
+          scope.unverified.push(note);
+          summary.push('(unverified: dependency install failed, later checks skipped)');
+          this._journal('warn', `Per-task checks skipped for ${task.id}`, `${note}\n\n${this._errorEvidence(outputOf(install), 12)}`);
+        }
+        this._recordTaskRuntimeSummary(task, summary);
+        return issues; // nothing else can run without dependencies
+      }
+      this._taskInstalledFingerprint = fingerprint;
+    }
+
+    const buildSetupChanged = changedPaths.some(file =>
+      /^(package\.json|tsconfig[^/]*\.json|(webpack|vite|rollup|babel)\.config\.[cm]?[jt]s|\.babelrc)$/.test(file));
+    const buildScript = !hasPackageJson ? null
+      : this.terminal.hasPackageScript('build') ? 'build' : this.terminal.hasPackageScript('compile') ? 'compile' : null;
+    if (buildScript) {
+      const command = this._packageScriptCommand(pm, buildScript);
+      const build = await run(command, 300_000);
+      summary.push(`${command}: ${build.success ? 'ok' : 'FAILED'}`);
+      if (!build.success) {
+        const own = this._diagnosticLinesFor(outputOf(build), changedPaths);
+        // A setup change is blamed only for failures no source file explains
+        // (config/resolution errors), not for errors inside other tasks' files.
+        const otherFileErrors = this._diagnosticLinesFor(outputOf(build), this._projectSourceFiles().filter(file => !changedPaths.includes(file)), 1);
+        const broken = own.length > 0 ? [] : importerBreakage(outputOf(build));
+        if (own.length > 0) { issues.push(`[runtime] \`${command}\` fails in this task's files:\n${own.join('\n')}`); }
+        else if (broken.length > 0) { issues.push(`[runtime] \`${command}\` fails in files that import what this task changed or deleted:\n${broken.join('\n')}`); }
+        else if (buildSetupChanged && otherFileErrors.length === 0) {
+          // Run 13: part 1 of a split setup task wrote webpack.config.js whose
+          // entry src/scripts/index.js is part 2's file. The build cannot pass
+          // until that part runs and the fixer may not create it, so a build
+          // that only misses files a pending task will write is unverified.
+          const waitingOn = this._missingPlannedFiles(task, outputOf(build));
+          if (waitingOn.length > 0) {
+            const note = `\`${command}\` fails only because ${waitingOn.map(item => `${item.file} (written by ${item.taskId})`).join(', ')} does not exist yet; the build for ${task.id} is unverified until then.`;
+            scope.unverified.push(note);
+            summary.push('(build waits for files a later task writes — not blocking)');
+          } else {
+            issues.push(`[runtime] \`${command}\` fails after this task changed the build setup:\n${this._errorEvidence(outputOf(build), 30)}`);
+          }
+        }
+      }
+    }
+
+    const testScript = hasPackageJson ? this._packageTestScript() : null;
+    if (testScript && !isPlaceholderScript(testScript)) {
+      const test = await this.terminal.runTests(pm);
+      summary.push(`${pm} test: ${test.success ? 'ok' : 'FAILED'}`);
+      // A runner with nothing to run yet ("No tests found") is not a defect of
+      // this task when the project has no test files: a later task writes them
+      // (benchmark run 10 blamed the setup task for exactly this).
+      const noTestsYet = /No tests found|No test files found|no test specified|No test suite found/i.test(outputOf(test))
+        && !this.fileManager.listWorkspaceFiles('').some(file => TEST_FILE.test(file) && /\.(m?[jt]sx?|cjs)$/.test(file)
+          && !/(^|\/)(node_modules|\.agent-workspace)\//.test(file));
+      if (!test.success && noTestsYet) { summary.push('(no test files yet — not blocking)'); }
+      // Exit 0 after running nothing is not a passing test suite (audit C04).
+      const ran = countExecutedTests(outputOf(test));
+      if (ran.executed !== null) { summary.push(`tests executed: ${ran.executed}${ran.skipped ? ` (${ran.skipped} skipped)` : ''}`); }
+      // Run 11: task-014 rewrote the test file that task-009 had brought to
+      // 23 passing tests. A task may add tests, not lose passing ones.
+      const touchedTests = changedPaths.some(file => TEST_FILE.test(file));
+      if (test.success && ran.executed !== null && ran.executed > 0) {
+        if (touchedTests && ran.executed < this._passingTestFloor) {
+          issues.push(`[tests] \`${pm} test\` now runs ${ran.executed} test(s), but ${this._passingTestFloor} passed before this task. ` +
+            'Keep the existing tests (fix or extend them) instead of replacing them with fewer.');
+        } else {
+          this._passingTestFloor = Math.max(this._passingTestFloor, ran.executed);
+        }
+      }
+      if (test.success && ran.executed === 0 && changedPaths.some(file => TEST_FILE.test(file))) {
+        issues.push(`[tests] \`${pm} test\` exits successfully but ran 0 tests${ran.skipped ? ` (${ran.skipped} skipped or todo)` : ''}. ` +
+          'The tests this task wrote are not discovered or not active: check the runner\'s file pattern and remove skip/todo.');
+      }
+      if (!test.success && !noTestsYet) {
+        const wroteTests = changedPaths.some(file => TEST_FILE.test(file));
+        const own = this._diagnosticLinesFor(outputOf(test), changedPaths);
+        const broken = own.length > 0 ? [] : importerBreakage(outputOf(test));
+        if (own.length > 0) { issues.push(`[runtime] \`${pm} test\` fails in this task's files:\n${own.join('\n')}`); }
+        else if (broken.length > 0) { issues.push(`[runtime] \`${pm} test\` fails in files that import what this task changed or deleted:\n${broken.join('\n')}`); }
+        else if (wroteTests || changedPaths.includes('package.json')) { issues.push(`[runtime] \`${pm} test\` fails after this task changed the tests or their setup:\n${this._errorEvidence(outputOf(test), 30)}`); }
+      }
+    }
+
+    const webChanged = changedPaths.some(file => /\.(html?|m?[jt]sx?|css)$/.test(file) && !TEST_FILE.test(file));
+    const isWeb = ['index.html', 'public/index.html', 'src/index.html'].some(entry => this.fileManager.fileExists(entry));
+    if (webChanged && isWeb && this.modelConfig.appVerification?.enabled !== false) {
+      const smoke = await new AppVerificationService(this.workspace.rootDir, this.terminal, this.terminalSessions, this.modelConfig.appVerification).verify();
+      summary.push(`browser smoke: ${smoke.failed ? 'FAILED' : 'ok'}`);
+      // A failure this task already caused stays its blocker until the page
+      // loads again, even though the previous check failed too (audit C01).
+      const regression = smoke.failed && (this._lastTaskSmokePassed !== false
+        || changedPaths.some(file => /\.html?$/.test(file)) || scope.openRuntime.has('smoke'));
+      if (regression) { scope.openRuntime.add('smoke'); }
+      if (!smoke.failed) { scope.openRuntime.delete('smoke'); }
+      if (regression) {
+        const evidence = smoke.checks.filter(check => !check.success)
+          .map(check => `${check.command}:\n${this._errorEvidence(outputOf(check), 8)}`).join('\n');
+        issues.push(`[runtime] The page fails in a real browser after this task:\n${evidence || smoke.summary}`);
+      }
+      this._lastTaskSmokePassed = !smoke.failed;
+    }
+
+    this._recordTaskRuntimeSummary(task, summary);
+    return issues;
+  }
+
+  /**
+   * Files a build error reports as missing that a pending task of the plan
+   * will write. Empty when any missing-module line names something no pending
+   * task owns, so a genuinely wrong path is still the task's defect.
+   */
+  private _missingPlannedFiles(task: TaskItem, output: string): Array<{ file: string; taskId: string }> {
+    const MISSING = /can't resolve|cannot find module|could not resolve|module not found|failed to resolve|ENOENT|no such file/i;
+    const lines = this._stripWorkspaceRoot(output).split(/\r?\n/).filter(line => MISSING.test(line));
+    if (lines.length === 0) { return []; }
+    const pending = (this._loadTaskPlan()?.tasks ?? [])
+      .filter(other => other.id !== task.id && other.status !== 'completed')
+      .flatMap(other => other.allowedFiles
+        .filter(file => !file.endsWith('/') && !file.includes('*') && !this.fileManager.fileExists(file))
+        .map(file => ({ file: file.replace(/^\.\//, ''), taskId: other.id })));
+    const named = (line: string) => pending.filter(item => line.includes(item.file));
+    const unexplained = lines.filter(line => named(line).length === 0 && /['"`][^'"`]+['"`]/.test(line));
+    if (unexplained.length > 0) { return []; }
+    const found = lines.flatMap(named);
+    return found.filter((item, index) => found.findIndex(other => other.file === item.file) === index);
+  }
+
+  /** The dependency installs the orchestrator itself issues, never model-written text. */
+  private static readonly CONFIGURED_INSTALLS = new Set(['npm install', 'pnpm install', 'yarn install', 'pip3 install -r requirements.txt']);
+
+  /**
+   * Runs one of the orchestrator's own install commands. With
+   * autoInstallDependencies on, the user has already approved exactly these,
+   * so they bypass the network-approval rule that still applies to any other
+   * command (audit C08). Anything else goes through the normal policy.
+   */
+  private async _runConfiguredInstall(command: string, timeoutMs: number): Promise<TerminalRunResult> {
+    if (this.modelConfig.autoInstallDependencies && AgentOrchestrator.CONFIGURED_INSTALLS.has(command)) {
+      return this.terminal.runApprovedCommand(command, timeoutMs);
+    }
+    return this.terminal.runSafeCommand(command, timeoutMs);
+  }
+
+  private _projectSourceFiles(): string[] {
+    return this.fileManager.listWorkspaceFiles('')
+      .filter(file => /\.(m?[jt]sx?|cjs|vue|svelte)$/.test(file) && !/(^|\/)(node_modules|dist|build|\.agent-workspace)\//.test(file));
+  }
+
+  private _packageTestScript(): string | null {
+    try {
+      const pkg = JSON.parse(this.fileManager.readWorkspaceFile('package.json') ?? '') as { scripts?: Record<string, string> };
+      return typeof pkg.scripts?.test === 'string' ? pkg.scripts.test : null;
+    } catch { return null; }
+  }
+
+  private _recordTaskRuntimeSummary(task: TaskItem, summary: string[]): void {
+    if (summary.length === 0) { return; }
+    this._lastMicroCheckSummary = `## Real checks after ${task.id} (${new Date().toISOString()})\n${summary.join('\n')}`;
+    this.workspace.appendFile(this.workspace.testResultLogPath, `\n\n---\n\n## Per-Task Verification: ${task.id}\n\n${summary.join('\n')}\n`);
+  }
+
+  /**
+   * Lower is better: failed commands dominate, then the number of error-looking
+   * lines. Used to tell whether a test-fix attempt improved the project.
+   */
+  private _verificationErrorScore(checks: ProjectCheckResults): number {
+    const errorLines = checks.output.split(/\r?\n/)
+      .filter(line => /\berror\b|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|Exception|Cannot find/i.test(line)).length;
+    return checks.failedCommands.length * 1000 + Math.min(errorLines, 999);
+  }
+
+  private _restoreWorkspaceFile(file: string, content: string | null): void {
+    if (!this._isSafeWorkspaceRelativePath(file)) { return; }
+    // Through FileManager so a symlink cannot lead a restore outside the workspace (audit C07).
+    if (content === null) { this.fileManager.deleteWorkspaceFile(file); }
+    else { this.fileManager.writeWorkspaceFile(file, content); }
+  }
+
+  /**
+   * Per-run verification memory lives on the instance; a new or resumed run
+   * must not inherit the previous run's smoke result, task scopes or test-fix
+   * focus (audit D03). Dependencies are reinstalled once, since node_modules
+   * may not match what the last run left.
+   */
+  private _resetRunScopedChecks(): void {
+    this._lastTaskSmokePassed = null;
+    this._taskReviewScopes.clear();
+    this._missingTaskFiles.clear();
+    this._passingTestFloor = 0;
+    this._testFixFocusText.clear();
+    this._taskInstalledFingerprint = '';
+    this._typeScriptGateWarned.clear();
+  }
+
+  /**
+   * The goal's acceptance walk-through, when the caller supplies one (F9).
+   * Run 11: 25/25 unit tests and every check passed on a game that could not
+   * be started; only the benchmark's browser walk-through caught it, after
+   * the pipeline had finished. DEBATE_ACCEPTANCE_SCRIPT names a module
+   * outside the workspace (so tasks cannot edit the oracle) exporting a
+   * factory that returns a BrowserInteraction; its failed checks then fail
+   * the final verification and drive the test-fix loop like any other error.
+   */
+  private _acceptanceInteraction(): BrowserInteraction | undefined {
+    const script = process.env.DEBATE_ACCEPTANCE_SCRIPT;
+    if (!script) {
+      const contract = this._loadAcceptanceContract();
+      return contract ? acceptanceContractInteraction(contract) : undefined;
+    }
+    const resolved = path.resolve(script);
+    const root = path.resolve(this.workspace.rootDir);
+    if (resolved === root || resolved.startsWith(root + path.sep)) {
+      this._journal('warn', 'Acceptance script ignored', `${resolved} lies inside the workspace, where tasks could edit it.`);
+      return undefined;
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const loaded = require(resolved) as Record<string, unknown>;
+      const factory = [loaded.interaction, loaded.default, ...Object.values(loaded)].find(value => typeof value === 'function') as (() => BrowserInteraction) | undefined;
+      if (!factory) { throw new Error('the module exports no interaction factory'); }
+      return factory();
+    } catch (err) {
+      this._journal('warn', 'Acceptance script could not be loaded', `${resolved}: ${formatError(err)}`);
+      return undefined;
+    }
+  }
+
+  /** Unwired modules and comment-only implementations across the project (run 11). */
+  private _implementationGaps(): { issues: string[]; output: string } {
+    const issues: string[] = [];
+    try {
+      const wiring = findUnwiredModules(this.workspace.rootDir);
+      if (wiring.unwired.length > 0) {
+        issues.push(`Source modules that no page loads (entry ${wiring.entries.join(', ')} never imports them, directly or indirectly): ${wiring.unwired.slice(0, 15).join(', ')}. ` +
+          'Import and use them from the page\'s entry script, or delete them if they are obsolete.');
+      }
+      issues.push(...findProjectCommentOnlyImplementations(this.workspace.rootDir));
+    } catch (err) {
+      this._journal('warn', 'Implementation-gap check could not run', formatError(err));
+    }
+    return {
+      issues,
+      output: issues.length > 0
+        ? `## Implementation Gaps\nFailed: the product does not run its own code.\n${issues.map(issue => `- ${issue}`).join('\n')}`
+        : '## Implementation Gaps\nPassed: every source module is loaded by a page (or a script), and no function or input handler is only a comment.',
+    };
+  }
+
+  /** Manifests and lockfiles a dependency install or self-heal may rewrite. */
+  private static readonly DEPENDENCY_FILES = ['package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'requirements.txt'];
+
+  /** What a verification run actually exercised: commands run and tests executed (null = unknown). */
+  private _verificationInventory(checks: ProjectCheckResults): { commands: number; tests: number | null } {
+    const commands = [checks.compileResult, checks.testResult, ...(checks.additionalResults ?? [])].filter(Boolean).length;
+    const test = checks.testResult;
+    const tests = test ? countExecutedTests(`${test.stdout ?? ''}\n${test.stderr ?? ''}`).executed : null;
+    return { commands, tests };
+  }
+
+  /** Why `now` exercised less than `floor`, or '' when it did not. */
+  private _inventoryShrank(now: { commands: number; tests: number | null }, floor: { commands: number; tests: number | null }): string {
+    if (now.commands < floor.commands) { return `${now.commands} check command(s) ran instead of ${floor.commands}`; }
+    if (floor.tests !== null && floor.tests > 0 && (now.tests ?? 0) < floor.tests) { return `${now.tests ?? 'an unknown number of'} test(s) executed instead of ${floor.tests}`; }
+    return '';
+  }
+
+  private _inventoryMax(a: { commands: number; tests: number | null }, b: { commands: number; tests: number | null }): { commands: number; tests: number | null } {
+    return { commands: Math.max(a.commands, b.commands), tests: a.tests === null ? b.tests : b.tests === null ? a.tests : Math.max(a.tests, b.tests) };
+  }
+
+  /**
+   * The first failing file cluster of a verification run: the first project
+   * file the diagnostics mention, the next one, and the first file's relative
+   * imports (≤ 4 files), plus package.json / the HTML entry only when the
+   * diagnostics point there. Returns null when no project file is named.
+   */
+  private _testFixFocus(checks: ProjectCheckResults, candidates: string[]): { files: string[]; diagnostics: string } | null {
+    const output = this._stripWorkspaceRoot(checks.output);
+    const lines = output.split(/\r?\n/);
+    const errorLine = /\berror\b|✖|✗|\bFAIL(ED)?\b|\bTS\d{4}\b|Exception|Cannot find|Blocking issues|^- /i;
+    const ordered: string[] = [];
+    // Browser errors name served URLs ("/scripts/main.js") rather than project
+    // paths ("src/scripts/main.js"); map a mention to the one file it ends with.
+    const aliases = new Map<string, string>();
+    let sources: string[] | null = null;
+    const resolveMention = (mention: string): string | null => {
+      if (this.fileManager.fileExists(mention)) { return mention; }
+      sources ??= this.fileManager.listWorkspaceFiles('').filter(file => !/(^|\/)(node_modules|\.agent-workspace)\//.test(file));
+      const matches = sources.filter(file => file.endsWith(`/${mention}`));
+      return matches.length === 1 ? matches[0] : null;
+    };
+    for (const line of lines) {
+      if (!errorLine.test(line)) { continue; }
+      for (const mention of this._extractWorkspaceFileMentions(line)) {
+        const file = resolveMention(mention);
+        if (!file || ordered.includes(file) || file === 'package.json'
+          || /(^|\/)node_modules\//.test(file) || file.startsWith('.agent-workspace/')) { continue; }
+        ordered.push(file);
+        if (file !== mention) { aliases.set(mention, file); }
+      }
+    }
+    if (ordered.length === 0) { return null; }
+
+    const files = ordered.slice(0, 2);
+    const first = ordered[0];
+    const importPattern = /(?:from\s*|import\s*\(?\s*|require\(\s*)['"](\.{1,2}\/[^'"]+)['"]/g;
+    for (const match of (this.fileManager.readWorkspaceFile(first) ?? '').matchAll(importPattern)) {
+      if (files.length >= 4) { break; }
+      const base = path.posix.normalize(path.posix.join(path.posix.dirname(first), match[1]));
+      const resolved = [base, `${base}.js`, `${base}.ts`, `${base}.tsx`, `${base}/index.js`, `${base}/index.ts`]
+        .find(candidate => this.fileManager.fileExists(candidate));
+      if (resolved && !files.includes(resolved)) { files.push(resolved); }
+    }
+    if (this.fileManager.fileExists('package.json')
+      && /package\.json|Cannot find module '[^.\/]|npm ERR|Missing script|command not found|not found:/i.test(output)) {
+      files.push('package.json');
+    }
+    if (checks.failedCommands.includes('app smoke verification')) {
+      for (const entry of ['index.html', 'public/index.html', 'src/index.html']) {
+        if (this.fileManager.fileExists(entry) && !files.includes(entry)) { files.push(entry); }
+      }
+    }
+    const inScope = files.filter(file => candidates.includes(file) || this.fileManager.fileExists(file));
+
+    const picked: string[] = [];
+    const startsError = /^\s*(\[\w+\]\s*)?(ERROR|✖|✗|FAIL)\b/i;
+    const namesScope = (line: string) => inScope.some(file => line.includes(file))
+      || [...aliases].some(([mention, file]) => inScope.includes(file) && line.includes(mention));
+    lines.forEach((line, index) => {
+      if (!namesScope(line) || !errorLine.test(line)) { return; }
+      picked.push(line);
+      for (const next of lines.slice(index + 1, index + 4)) {
+        if (startsError.test(next) && !namesScope(next)) { break; }
+        picked.push(next);
+      }
+    });
+    const diagnostics = [
+      `Failed checks: ${checks.failedCommands.join(', ')}`,
+      '',
+      ...[...new Set(picked)].slice(0, 80),
+    ].join('\n');
+    return { files: inScope, diagnostics };
+  }
+
   private _extractWorkspaceFileMentions(text: string): string[] {
     const files = new Set<string>();
-    const pattern = /(?:^|[\s('"`])((?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|plist|storyboard|swift|ts|tsx|txt|xcconfig|xib|xml|yml|yaml))/g;
+    // A leading "/" (served URL paths such as "/scripts/main.js") is not captured.
+    const pattern = /(?:^|[\s('"`])\/?((?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:cjs|css|html|js|json|jsx|md|mjs|plist|storyboard|swift|ts|tsx|txt|xcconfig|xib|xml|yml|yaml))/g;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text)) !== null) {
       const normalized = this._normalizeRelativePath(match[1]);
@@ -2350,6 +4644,165 @@ export class AgentOrchestrator {
     return [...files];
   }
 
+  /**
+   * Verify the project against what it CLAIMS to deliver, so the final report is
+   * honest instead of describing files that do not exist. Pure + unit-testable.
+   * - `missingDeliverables`: artifacts the brief promised but that are absent.
+   * - `phantomReferences`: concrete file paths the README references (in backticks)
+   *   that do not exist on disk (e.g. a "tests/" or blueprint file never created).
+   */
+  _verifyArtifactsAgainstClaims(
+    readme: string,
+    declaredDeliverables: string[],
+    existingFiles: string[]
+  ): { missingDeliverables: string[]; phantomReferences: string[] } {
+    const norm = (p: string): string => p.replace(/^\.\//, '').replace(/\/+$/, '').trim();
+    const files = existingFiles.map(norm).filter(Boolean);
+    const present = (p: string): boolean => {
+      const n = norm(p);
+      if (!n) { return true; }
+      return files.some(f => f === n || f.startsWith(`${n}/`) || f.endsWith(`/${n}`) || f.split('/').includes(n));
+    };
+
+    const missingDeliverables = [...new Set(declaredDeliverables.map(norm).filter(Boolean))].filter(d => !present(d));
+
+    // Only flag backticked tokens that clearly denote a file/dir path with a
+    // recognized code extension or an explicit directory — keeps false positives
+    // (e.g. `npm install`, `node`) out.
+    const codeExt = /\.(py|js|mjs|cjs|ts|tsx|jsx|json|html|css|scss|md|txt|ya?ml|toml|cfg|ini|swift|go|rs|java|kt|rb|php|sh|sql)$/i;
+    const phantom = new Set<string>();
+    const backtick = /`([^`\n]{2,80})`/g;
+    let m: RegExpExecArray | null;
+    while ((m = backtick.exec(readme || '')) !== null) {
+      const tok = m[1].trim();
+      if (/\s/.test(tok)) { continue; }                      // skip commands like "npm install"
+      if (tok.startsWith('.agent-workspace/')) { continue; } // internal runtime evidence is intentionally excluded from delivery
+      const looksLikePath = tok.endsWith('/') || codeExt.test(tok) || (tok.includes('/') && !tok.includes('://'));
+      if (!looksLikePath) { continue; }
+      if (!present(tok)) { phantom.add(tok.replace(/\/+$/, '')); }
+      if (phantom.size >= 15) { break; }
+    }
+
+    return { missingDeliverables, phantomReferences: [...phantom] };
+  }
+
+  /** Read README + brief deliverables, run the pure checker, journal the result. */
+  private _runArtifactVerification(projectBriefRaw: string): { summary: string; ok: boolean } {
+    const existingFiles = this.fileManager.listWorkspaceFiles('');
+    const readme = this.fileManager.fileExists('README.md')
+      ? (this.fileManager.readWorkspaceFile('README.md') ?? '')
+      : '';
+    let deliverables: string[] = [];
+    try {
+      const brief = JSON.parse(projectBriefRaw) as { deliveryArtifacts?: unknown };
+      if (Array.isArray(brief.deliveryArtifacts)) {
+        deliverables = brief.deliveryArtifacts.map(d => String(d));
+      }
+    } catch { /* brief may be markdown; deliverables stay empty */ }
+
+    // Briefs often mix concrete paths with semantic deliverables such as
+    // "source project" or "verification log". Resolve those explicitly rather
+    // than treating the prose itself as a filename that can never exist.
+    const pathLikeDeliverables = deliverables.filter(item =>
+      /\/|\.(py|js|mjs|cjs|ts|tsx|jsx|json|html|css|md|txt|ya?ml|toml|swift|go|rs|java)$/i.test(item.trim())
+    );
+    const semanticMissing: string[] = [];
+    const semanticText = deliverables.join('\n').toLowerCase();
+    const sourceFiles = existingFiles.filter(file =>
+      /\.(py|js|mjs|cjs|ts|tsx|jsx|html|css|swift|go|rs|java|kt|cs)$/i.test(file)
+    );
+    if (/source project|source code/.test(semanticText) && sourceFiles.length === 0) {
+      semanticMissing.push('source project');
+    }
+    if (/readme/.test(semanticText) && !this.fileManager.fileExists('README.md')) {
+      semanticMissing.push('README instructions');
+    }
+    if (/verification log|test log/.test(semanticText) && !this.workspace.fileExists(this.workspace.testResultLogPath)) {
+      semanticMissing.push('verification log');
+    }
+    const checked = this._verifyArtifactsAgainstClaims(readme, pathLikeDeliverables, existingFiles);
+    const missingDeliverables = [...new Set([...checked.missingDeliverables, ...semanticMissing])];
+    const phantomReferences = checked.phantomReferences;
+    const manifestMissingFiles: string[] = [];
+    let manifestProblem = '';
+    const manifestRaw = this.workspace.readFile(this.workspace.deliveryManifestPath);
+    if (!manifestRaw) {
+      manifestProblem = 'Delivery manifest is missing.';
+    } else {
+      try {
+        const manifest = JSON.parse(manifestRaw) as { filesIncluded?: unknown; archiveCreated?: unknown; archivePath?: unknown };
+        if (!Array.isArray(manifest.filesIncluded)) {
+          manifestProblem = 'Delivery manifest has no valid filesIncluded array.';
+        } else {
+          for (const file of manifest.filesIncluded.map(String)) {
+            if (!existingFiles.includes(file)) { manifestMissingFiles.push(file); }
+          }
+        }
+        if (/final archive|archive/.test(semanticText)) {
+          const archivePath = typeof manifest.archivePath === 'string' ? manifest.archivePath : '';
+          if (manifest.archiveCreated !== true || !archivePath || !this.fileManager.fileExists(archivePath)) {
+            semanticMissing.push('final archive');
+            if (!missingDeliverables.includes('final archive')) { missingDeliverables.push('final archive'); }
+          }
+        }
+      } catch (err) {
+        manifestProblem = `Delivery manifest is invalid JSON: ${formatError(err)}.`;
+      }
+    }
+    const ok = missingDeliverables.length === 0 && phantomReferences.length === 0
+      && manifestMissingFiles.length === 0 && !manifestProblem;
+
+    // Advisory only — deliberately does NOT affect `ok`. Unlike the checks
+    // above (a missing deliverable/phantom reference/manifest gap means the
+    // delivery is dishonest about what it contains), an unreferenced export
+    // is a code-quality smell, not proof the build is broken: this heuristic
+    // is new and its bare-basename reference search is intentionally loose
+    // (see findUnreferencedExportingFiles), so a false positive here should
+    // never abort an otherwise-good, honestly-reported build.
+    const wiringIssues = this._findUnreferencedFilesAtFinalDelivery(existingFiles);
+
+    const summary = [
+      ok
+        ? 'All declared deliverables exist, README references resolve, and the delivery manifest contains no missing files.'
+        : [
+            missingDeliverables.length ? `Missing declared deliverables: ${missingDeliverables.join(', ')}` : '',
+            phantomReferences.length ? `README references files that do not exist: ${phantomReferences.join(', ')}` : '',
+            manifestMissingFiles.length ? `Delivery manifest lists missing files: ${manifestMissingFiles.join(', ')}` : '',
+            manifestProblem,
+          ].filter(Boolean).join('\n'),
+      wiringIssues.length ? `Possibly unwired files (advisory, not blocking): ${wiringIssues.join(' | ')}` : '',
+    ].filter(Boolean).join('\n');
+
+    if (!ok) {
+      this._journal('warn', 'Artifact verification found gaps', summary);
+      this.workspace.appendAssumption('finalIntegrator', `Artifact verification gaps: ${summary}`);
+    } else if (wiringIssues.length) {
+      this._journal('warn', 'Artifact verification passed, but found possibly unwired files', summary);
+      this.workspace.appendAssumption('finalIntegrator', `Possibly unwired files: ${wiringIssues.join(' | ')}`);
+    } else {
+      this._journal('audit', 'Artifact verification passed', summary);
+    }
+    return { summary, ok };
+  }
+
+  /**
+   * End-of-build-only scan for exporting source files nothing else in the
+   * finished project ever imports (see findUnreferencedExportingFiles for
+   * why this deliberately never runs per-task). Bounded to a sane file count
+   * and size so a huge or vendored tree can't make final integration slow.
+   */
+  private _findUnreferencedFilesAtFinalDelivery(existingFiles: string[]): string[] {
+    const relevant = existingFiles.filter(p => /\.(js|jsx|ts|tsx|mjs|cjs|html)$/.test(p)).slice(0, 500);
+    const files = relevant
+      .map(p => ({ path: p, content: this.fileManager.readWorkspaceFile(p) ?? '' }))
+      .filter(f => f.content.length > 0 && f.content.length <= 200_000);
+    try {
+      return findUnreferencedExportingFiles(files);
+    } catch {
+      return []; // advisory check; never let it fail final delivery on its own account
+    }
+  }
+
   private async _phaseFinalIntegration(state: ProjectState): Promise<void> {
     this._checkAborted();
     this._setPhase(state, 'final_integration', 'Final Integrator: Writing report...');
@@ -2362,18 +4815,30 @@ export class AgentOrchestrator {
     const projectBrief = this.workspace.readFile(this.workspace.projectBriefPath) ?? '';
     const deliveryManifest = this.workspace.readFile(this.workspace.deliveryManifestPath) ?? '';
     const gitSnapshot = this.workspace.readFile(this.workspace.gitSnapshotPath) ?? '';
+    const assumptions = this.workspace.readFile(this.workspace.assumptionsPath) ?? '';
 
     // Gather changed files summary
     const changedFiles = this._collectChangedFiles();
+
+    // Honesty check: verify the project against what it claims to deliver.
+    const verification = this._runArtifactVerification(projectBrief);
+    if (!verification.ok) {
+      throw new WorkflowError(
+        `Completion gate blocked the final report because artifact verification failed: ${verification.summary}`,
+        'final_integration'
+      );
+    }
 
     const context = this._assembleContext([
       this._sec('# Original User Prompt', prompt, 1),
       this._sec('# Autonomous Project Brief', projectBrief, 2),
       this._sec('# Task Results', taskResults, 2),
       this._sec('# Test Results', testerNote, 3),
+      this._sec('# Artifact Verification (be honest about these gaps in the report)', verification.summary, 2),
       this._sec('# Delivery Manifest', deliveryManifest, 3),
       this._sec('# Architecture', architectMd, 4),
       this._sec('# Changed Files', changedFiles.join('\n'), 4),
+      this._sec('# Autonomous Assumptions (disclose deterministic recovery, self-healing, or unresolved gaps in Known Limitations — do not omit)', assumptions, 5),
       this._sec('# Git Repository Snapshot', gitSnapshot, 7),
     ]);
 
@@ -2392,6 +4857,7 @@ export class AgentOrchestrator {
     }
 
     this.workspace.writeFile(this.workspace.finalReportPath, this._wrapNote('Final Report', report));
+    this._journal('report', 'Final report — handoff to boss', report);
     this._updateTimeline('final_integration', 'completed');
     this._recordActivity({
       phase: 'final_integration',
@@ -2402,6 +4868,7 @@ export class AgentOrchestrator {
     });
     this.callbacks.onComplete?.(report);
     this._emit('log', 'Final report generated.', 'info');
+    this.telegram.notify(`✅ Hoàn thành!\n\n${report}`);
   }
 
   private async _phaseImprovementConsensus(state: ProjectState, sprint: number): Promise<ImprovementConsensus[]> {
@@ -2416,16 +4883,36 @@ export class AgentOrchestrator {
     const taskResults = this.workspace.readFile(this.workspace.taskResultsPath) ?? '';
     const testerNote = this.workspace.readFile(this.workspace.testerPath) ?? '';
     const rollingSummary = this.workspace.readFile(this.workspace.rollingSummaryPath) ?? '';
+    const collectionAcceptance = await new CollectionAcceptanceService(this.workspace.rootDir)
+      .verify(this.workspace.readUserPrompt());
+    this.workspace.writeFile(path.join(this.workspace.logsDir, 'collection_acceptance.json'), prettyJson(collectionAcceptance));
+    // A real run shipped a game with 2 of 20 requested levels — literally a
+    // "// Add more levels as needed" comment — while three separate retrospective
+    // agents unanimously and confidently claimed "all 20 levels work". The cause:
+    // this step only ever showed them a bare list of file NAMES, so there was no
+    // way for them to have known either way; they were guessing from task titles.
+    // Giving them the actual (bounded) file contents at least makes the claim
+    // checkable instead of purely self-reported.
     const changedFiles = this._collectChangedFiles();
+    const changedFilesContent = changedFiles.length === 0
+      ? 'No changed files recorded.'
+      : changedFiles
+        .map(p => {
+          const content = this.fileManager.readWorkspaceFile(p);
+          if (content === null) { return `## File: ${p}\n(deleted or unreadable)`; }
+          return `## File: ${p}\n\`\`\`\n${content.slice(0, 2500)}${content.length > 2500 ? '\n...(truncated)' : ''}\n\`\`\``;
+        })
+        .join('\n\n');
     const baseContext = this._assembleContext([
       this._sec('# Original User Prompt', prompt, 1),
       this._sec('', `# Sprint\n\n${sprint}`, 1, 0.02),
       this._sec('# Project Brief', projectBrief, 2),
       this._sec('# Completed Task Results', taskResults, 2),
       this._sec('# Verification Results', testerNote, 3),
+      this._sec('# Measured Collection Acceptance', prettyJson(collectionAcceptance), 2),
       this._sec('# Architecture', architecture, 4),
       this._sec('# Current Task Plan', taskPlan, 5),
-      this._sec('# Changed Files', changedFiles.join('\n') || 'No changed files recorded.', 5),
+      this._sec('# Changed Files (actual current content)', changedFilesContent, 5),
       this._sec('# Rolling Summary', rollingSummary, 6),
     ]);
 
@@ -2444,6 +4931,13 @@ export class AgentOrchestrator {
             'Decide whether the current verified product needs another small sprint.',
             'Only recommend work that materially improves the original user request.',
             'If tests pass and the product satisfies the brief, prefer stopping instead of inventing endless enhancements.',
+            'Base "readyToStop" ONLY on what you can see in "# Changed Files" below — the actual current',
+            'file contents, not the task titles or your own assumption about what a task like that usually produces.',
+            'If the brief states a specific count (e.g. "20 levels"), verify that many are actually present in the',
+            'file contents before claiming it is done; do not extrapolate from a partial or truncated example.',
+            'Never assert unverifiable runtime behavior (frame rate, cross-browser/device behavior, accessibility',
+            'compliance) as a verified fact — you cannot observe it from source code, so treat it as an assumption',
+            'at most, never as grounds for readyToStop.',
             'Respond only with valid JSON.',
           ].join('\n'),
         },
@@ -2495,6 +4989,42 @@ export class AgentOrchestrator {
       });
     }
 
+    // Deterministic backstop: three separate models have, in a real run, all
+    // unanimously (and wrongly) claimed a product with a "// Add 19 more levels
+    // here" stub and invalid JSON was complete and verified. Model self-report is
+    // not trustworthy enough to gate stopping on its own, so re-run the same
+    // cheap structural scan used during task review across every changed file
+    // one more time here, and refuse to honor a STOP verdict while it still finds
+    // something concretely wrong — no model call, so it cannot be talked out of it.
+    const structuralIssues = this._heuristicFileIssues(
+      changedFiles.map((p): FileChange => {
+        const content = this.fileManager.readWorkspaceFile(p);
+        // A path an earlier task deliberately deleted has no current content —
+        // that is not the same as a task shipping an empty file, so mark it
+        // 'delete' rather than defaulting to '' (which the empty-file check
+        // below would otherwise misreport as a fresh regression).
+        return content === null ? { path: p, action: 'delete' } : { path: p, action: 'modify', content };
+      }),
+      ''
+    ).filter(Boolean);
+    structuralIssues.push(...collectionAcceptance.checks.filter(check => check.status !== 'passed')
+      .map(check => `Collection acceptance: ${check.diagnostic}`));
+    structuralIssues.push(...this._implementationGaps().issues);
+    const unfinishedTasks = this._loadTaskPlan()?.tasks.filter(task => task.status !== 'completed') ?? [];
+    structuralIssues.push(...unfinishedTasks.map(task => `Unfinished task ${task.id}: ${task.title} (${task.status}).`));
+    structuralIssues.push(...state.failedTasks
+      .filter(id => !unfinishedTasks.some(task => task.id === id))
+      .map(id => `Failed task ${id} still needs recovery.`));
+    if (structuralIssues.length > 0) {
+      for (const item of consensus) {
+        item.readyToStop = false;
+        item.remainingWork = [...new Set([...item.remainingWork, ...structuralIssues])].slice(0, 6);
+        item.nextSprintGoal = item.nextSprintGoal || 'Fix the structural issues a deterministic scan found in the delivered files.';
+      }
+      this._journal('warn', `Deterministic scan overrides sprint ${sprint} retrospective consensus`,
+        `Model consensus said the product was complete, but a structural scan (no model involved) still found: ${structuralIssues.join('; ')}`);
+    }
+
     const summaryPath = this.workspace.agentNotePath(`sprint_${String(sprint).padStart(2, '0')}_consensus_summary.md`);
     const ready = this._consensusReadyToStop(consensus);
     this.workspace.writeFile(
@@ -2520,6 +5050,11 @@ export class AgentOrchestrator {
       `Consensus: ${ready ? 'stop' : 'continue'}\n` +
       consensus.map(item => `- ${item.agentRole}: ${item.readyToStop ? 'stop' : 'continue'} (${item.confidence})`).join('\n')
     );
+    this._journal('consensus', `Sprint ${sprint} retrospective — decision: ${ready ? 'STOP (product is complete)' : 'CONTINUE (more work)'}`,
+      consensus.map(item =>
+        `- **${item.agentRole}**: ${item.readyToStop ? '✅ ready to stop' : '🔁 continue'} (${item.confidence}) — ${item.rationale}`
+        + (item.remainingWork.length ? `\n  Remaining: ${item.remainingWork.join('; ')}` : '')
+      ).join('\n'));
     this._updateTimeline('brainstorm', 'completed');
     return consensus;
   }
@@ -2532,7 +5067,7 @@ export class AgentOrchestrator {
     task: TaskItem,
     architectMd: string,
     rollingSummary: string,
-    _state: ProjectState
+    state: ProjectState
   ): Promise<CodeWorkerOutput | null> {
     // Build context: task + architecture + existing file contents
     this._ensureCapabilityServices();
@@ -2584,8 +5119,14 @@ export class AgentOrchestrator {
       this._sec('# Autonomous Assumptions', assumptions, 14),
     ]);
 
-    const { model, fallbackModel } = this._agentConfig('codeWorker');
-    const messages = this._buildMessages('codeWorker', context);
+    const specialist = this._specialistForTask(task, state);
+    const { model, fallbackModel } = specialist
+      ? { model: specialist.model, fallbackModel: specialist.fallbackModel }
+      : this._agentConfig('codeWorker');
+    const messages = this._buildMessages('codeWorker', context, specialist);
+    if (specialist) {
+      this._emit('log', `Task "${task.id}" routed to team specialist "${specialist.name}" (${specialist.model}).`, 'info');
+    }
 
     try {
       const result = await this._callWithFallbackJson<CodeWorkerOutput>(
@@ -2603,13 +5144,86 @@ export class AgentOrchestrator {
     }
   }
 
+  /** A resumed no-op still requires the ordinary review and verification gates. */
+  /**
+   * A file as shown to the LLM reviewer/auditor. Run 11: a valid 13 KB
+   * levels.json was cut at 3000 characters and the auditor reported
+   * "incomplete JSON, the file ends abruptly" on every attempt. Say where the
+   * excerpt stops, and for JSON give the real parse result.
+   */
+  static reviewExcerpt(file: string, content: string, limit = 3000): string {
+    const fence = (text: string) => `\`\`\`\n${text}\n\`\`\``;
+    if (content.length <= limit) { return fence(content); }
+    let parsed = '';
+    if (/\.json$/i.test(file)) {
+      try {
+        const value = JSON.parse(content) as unknown;
+        parsed = Array.isArray(value)
+          ? ` The full file parses as valid JSON: an array of ${value.length} item(s).`
+          : ` The full file parses as valid JSON (an object with keys: ${Object.keys(value as object).slice(0, 12).join(', ')}).`;
+      } catch (err) {
+        parsed = ` The full file does NOT parse as JSON: ${err instanceof Error ? err.message : String(err)}.`;
+      }
+    }
+    return `${fence(content.slice(0, limit))}\n[Excerpt: the first ${limit} of ${content.length} characters. The file continues on disk; do not report it as truncated or incomplete because this excerpt ends.${parsed}]`;
+  }
+
+  /** A blocking issue while a task still has not created files it owns, else null. */
+  private _missingTaskFilesIssue(taskId: string): string | null {
+    const stillMissing = (this._missingTaskFiles.get(taskId) ?? []).filter(file => !this.fileManager.fileExists(file));
+    if (stillMissing.length === 0) { this._missingTaskFiles.delete(taskId); return null; }
+    return `[missing] This task must create ${stillMissing.join(', ')}, which does not exist yet. Return the complete file content.`;
+  }
+
+  private _existingTaskReviewOutput(task: TaskItem, output: CodeWorkerOutput): CodeWorkerOutput | null {
+    if (task.allowedFiles.length === 0) { return null; }
+    const files: FileChange[] = [];
+    const missing: string[] = [];
+    let hasContent = false;
+    try {
+      for (const candidate of task.allowedFiles) {
+        const relative = this._normalizeRelativePath(candidate);
+        if (!relative || relative === '..' || relative.startsWith('../')) { return null; }
+        const full = path.join(this.workspace.rootDir, relative);
+        // Benchmark run 11, sprint 2: one not-yet-created file (vite.config.js)
+        // made "no change" fail the task and skip the sprint. Review what
+        // exists; the missing files become a blocking issue for the fix loop.
+        if (!fs.existsSync(full)) {
+          if (/[*?[\]{}]/.test(relative) || relative.endsWith('/')) { continue; }
+          missing.push(relative);
+          continue;
+        }
+        const stat = fs.lstatSync(full);
+        if (stat.isDirectory()) {
+          files.push({ path: `${relative.replace(/\/+$/, '')}/`, action: 'create', content: '', description: 'Existing directory, review only.' });
+        } else if (stat.isFile()) {
+          const content = this.fileManager.readWorkspaceFile(relative);
+          if (content === null) { return null; }
+          hasContent ||= Boolean(content.trim());
+          files.push({ path: relative, action: 'modify', content, description: 'Existing file, review only; no write was performed.' });
+        } else { return null; }
+      }
+    } catch { return null; }
+    if (!hasContent) { return null; }
+    if (missing.length > 0) { this._missingTaskFiles.set(task.id, missing); } else { this._missingTaskFiles.delete(task.id); }
+    return { ...output, reasoning: `${output.reasoning}\nReviewing actual existing task outputs; no changes have been applied.`, files };
+  }
+
   private async _executeReviewer(
     task: TaskItem,
     workerOutput: CodeWorkerOutput,
     _state: ProjectState
   ): Promise<ReviewResult> {
-    const filesContext = workerOutput.files
-      .map(f => `## File: ${f.path}\n\`\`\`\n${(f.content ?? '').substring(0, 3000)}\n\`\`\``)
+    // Everything this task touched so far, not only the latest patch: a fix
+    // that changes nothing or edits a different file must not hide the files
+    // that failed before (audit C02).
+    const scope = this._taskReviewScopes.record(task.id,
+      workerOutput.files.map(f => ({ path: this._normalizeRelativePath(f.path), action: f.action })));
+    const taskPaths = [...scope.written].filter(file => this.fileManager.fileExists(file));
+    const contextFiles = workerOutput.files.length > 0 ? workerOutput.files
+      : taskPaths.map(file => ({ path: file, content: this.fileManager.readWorkspaceFile(file) ?? '' }));
+    const filesContext = contextFiles
+      .map(f => `## File: ${f.path}\n${AgentOrchestrator.reviewExcerpt(f.path, f.content ?? '')}`)
       .join('\n\n');
     const prompt = this._userPromptWithFileContext();
     const promptFiles = this._promptReferencedFilePaths();
@@ -2636,19 +5250,17 @@ export class AgentOrchestrator {
     const { model, fallbackModel } = this._agentConfig('reviewer');
     const messages = this._buildMessages('reviewer', context);
 
+    let review: ReviewResult;
     try {
-      const review = await this._callWithFallbackJson<ReviewResult>(
+      review = await this._callWithFallbackJson<ReviewResult>(
         'reviewer', model, fallbackModel, messages, this.workspace.reviewerPath, promptFiles
       );
       this._normalizeReviewResult(task, review);
-
-      // Save review note
-      this.workspace.appendFile(this.workspace.reviewerPath, `\n\n---\n\n${prettyJson(review)}`);
-      return review;
+      this.workspace.appendFile(this.workspace.reviewerPath, `\n\n---\n\n### LLM reviewer pass (pre-merge)\n\n${prettyJson(review)}`);
     } catch (err) {
       logWarn(`Reviewer failed for task "${task.id}": ${formatError(err)}. Falling back to heuristic review.`);
       const issues = this._heuristicReviewIssues(workerOutput);
-      return {
+      review = {
         taskId: task.id,
         approved: issues.length === 0,
         issues,
@@ -2659,12 +5271,393 @@ export class AgentOrchestrator {
         reviewedAt: new Date().toISOString(),
       };
     }
+
+    // Deterministic cross-check, independent of any model: a changed file that
+    // destructures names from require('./relative') which the target module
+    // doesn't export. Both LLM passes below have missed this in practice (they
+    // read files in isolation), and it only surfaces later as a runtime "X is
+    // not a function" test failure — so this always runs, not just as a
+    // model-unavailable fallback, and it hands the fixer the exact name and
+    // file involved instead of leaving it to guess from a bare stack trace.
+    const contractIssues = findUnresolvedRequireImports(
+      workerOutput.files.filter(f => f.action !== 'delete').map(f => ({ path: f.path, content: f.content ?? '' })),
+      relPath => this.fileManager.readWorkspaceFile(relPath)
+    );
+    if (contractIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...contractIssues];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Export the missing name(s) from their source module (e.g. via module.exports), or fix the import/require to match what the module actually exports.',
+      ];
+    }
+
+    // Deterministic cross-check for the other real failure mode seen in
+    // practice (twice, in two separately generated browser-game projects): a
+    // changed file mixes ES module import/export syntax with Node-only
+    // filesystem/process APIs (require('fs'), __dirname, ...). This always
+    // crashes at runtime the moment a browser bundle loads the file — a
+    // defect neither LLM pass caught reading the file in isolation — so it
+    // runs unconditionally, the same as the contract check above.
+    const browserApiIssues = findBrowserIncompatibleNodeUsage(
+      workerOutput.files.filter(f => f.action !== 'delete').map(f => ({ path: f.path, content: f.content ?? '' }))
+    );
+    if (browserApiIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...browserApiIssues];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Rewrite the file to use one module system consistently: pure ESM (import/export, e.g. importing JSON directly) for browser-bundled code, or plain CommonJS (require/module.exports) for a Node-only file — never both in the same file.',
+      ];
+    }
+
+    // Nothing compiles code between tasks, so TypeScript errors (a missing
+    // import, a wrong named export) used to pass review and pile up for the
+    // final test-fix loop — 161 of them in benchmark run 7. Type-check the
+    // changed files now (JavaScript too), reporting only errors that missing
+    // @types cannot explain.
+    const typeScriptGate = checkTypeScriptTask(this.workspace.rootDir, taskPaths);
+    const typeScriptIssues = typeScriptGate.issues;
+    if (typeScriptGate.status === 'unavailable' || typeScriptGate.status === 'skipped') {
+      // Not checked is not clean (audit C03): say so on the review and, once
+      // per run, in the journal.
+      review.uncertainties = [...(review.uncertainties ?? []), `[typescript gate ${typeScriptGate.status}] ${typeScriptGate.reason}`];
+      if (!this._typeScriptGateWarned.has(typeScriptGate.status)) {
+        this._typeScriptGateWarned.add(typeScriptGate.status);
+        this._emit('log', `TypeScript gate ${typeScriptGate.status}: ${typeScriptGate.reason}`, 'warn');
+        this._journal('warn', `TypeScript gate ${typeScriptGate.status}`, typeScriptGate.reason);
+      }
+    }
+    if (typeScriptIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...typeScriptIssues];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Fix the TypeScript/JavaScript errors above: import every name you use, import only files that exist, and import only names the target module actually exports (named vs default).',
+      ];
+    }
+
+    // A page that cannot load its own code (classic <script> for an ES module,
+    // bare npm imports without a bundler) used to surface only at the final
+    // browser smoke test, as an error naming no file (benchmark runs 6 and 8).
+    const deliveryPaths = taskPaths;
+    const deliveryIssues = [
+      ...findBrowserDeliveryIssues(this.workspace.rootDir, deliveryPaths),
+      ...findMissingScriptTargets(this.workspace.rootDir, deliveryPaths),
+    ];
+    if (deliveryIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...deliveryIssues.map(issue => `[browser] ${issue.message}`)];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Make the page loadable as the architecture decided: either no build (<script type="module">, relative imports, libraries from a CDN or import map) or a bundler such as Vite.',
+      ];
+    }
+
+    // Tests that can never run (benchmark run 8): a .ts test in a JS project,
+    // an undeclared 'chai' import, and a placeholder npm test script.
+    const changedPaths = taskPaths;
+    const contractIssuesForTests = [
+      ...findLanguageMismatch(this.workspace.rootDir, changedPaths, this.fileManager.listWorkspaceFiles('')),
+      ...findUndeclaredPackageImports(this.workspace.rootDir, changedPaths),
+      ...findTestScriptIssues(this.workspace.rootDir, changedPaths),
+    ];
+    if (contractIssuesForTests.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...contractIssuesForTests];
+      // Declaring a dependency or a test runner is only possible in package.json.
+      if (contractIssuesForTests.some(issue => /^\[(deps|tests)\]/.test(issue))
+        && this.fileManager.fileExists('package.json')
+        && !this._matchesAllowedPath('package.json', task.allowedFiles)) {
+        task.allowedFiles.push('package.json');
+        this.workspace.appendAssumption('reviewer', `Task ${task.id} may now edit package.json to declare the dependencies/test runner its files need.`);
+      }
+    }
+
+    // Run the real build/test/browser checks now instead of only after every
+    // task is written (benchmark runs 3–8: errors piled up for the final
+    // test-fix loop, which could not untangle them).
+    const runtimeIssues = await this._taskRuntimeIssues(task, changedPaths);
+    if (runtimeIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...runtimeIssues];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Fix the failures reported by the real build/test/browser run above; they come from this task\'s files.',
+      ];
+    }
+    if (scope.unverified.length > 0) {
+      review.uncertainties = [...(review.uncertainties ?? []), ...scope.unverified];
+    }
+    const missingIssue = this._missingTaskFilesIssue(task.id);
+    if (missingIssue) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, missingIssue];
+    }
+
+    // Same reasoning, for the stub-comment and invalid-JSON heuristics: these
+    // used to run only when a model call failed. They are cheap and essentially
+    // false-positive-free, so they now always contribute alongside the LLM
+    // passes instead of only standing in for one that is unavailable.
+    const structuralIssues = [
+      ...this._heuristicReviewIssues(workerOutput),
+      // A handler or loop that is only a comment is an unwritten implementation (run 11).
+      ...taskPaths.flatMap(file => findCommentOnlyImplementations(file, this.fileManager.readWorkspaceFile(file) ?? '')).map(issue => `[stub] ${issue}`),
+    ];
+    if (structuralIssues.length > 0) {
+      review.needsFix = true;
+      review.approved = false;
+      review.issues = [...review.issues, ...structuralIssues];
+      review.fixSuggestions = [
+        ...review.fixSuggestions,
+        'Resolve the structural issues above (invalid JSON, or an unfinished "add more" placeholder) and return the complete implementation.',
+      ];
+    }
+
+    // Cross-check: an independent, stronger model audits the change against
+    // overall production-quality standards (not just task acceptance). Its
+    // findings are merged in so the fix loop keeps iterating until BOTH the
+    // task reviewer and the quality auditor are satisfied.
+    const audit = await this._executeQualityAudit(task, workerOutput, context, this._incrementalPlanContext(task));
+
+    // Guard against a false-negative stall: an auditor that demands a fix but
+    // names ZERO concrete defects gives the fixer nothing actionable, so the
+    // loop spins to the retry limit and the task fails for no real reason.
+    // Backfill with a deterministic heuristic scan; if even that finds nothing,
+    // the audit cannot justify blocking, so we downgrade it to a non-blocking
+    // uncertainty instead of failing the build.
+    if (audit.needsFix && audit.issues.length === 0 && audit.securityConcerns.length === 0) {
+      const heuristicIssues = this._heuristicReviewIssues(workerOutput);
+      if (heuristicIssues.length > 0) {
+        audit.issues = heuristicIssues;
+        audit.fixSuggestions = ['Resolve the issues above and return complete, production-ready file contents.'];
+      } else {
+        const note = 'Quality auditor requested changes but listed no concrete defect; treated as non-blocking after a clean heuristic scan.';
+        this._journal('warn', `Quality audit non-actionable for ${task.id}`, note);
+        audit.needsFix = false;
+        audit.approved = true;
+        audit.uncertainties = [...(audit.uncertainties ?? []), note];
+      }
+    }
+
+    const merged = this._mergeReviewWithAudit(task, review, audit);
+    // The pre-merge write above only captures the raw LLM reviewer pass; the
+    // deterministic cross-checks and quality audit above it can each flip
+    // needsFix/approved afterward. Without this, the on-disk artifact can show
+    // "approved: true" on every attempt of a run that actually failed because
+    // one of those later checks kept blocking it — misleading anyone (or any
+    // future session) debugging from logs alone (seen in practice 2026-09-17).
+    this.workspace.appendFile(this.workspace.reviewerPath, `\n\n---\n\n### Final merged decision (after deterministic checks + quality audit)\n\n${prettyJson(merged)}`);
+    return merged;
+  }
+
+  /**
+   * Holistic code quality cross-check by a third, independent model (different
+   * from the code writer and the task reviewer). It judges the change against
+   * general engineering standards: correctness, completeness, error handling,
+   * security, and consistency with the architecture — flagging only material,
+   * production-blocking defects (never subjective style preferences).
+   */
+  private async _executeQualityAudit(
+    task: TaskItem,
+    workerOutput: CodeWorkerOutput,
+    reviewContext: string,
+    incrementalContext = ''
+  ): Promise<ReviewResult> {
+    const promptFiles = this._promptReferencedFilePaths();
+    // Use the strongest available model (the brainstorm role, e.g. a 30B coder)
+    // so the auditor brings a genuinely independent, capable perspective.
+    const { model, fallbackModel } = this._agentConfig('brainstorm');
+    const auditPath = this.workspace.agentNotePath('quality_audit.jsonl');
+    const messages: OllamaMessage[] = [
+      {
+        role: 'system',
+        content: [
+          'You are a principal engineer performing an INDEPENDENT, holistic code-quality audit.',
+          'Another engineer wrote this code and a reviewer already checked task acceptance.',
+          'Your job is the overall-quality cross-check: judge the change against general production standards.',
+          'Flag ONLY material, production-blocking defects in these categories:',
+          '- Correctness bugs (logic errors, wrong/edge-case handling, broken control flow).',
+          '- Incomplete implementation (stubs, TODOs, unimplemented core behavior, dead paths).',
+          '- Missing or wrong error handling for realistic failures.',
+          '- Security problems (injection, path traversal, secret leakage, unsafe input).',
+          '- Inconsistency with the stated architecture or the original prompt constraints.',
+          'Do NOT flag subjective style, naming, or nice-to-have refactors. If the code is production-ready, approve it.',
+          'This build is INCREMENTAL: it is assembled task-by-task, not all at once.',
+          'Judge ONLY whether THIS task\'s changes satisfy THIS task\'s own acceptance criteria.',
+          'Files or behavior that other, still-pending tasks are scheduled to implement are NOT defects of this task —',
+          'do NOT flag a file as "incomplete/stub/missing" if a later task owns and will complete it.',
+          'The task\'s allowed files are files it MAY create, not files it must create: never flag a missing allowed file',
+          'unless an acceptance criterion requires it (e.g. 20 levels in one data file satisfies "20 levels").',
+          incrementalContext,
+          'Respond only with valid JSON.',
+        ].filter(Boolean).join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          reviewContext,
+          '',
+          'Return exactly this JSON shape:',
+          '{',
+          '  "approved": true,',
+          '  "blockingIssues": ["material defects that must be fixed before continuing; empty if none"],',
+          '  "securityConcerns": ["security defects; empty if none"],',
+          '  "fixInstructions": ["specific, actionable fix instructions for each blocking issue"],',
+          '  "qualityScore": 0,',
+          '  "rationale": "one-sentence overall judgement"',
+          '}',
+        ].join('\n'),
+      },
+    ];
+
+    try {
+      const raw = await this._callWithFallbackJson<{
+        approved?: boolean;
+        blockingIssues?: unknown;
+        securityConcerns?: unknown;
+        fixInstructions?: unknown;
+        qualityScore?: unknown;
+        rationale?: unknown;
+      }>('brainstorm', model, fallbackModel, messages, auditPath, promptFiles);
+
+      const toList = (v: unknown): string[] =>
+        Array.isArray(v) ? v.map(x => String(x).trim()).filter(Boolean).slice(0, 10) : [];
+      const blockingIssues = toList(raw.blockingIssues);
+      const securityConcerns = toList(raw.securityConcerns);
+      const needsFix = !(raw.approved === true) || blockingIssues.length > 0 || securityConcerns.length > 0;
+
+      const result: ReviewResult = {
+        taskId: task.id,
+        approved: !needsFix,
+        issues: blockingIssues,
+        suggestions: typeof raw.rationale === 'string' ? [raw.rationale] : [],
+        securityConcerns,
+        needsFix,
+        fixSuggestions: toList(raw.fixInstructions),
+        reviewedAt: new Date().toISOString(),
+      };
+      this.workspace.appendFile(
+        auditPath,
+        JSON.stringify({ timestamp: result.reviewedAt, taskId: task.id, ...raw }) + '\n'
+      );
+      this._journal(needsFix ? 'warn' : 'audit',
+        `Quality audit for ${task.id}`,
+        needsFix
+          ? `🔁 Found ${blockingIssues.length + securityConcerns.length} blocking issue(s): ${[...blockingIssues, ...securityConcerns].slice(0, 3).join('; ')}`
+          : `✅ Passed holistic quality audit. ${typeof raw.rationale === 'string' ? raw.rationale : ''}`.trim()
+      );
+      return result;
+    } catch (err) {
+      // The auditor model is unavailable even after self-healing retries/alternate
+      // models. We must NOT silently approve — that would let incomplete or unsafe
+      // code pass the "highest possible quality" bar. Instead, degrade to a
+      // deterministic heuristic audit (stubs, TODOs, empty bodies, obvious red
+      // flags) and record an explicit uncertainty so the gap is visible in the
+      // journal and the brief, rather than hidden behind a false approval.
+      const heuristicIssues = this._heuristicReviewIssues(workerOutput);
+      const needsFix = heuristicIssues.length > 0;
+      const note =
+        `Holistic quality auditor was unavailable (${formatError(err)}). ` +
+        `Fell back to a heuristic audit, which found ${heuristicIssues.length} issue(s).`;
+      logWarn(`Quality auditor failed for task "${task.id}": ${note}`);
+      this.workspace.appendAssumption('quality-audit',
+        `${note} Treat the independent quality cross-check for task "${task.id}" as DEGRADED, not fully passed.`);
+      this._journal('warn', `Quality audit DEGRADED for ${task.id}`,
+        needsFix
+          ? `⚠️ Auditor model unavailable; heuristic audit flagged ${heuristicIssues.length} issue(s): ${heuristicIssues.slice(0, 3).join('; ')}`
+          : `⚠️ Auditor model unavailable; heuristic audit found no obvious defects, but the holistic cross-check did NOT run.`);
+      return {
+        taskId: task.id,
+        approved: !needsFix,
+        issues: heuristicIssues,
+        suggestions: [],
+        securityConcerns: [],
+        needsFix,
+        fixSuggestions: needsFix
+          ? ['Resolve the heuristic findings and return complete, production-ready file contents.']
+          : [],
+        uncertainties: [note],
+        reviewedAt: new Date().toISOString(),
+      };
+    }
+  }
+
+  /**
+   * Stable signature of a review's blocking issues, used to detect a fixer stuck
+   * in a loop (the same problems recurring attempt after attempt).
+   */
+  /**
+   * Tell a per-task auditor which files belong to OTHER, still-pending tasks so
+   * it does not fail an early scaffold task for not yet implementing work that a
+   * later task owns. Without this, a "create the skeleton of everything" task is
+   * held to whole-project completeness and can never pass — deadlocking the build.
+   */
+  private _incrementalPlanContext(task: TaskItem): string {
+    const raw = this.workspace.readFile(this.workspace.taskPlanPath);
+    if (!raw) { return ''; }
+    let tasks: TaskItem[];
+    try {
+      const parsed = JSON.parse(raw) as { tasks?: TaskItem[] } | TaskItem[];
+      tasks = Array.isArray(parsed) ? parsed : (parsed.tasks ?? []);
+    } catch { return ''; }
+
+    const others = tasks.filter(t => t.id !== task.id && t.status !== 'completed');
+    if (others.length === 0) { return ''; }
+
+    // Any file that a still-pending task also lists will be finalized by that
+    // later task — so its stub/incomplete state during THIS task is expected.
+    const futureFiles = [...new Set(others.flatMap(t => t.allowedFiles ?? []))];
+    const lines: string[] = [];
+    if (futureFiles.length > 0) {
+      lines.push(`Files that later pending tasks will finalize (their stub/incomplete state now is EXPECTED, not a defect): ${futureFiles.join(', ')}.`);
+    }
+    lines.push(`Remaining scheduled tasks that will complete the rest: ${others.map(t => `"${t.title}"`).join(', ')}.`);
+    return lines.join('\n');
+  }
+
+  private _issueSignature(review: ReviewResult): string {
+    const signature = [...(review.issues ?? []), ...(review.securityConcerns ?? [])]
+      .map(s => String(s).toLowerCase().replace(/[0-9]+/g, '#').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .sort()
+      .join(' | ');
+    // A rejection with no concrete issues is itself a stable, no-progress state:
+    // return a truthy sentinel so the stuck-loop detector counts repeats of it
+    // instead of treating an empty string as "no signature" and spinning.
+    return signature || (review.needsFix ? '∅ no-actionable-issues' : '');
+  }
+
+  /** Merge the task reviewer's verdict with the independent quality audit. */
+  private _mergeReviewWithAudit(task: TaskItem, review: ReviewResult, audit: ReviewResult): ReviewResult {
+    const dedupe = (arr: unknown[]): string[] => [...new Set(arr.map(s => String(s).trim()).filter(Boolean))];
+    const needsFix = review.needsFix || audit.needsFix;
+    const merged: ReviewResult = {
+      taskId: task.id,
+      approved: !needsFix,
+      issues: dedupe([...review.issues, ...audit.issues.map(i => `[quality] ${i}`)]),
+      suggestions: dedupe([...review.suggestions, ...audit.suggestions]),
+      securityConcerns: dedupe([...review.securityConcerns, ...audit.securityConcerns]),
+      needsFix,
+      fixSuggestions: dedupe([...review.fixSuggestions, ...audit.fixSuggestions]),
+      uncertainties: dedupe([...(review.uncertainties ?? []), ...(audit.uncertainties ?? [])]),
+      reviewedAt: new Date().toISOString(),
+    };
+    return merged;
   }
 
   private async _executeFixer(
     task: TaskItem,
     review: ReviewResult,
-    _state: ProjectState
+    _state: ProjectState,
+    allowToolCalls = true
   ): Promise<CodeWorkerOutput | null> {
     this._ensureCapabilityServices();
     const promptFiles = this._promptReferencedFilePaths();
@@ -2675,8 +5668,11 @@ export class AgentOrchestrator {
       ...review.fixSuggestions.map(s => `- Fix: ${s}`),
     ].join('\n');
 
+    const verificationText = task.id.startsWith('test-fix-') ? this.workspace.readFile(this.workspace.testResultLogPath) ?? '' : '';
+    const focusedFiles = this._extractWorkspaceFileMentions(`${errorContext}\n${verificationText}\n${this._resolvedImportDiagnostics(verificationText).join('\n')}`)
+      .filter(file => task.allowedFiles.includes(file));
     const existingFilesContent = task.allowedFiles.length > 0
-      ? this.fileManager.readFilesAsContext(task.allowedFiles)
+      ? this.fileManager.readFilesAsContext([...new Set([...focusedFiles, ...task.allowedFiles])])
       : '';
     const answeredQuestions = this.workspace.readFile(this.workspace.openQuestionsPath) ?? '';
     const assumptions = this.workspace.readFile(this.workspace.assumptionsPath) ?? '';
@@ -2690,7 +5686,7 @@ export class AgentOrchestrator {
     const skillContext = this.workspace.readFile(this.workspace.skillContextPath) ?? '';
     const planContext = this.workspace.readFile(this.workspace.planControllerPath) ?? '';
     const toolManifest = this.toolRegistry.manifestForPrompt();
-    const latestTestOutput = this.workspace.readFile(this.workspace.testResultLogPath) ?? '';
+    const latestTestOutput = this._testFixFocusText.get(task.id) ?? this.workspace.readFile(this.workspace.testResultLogPath) ?? '';
     const diagnosticBundle = this._latestVerificationDiagnosticBundle(errorContext);
     const structuredMemory = this._structuredMemoryContext();
 
@@ -2719,17 +5715,32 @@ export class AgentOrchestrator {
       this._sec('# Tool Registry', toolManifest, 12),
       this._sec('# User Answers And Clarifications', answeredQuestions, 13),
       this._sec('# Autonomous Assumptions', assumptions, 14),
-    ]);
+    ], task.id.startsWith('test-fix-') ? Math.min(this._contextBudget(), 32_000) : undefined);
 
-    const { model, fallbackModel } = this._agentConfig('fixer');
-    const messages = this._buildMessages('fixer', context);
+    // A specialist-owned task keeps the same specialist (persona and model) for
+    // its fixes. From the 3rd attempt on, every repair — task fix or test-fix,
+    // specialist-owned or not — escalates to the fixer's stronger fallback
+    // model: a real run (2026-09-19) had the specialist's 14B model fail 8/8
+    // times to fix a one-token typo (b.sta → b.status) the reviewer had named.
+    const specialist = this._specialistForTask(task, _state);
+    const configured = this._agentConfig('fixer');
+    const baseModel = specialist ? specialist.model : configured.model;
+    const escalate = this._canEscalateFixer(task, _state)
+      && (_state.fixRetryCount >= AgentOrchestrator.FIX_ESCALATION_ATTEMPT || this.escalatedFixTasks.has(task.id));
+    const model = escalate ? configured.fallbackModel : baseModel;
+    const fallbackModel = escalate ? baseModel : specialist ? specialist.fallbackModel : configured.fallbackModel;
+    if (escalate) { this._emit('log', `Repeated repair of "${task.id}" is being escalated from ${baseModel} to ${model}.`, 'warn'); }
+    if (specialist) { this._emit('log', `Fix for task "${task.id}" routed to team specialist "${specialist.name}" (${specialist.model}).`, 'info'); }
+    const messages = this._buildMessages('fixer', context, specialist);
 
     try {
       const result = await this._callWithFallbackJson<CodeWorkerOutput>(
         'fixer', model, fallbackModel, messages, this.workspace.codeWorkerPath, [...task.allowedFiles, ...promptFiles]
       );
       this._normalizeWorkerOutputShape('fixer', task, result);
-      const finalResult = await this._runWorkerToolLoop('fixer', task, messages, this.workspace.codeWorkerPath, [...task.allowedFiles, ...promptFiles], result);
+      const finalResult = allowToolCalls
+        ? await this._runWorkerToolLoop('fixer', task, messages, this.workspace.codeWorkerPath, [...task.allowedFiles, ...promptFiles], result)
+        : result;
       this._normalizeWorkerOutputShape('fixer', task, finalResult);
       this._attachChangeBaseline(finalResult, baseline);
       return finalResult;
@@ -2737,6 +5748,13 @@ export class AgentOrchestrator {
       this._emit('error', `Fixer failed: ${formatError(err)}`);
       return null;
     }
+  }
+
+  /** True when the fixer has a distinct stronger model to escalate this task's repairs to. */
+  private _canEscalateFixer(task: TaskItem, state: ProjectState): boolean {
+    const configured = this._agentConfig('fixer');
+    const baseModel = this._specialistForTask(task, state)?.model ?? configured.model;
+    return !!configured.fallbackModel && configured.fallbackModel !== baseModel;
   }
 
   private async _runWorkerToolLoop(
@@ -2756,12 +5774,30 @@ export class AgentOrchestrator {
     const messages = [...baseMessages];
     const { model, fallbackModel } = this._agentConfig(role);
     const maxRounds = this.modelConfig.toolCalling.maxToolRounds;
+    const failedToolRequests = new Map<string, number>();
 
     for (let round = 1; round <= maxRounds; round++) {
       const requests = (result.toolRequests ?? [])
         .filter(request => request && typeof request.name === 'string')
         .slice(0, 6);
       if (requests.length === 0) { break; }
+
+      const repeatFailedRequests = requests.filter(request => {
+        const normalizedRequest = {
+          id: request.id || `${role}-${task.id}-tool-${round}`,
+          name: request.name,
+          args: request.args ?? {},
+        };
+        return (failedToolRequests.get(this._toolRequestFingerprint(normalizedRequest)) ?? 0) > 0;
+      });
+      if (repeatFailedRequests.length === requests.length) {
+        this.workspace.appendAssumption(
+          role,
+          `Task ${task.id} stopped tool-calling after repeated failed tool request(s): ${repeatFailedRequests.map(request => request.name).join(', ')}.`
+        );
+        result.toolRequests = [];
+        break;
+      }
 
       const toolResults: ToolCallResult[] = [];
       for (const request of requests) {
@@ -2771,8 +5807,35 @@ export class AgentOrchestrator {
           name: request.name,
           args: request.args ?? {},
         };
+        const fingerprint = this._toolRequestFingerprint(normalizedRequest);
+        if ((failedToolRequests.get(fingerprint) ?? 0) > 0) {
+          const toolResult: ToolCallResult = {
+            id: normalizedRequest.id,
+            name: normalizedRequest.name,
+            success: false,
+            output: '',
+            error: 'Skipped repeated tool request because the same tool call already failed. Use prior observations and produce final file changes instead.',
+          };
+          toolResults.push(toolResult);
+          this.workspace.appendMemoryEvent({
+            type: 'tool',
+            phase: this.workspace.readProjectState().currentPhase,
+            agentRole: role,
+            taskId: task.id,
+            summary: `${role} tool ${toolResult.name} skipped after repeated failure.`,
+            data: {
+              request: normalizedRequest,
+              error: toolResult.error,
+              outputPreview: '',
+            },
+          });
+          continue;
+        }
         const toolResult = await this.toolRegistry.execute(normalizedRequest);
         toolResults.push(toolResult);
+        if (this._toolResultFailed(toolResult)) {
+          failedToolRequests.set(fingerprint, (failedToolRequests.get(fingerprint) ?? 0) + 1);
+        }
         this.workspace.appendMemoryEvent({
           type: 'tool',
           phase: this.workspace.readProjectState().currentPhase,
@@ -2820,6 +5883,27 @@ export class AgentOrchestrator {
     }
 
     return result;
+  }
+
+  private _toolRequestFingerprint(request: ToolCallRequest): string {
+    return `${request.name}:${this._stableJson(request.args ?? {})}`;
+  }
+
+  private _toolResultFailed(result: ToolCallResult): boolean {
+    if (!result.success || result.error) { return true; }
+    return /"success"\s*:\s*false|"exitCode"\s*:\s*(?:[1-9]|\d{2,})/.test(result.output);
+  }
+
+  private _stableJson(value: unknown): string {
+    if (Array.isArray(value)) {
+      return `[${value.map(item => this._stableJson(item)).join(',')}]`;
+    }
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value as Record<string, unknown>).sort().map(key =>
+        `${JSON.stringify(key)}:${this._stableJson((value as Record<string, unknown>)[key])}`
+      ).join(',')}}`;
+    }
+    return JSON.stringify(value);
   }
 
   // ------------------------------------------------------------------
@@ -2871,22 +5955,55 @@ export class AgentOrchestrator {
       return false;
     }
 
-    const result = this.patchService.hasUnifiedPatch(workerOutput.files)
-      ? this.patchService.applyFileChanges(workerOutput.files)
-      : this.fileManager.applyApprovedChanges(workerOutput.files);
-    if (!result.applied) {
-      this._emit('error', `Failed to apply changes: ${result.error}`);
-      return false;
-    } else {
-      this.workspace.appendMemoryEvent({
-        type: 'patch',
-        phase: this.workspace.readProjectState().currentPhase,
-        summary: `Applied patch ${patchId}.`,
-        data: { patchId, targetFiles, changeCount: workerOutput.files.length },
-      });
-      this._emit('log', `Applied ${workerOutput.files.length} file change(s).`, 'info');
-      return true;
+    // A worker batch routinely mixes full-content CREATE/rewrite files (the
+    // substantive new product code) with one or two unified-diff edits to
+    // existing files (e.g. a README badge). These are INDEPENDENT: a fragile
+    // diff whose context no longer matches must never discard the good new
+    // files. So apply them separately —
+    //   1) full-content writes as one transactional group, and
+    //   2) each unified-diff edit on its own; a diff that still fails after
+    //      fuzzy relocation is skipped with a logged warning, not fatal.
+    const contentFiles = workerOutput.files.filter(f => !(typeof f.patch === 'string' && f.patch.trim()));
+    const patchFiles = workerOutput.files.filter(f => typeof f.patch === 'string' && f.patch.trim());
+
+    let appliedCount = 0;
+    const failures: string[] = [];
+
+    if (contentFiles.length > 0) {
+      const r = this.fileManager.applyApprovedChanges(contentFiles);
+      if (r.applied) {
+        appliedCount += contentFiles.length;
+      } else {
+        failures.push(`content files (${contentFiles.map(f => f.path).join(', ')}): ${r.error}`);
+      }
     }
+
+    for (const pf of patchFiles) {
+      const r = this.patchService.applyFileChanges([pf]);
+      if (r.applied) {
+        appliedCount += 1;
+      } else {
+        failures.push(`${pf.path}: ${r.error}`);
+        this._emit('log', `Skipped fragile diff for "${pf.path}" (${r.error}); continuing with the other changes.`, 'warn');
+        this._journal('warn', `Diff edit skipped: ${pf.path}`,
+          `A unified-diff edit could not be applied (${r.error}) even after fuzzy relocation; it was skipped so the substantive new files still land. The reviewer/fixer can redo this edit with full content if it matters.`);
+      }
+    }
+
+    // The patch is "applied" if anything substantive landed. Only a total
+    // wipe-out (nothing applied at all) is a real failure for the task.
+    if (appliedCount === 0) {
+      this._emit('error', `Failed to apply changes: ${failures.join('; ')}`);
+      return false;
+    }
+    this.workspace.appendMemoryEvent({
+      type: 'patch',
+      phase: this.workspace.readProjectState().currentPhase,
+      summary: `Applied patch ${patchId} (${appliedCount}/${workerOutput.files.length} change(s)).`,
+      data: { patchId, targetFiles, changeCount: appliedCount, skipped: failures },
+    });
+    this._emit('log', `Applied ${appliedCount}/${workerOutput.files.length} file change(s).`, 'info');
+    return true;
   }
 
   private async _tryDeterministicTaskRecovery(
@@ -2923,10 +6040,44 @@ export class AgentOrchestrator {
     );
 
     const applied = await this._applyCodeChanges(`${task.id}-deterministic-recovery-${Date.now()}`, recovery, state);
+    if (applied) {
+      this._reconcileBriefDeliverablesWithRecovery(recovery);
+    }
     return applied ? recovery : null;
   }
 
+  private _reconcileBriefDeliverablesWithRecovery(recovery: CodeWorkerOutput): void {
+    const raw = this.workspace.readFile(this.workspace.projectBriefPath);
+    if (!raw) { return; }
+    try {
+      const brief = JSON.parse(raw) as ProjectBrief;
+      const declared = Array.isArray(brief.deliveryArtifacts) ? brief.deliveryArtifacts.map(String) : [];
+      const semantic = declared.filter(item =>
+        !/\/|\.(py|js|mjs|cjs|ts|tsx|jsx|json|html|css|md|txt|ya?ml|toml|swift|go|rs|java)$/i.test(item.trim())
+      );
+      brief.deliveryArtifacts = [
+        ...new Set([...semantic, ...recovery.files.map(file => file.path)]),
+      ];
+      this.workspace.writeFile(this.workspace.projectBriefPath, prettyJson(brief));
+    } catch {
+      // A markdown or malformed brief cannot be reconciled structurally; the
+      // completion gate will continue to report any unresolved claims honestly.
+    }
+  }
+
+  private _isApplePlatformProject(): boolean {
+    const prompt = this.workspace.readUserPrompt().toLowerCase();
+    const brief = (this.workspace.readFile(this.workspace.projectBriefPath) ?? '').toLowerCase();
+    return /swift|swiftui|ios|macos|iphone|ipad|xcode|cocoa/.test(prompt + brief)
+      || this.fileManager.fileExists('Package.swift')
+      || this._findWorkspaceEntryByExtension('.xcodeproj') !== null
+      || this._findWorkspaceEntryByExtension('.xcworkspace') !== null;
+  }
+
   private _deterministicProductRecovery(task: TaskItem, review?: ReviewResult): CodeWorkerOutput | null {
+    if (this.modelConfig.selfHealing?.allowProductTemplates === false) { return null; }
+    // Never generate web/game/Node.js files for Apple platform projects
+    if (this._isApplePlatformProject()) { return null; }
     return this._deterministicArkanoidGameRecovery(task, review)
       ?? this._deterministicBrowserGameRecovery(task, review)
       ?? this._deterministicApiRecovery(task, review)
@@ -3016,9 +6167,15 @@ export class AgentOrchestrator {
 
     const projectName = this._projectTitleFromPrompt(prompt, 'Neon Brick Breaker');
     const packageName = this._slugFromPrompt(projectName);
+    const levelCount = this._extractRequestedLevelCount(prompt);
     return {
-      reasoning: `Deterministic self-healing generated a complete Arkanoid-style browser game with 10 levels for ${projectName}.`,
+      reasoning: `Deterministic self-healing generated a complete Arkanoid-style browser game with ${levelCount} levels for ${projectName}.`,
       files: [
+        {
+          path: 'acceptance.json', action: 'create',
+          description: 'Binding to the actual procedural level catalog for independent count verification.',
+          content: prettyJson({ collections: [{ label: 'levels', source: { kind: 'module-export', file: 'src/logic.js', export: 'levelCatalog' } }] }),
+        },
         {
           path: 'package.json',
           action: 'create',
@@ -3040,8 +6197,8 @@ export class AgentOrchestrator {
         {
           path: 'src/logic.js',
           action: 'create',
-          description: 'Dependency-free, testable Arkanoid game logic with 10 levels.',
-          content: this._deterministicArkanoidLogic(),
+          description: `Dependency-free, testable Arkanoid game logic with ${levelCount} levels.`,
+          content: this._deterministicArkanoidLogic(levelCount),
         },
         {
           path: 'src/render.js',
@@ -3050,7 +6207,7 @@ export class AgentOrchestrator {
           content: this._deterministicArkanoidRenderer(),
         },
         {
-          path: 'src/game.js',
+          path: 'src/app.js',
           action: 'create',
           description: 'Browser game loop, input, pause, and restart controls.',
           content: this._deterministicArkanoidRuntime(),
@@ -3059,13 +6216,13 @@ export class AgentOrchestrator {
           path: 'test/logic.test.js',
           action: 'create',
           description: 'node:test coverage for Arkanoid levels, scoring, collisions, and win/loss rules.',
-          content: this._deterministicArkanoidTests(),
+          content: this._deterministicArkanoidTests(levelCount),
         },
         {
           path: 'README.md',
           action: 'create',
-          description: 'Run and play instructions for the 10-level Arkanoid game.',
-          content: this._deterministicArkanoidReadme(projectName),
+          description: `Run and play instructions for the ${levelCount}-level Arkanoid game.`,
+          content: this._deterministicArkanoidReadme(projectName, levelCount),
         },
       ],
       needUserInput: false,
@@ -3181,6 +6338,7 @@ export class AgentOrchestrator {
 
     const projectName = this._projectTitleFromPrompt(prompt, 'Local Tasks CLI');
     const packageName = this._slugFromPrompt(projectName);
+    const isGreetingCli = /--name\b/i.test(prompt) && /hello\s*[,!]|greet|greeting/i.test(prompt);
     return {
       reasoning: `Deterministic self-healing generated a complete dependency-free CLI product for ${projectName}.`,
       files: [
@@ -3188,25 +6346,29 @@ export class AgentOrchestrator {
           path: 'package.json',
           action: 'create',
           description: 'Package scripts for CLI verification and demo.',
-          content: this._deterministicCliPackageJson(packageName, projectName),
+          content: isGreetingCli
+            ? this._deterministicGreetingCliPackageJson(packageName, projectName)
+            : this._deterministicCliPackageJson(packageName, projectName),
         },
         {
           path: 'src/cli.js',
           action: 'create',
           description: 'Dependency-free CLI implementation.',
-          content: this._deterministicCliSource(),
+          content: isGreetingCli ? this._deterministicGreetingCliSource() : this._deterministicCliSource(),
         },
         {
           path: 'test/cli.test.js',
           action: 'create',
           description: 'node:test coverage for core CLI behavior.',
-          content: this._deterministicCliTests(),
+          content: isGreetingCli ? this._deterministicGreetingCliTests() : this._deterministicCliTests(),
         },
         {
           path: 'README.md',
           action: 'create',
           description: 'CLI usage and verification instructions.',
-          content: this._deterministicCliReadme(projectName),
+          content: isGreetingCli
+            ? this._deterministicGreetingCliReadme(projectName)
+            : this._deterministicCliReadme(projectName),
         },
       ],
       needUserInput: false,
@@ -3326,6 +6488,26 @@ export class AgentOrchestrator {
       && /game|browser|canvas|html|javascript|level|lvl|\d+\s*(level|lvl)/.test(lower);
   }
 
+  /**
+   * Read an explicit level/stage count out of the goal (EN + accent-stripped
+   * VI, e.g. "30 levels", "10 man", "5 cap do") so deterministic recovery
+   * templates honor what was actually asked instead of a fixed number.
+   * Falls back to 10 when the goal does not name a count, and caps at 100 so
+   * the generated scaffold (level array, tests) stays a bounded, reviewable
+   * size regardless of what a prompt requests.
+   */
+  private _extractRequestedLevelCount(prompt: string, fallback = 10): number {
+    const lower = this._normalizedPromptIntent(prompt);
+    // Allow a few adjective words between the number and "levels" (e.g. "30
+    // different levels", "30 unique challenging levels") — a real run's exact
+    // prompt phrasing ("30 different levels") silently missed a stricter
+    // number-then-keyword-only regex and fell back to the default of 10.
+    const match = lower.match(/(\d{1,3})\s*(?:[a-z]+\s+){0,3}(?:levels?|lvls?|stages?|man(?:\s*choi)?|cap\s*do)\b/);
+    if (!match) { return fallback; }
+    const count = Number(match[1]);
+    return Number.isFinite(count) && count >= 1 ? Math.min(count, 100) : fallback;
+  }
+
   private _isCliProjectPrompt(prompt: string): boolean {
     const lower = prompt.toLowerCase();
     return /\bcli\b|command[- ]line|terminal tool|console app/.test(lower);
@@ -3382,8 +6564,8 @@ export class AgentOrchestrator {
       main: 'index.html',
       scripts: {
         test: 'node --test test/*.test.js',
-        demo: 'echo "Open index.html in your browser to play."',
-        start: 'echo "Open index.html in your browser. No build step is required."',
+        demo: 'echo "Open http://127.0.0.1:5173 after running npm start."',
+        start: 'python3 -m http.server 5173',
       },
       keywords: ['game', 'canvas', 'browser'],
       license: 'MIT',
@@ -3417,7 +6599,7 @@ export class AgentOrchestrator {
       '  </main>',
       '  <script src="src/logic.js"></script>',
       '  <script src="src/render.js"></script>',
-      '  <script src="src/game.js"></script>',
+      '  <script src="src/app.js"></script>',
       '</body>',
       '</html>',
       '',
@@ -3663,7 +6845,7 @@ export class AgentOrchestrator {
       '',
       '```sh',
       'npm test',
-      'npm run start',
+      'npm start',
       'npm run demo',
       '```',
       '',
@@ -3725,12 +6907,12 @@ export class AgentOrchestrator {
     ].join('\n');
   }
 
-  private _deterministicArkanoidLogic(): string {
+  private _deterministicArkanoidLogic(levelCount: number): string {
     return [
       '(function expose(root) {',
       '  const WIDTH = 900;',
       '  const HEIGHT = 620;',
-      '  const MAX_LEVEL = 10;',
+      `  const MAX_LEVEL = ${levelCount};`,
       '  const PADDLE_WIDTH = 116;',
       '  const PADDLE_HEIGHT = 16;',
       '  const BALL_RADIUS = 9;',
@@ -3805,7 +6987,8 @@ export class AgentOrchestrator {
       '    return state;',
       '  }',
       '  function setPaused(state, paused) { if (!state.gameOver) state.paused = paused; return state; }',
-      '  const api = { BALL_RADIUS, HEIGHT, MAX_LEVEL, PADDLE_HEIGHT, PADDLE_WIDTH, WIDTH, advanceLevel, ballRect, bounceFromPaddle, clamp, createInitialState, createInputState, createLevel, hitBrick, rectsOverlap, resetBall, setPaused, updateBall, updateGame, updatePaddle };',
+      '  const levelCatalog = Array.from({ length: MAX_LEVEL }, (_, index) => createLevel(index + 1));',
+      '  const api = { BALL_RADIUS, HEIGHT, MAX_LEVEL, PADDLE_HEIGHT, PADDLE_WIDTH, WIDTH, levelCatalog, advanceLevel, ballRect, bounceFromPaddle, clamp, createInitialState, createInputState, createLevel, hitBrick, rectsOverlap, resetBall, setPaused, updateBall, updateGame, updatePaddle };',
       '  if (typeof module !== "undefined" && module.exports) module.exports = api;',
       '  root.ArkanoidLogic = api;',
       '})(typeof globalThis !== "undefined" ? globalThis : window);',
@@ -3825,7 +7008,7 @@ export class AgentOrchestrator {
       '  function drawBall(ctx, ball) { ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2); ctx.fillStyle = "#facc15"; ctx.fill(); ctx.strokeStyle = "#fff7ed"; ctx.stroke(); }',
       '  function drawHud(ctx, state) { ctx.fillStyle = "#e0f2fe"; ctx.font = "700 18px system-ui, sans-serif"; ctx.fillText("Score " + state.score, 18, 30); ctx.fillText("Lives " + state.lives, 150, 30); ctx.fillText("Level " + state.level + "/" + state.maxLevel, 254, 30);',
       '    if (!state.launched && !state.gameOver) { ctx.textAlign = "center"; ctx.fillText("Press Space to launch", state.width / 2, state.height / 2 + 52); ctx.textAlign = "left"; }',
-      '    if (state.paused || state.gameOver) { ctx.fillStyle = "rgba(0,0,0,0.58)"; ctx.fillRect(0,0,state.width,state.height); ctx.fillStyle = "#ffffff"; ctx.textAlign = "center"; ctx.font = "800 42px system-ui, sans-serif"; ctx.fillText(state.won ? "You Cleared All 10 Levels" : state.gameOver ? "Game Over" : "Paused", state.width / 2, state.height / 2 - 12); ctx.font = "18px system-ui, sans-serif"; ctx.fillText("Press R to restart", state.width / 2, state.height / 2 + 28); ctx.textAlign = "left"; }',
+      '    if (state.paused || state.gameOver) { ctx.fillStyle = "rgba(0,0,0,0.58)"; ctx.fillRect(0,0,state.width,state.height); ctx.fillStyle = "#ffffff"; ctx.textAlign = "center"; ctx.font = "800 42px system-ui, sans-serif"; ctx.fillText(state.won ? ("You Cleared All " + state.maxLevel + " Levels") : state.gameOver ? "Game Over" : "Paused", state.width / 2, state.height / 2 - 12); ctx.font = "18px system-ui, sans-serif"; ctx.fillText("Press R to restart", state.width / 2, state.height / 2 + 28); ctx.textAlign = "left"; }',
       '  }',
       '  function render(ctx, state) { drawBackground(ctx, state); drawBricks(ctx, state); drawPaddle(ctx, state.paddle); drawBall(ctx, state.ball); drawHud(ctx, state); }',
       '  const api = { drawBackground, drawBall, drawBricks, drawHud, drawPaddle, render };',
@@ -3860,19 +7043,20 @@ export class AgentOrchestrator {
     ].join('\n');
   }
 
-  private _deterministicArkanoidTests(): string {
+  private _deterministicArkanoidTests(levelCount: number): string {
+    const lastIndex = levelCount - 1;
     return [
       "const assert = require('node:assert/strict');",
       "const test = require('node:test');",
       "const { MAX_LEVEL, advanceLevel, createInitialState, createInputState, createLevel, resetBall, updateGame } = require('../src/logic');",
       '',
-      "test('creates ten distinct playable levels', () => {",
-      '  assert.equal(MAX_LEVEL, 10);',
-      '  const counts = Array.from({ length: 10 }, (_, index) => createLevel(index + 1).length);',
-      '  assert.equal(counts.length, 10); assert.ok(counts.every(count => count > 20)); assert.ok(counts[9] >= counts[0]);',
+      `test('creates ${levelCount} distinct playable levels', () => {`,
+      `  assert.equal(MAX_LEVEL, ${levelCount});`,
+      `  const counts = Array.from({ length: ${levelCount} }, (_, index) => createLevel(index + 1).length);`,
+      `  assert.equal(counts.length, ${levelCount}); assert.ok(counts.every(count => count > 20)); assert.ok(counts[${lastIndex}] >= counts[0]);`,
       '});',
       "test('initial state starts on requested level with paddle, ball, lives, and bricks', () => {",
-      '  const state = createInitialState(900, 620, 4); assert.equal(state.level, 4); assert.equal(state.lives, 3); assert.equal(state.launched, false); assert.ok(state.bricks.length > 0); assert.ok(state.paddle.x > 0);',
+      `  const state = createInitialState(900, 620, ${Math.min(4, levelCount)}); assert.equal(state.level, ${Math.min(4, levelCount)}); assert.equal(state.lives, 3); assert.equal(state.launched, false); assert.ok(state.bricks.length > 0); assert.ok(state.paddle.x > 0);`,
       '});',
       "test('paddle movement is clamped to the play field', () => {",
       '  const state = createInitialState(220, 300); const input = createInputState(); input.left = true; state.paddle.x = 0; updateGame(state, input, 1); assert.equal(state.paddle.x, 0); input.left = false; input.right = true; for (let i = 0; i < 12; i++) updateGame(state, input, 1); assert.equal(state.paddle.x, state.width - state.paddle.width);',
@@ -3886,8 +7070,8 @@ export class AgentOrchestrator {
       "test('missing the paddle costs a life and resets the ball', () => {",
       '  const state = createInitialState(); state.launched = true; state.ball.y = state.height + 20; updateGame(state, createInputState(), 0.016); assert.equal(state.lives, 2); assert.equal(state.launched, false);',
       '});',
-      "test('advancing past level ten wins the game', () => {",
-      '  const state = createInitialState(900, 620, 10); state.bricks = []; advanceLevel(state); assert.equal(state.won, true); assert.equal(state.gameOver, true);',
+      `test('advancing past level ${levelCount} wins the game', () => {`,
+      `  const state = createInitialState(900, 620, ${levelCount}); state.bricks = []; advanceLevel(state); assert.equal(state.won, true); assert.equal(state.gameOver, true);`,
       '});',
       "test('resetBall reattaches ball above paddle', () => {",
       '  const state = createInitialState(); state.launched = true; resetBall(state); assert.equal(state.launched, false); assert.equal(state.ball.x, state.paddle.x + state.paddle.width / 2);',
@@ -3896,13 +7080,13 @@ export class AgentOrchestrator {
     ].join('\n');
   }
 
-  private _deterministicArkanoidReadme(projectName: string): string {
+  private _deterministicArkanoidReadme(projectName: string, levelCount: number): string {
     return [
       `# ${projectName}`,
       '',
-      `${projectName} is a dependency-free Arkanoid-style browser game with 10 handcrafted difficulty levels.`,
+      `${projectName} is a dependency-free Arkanoid-style browser game with ${levelCount} handcrafted difficulty levels.`,
       '',
-      'Open `index.html` in a browser to play. Move the paddle, launch the ball, clear every brick, and finish all 10 levels.',
+      `Open \`index.html\` in a browser to play. Move the paddle, launch the ball, clear every brick, and finish all ${levelCount} levels.`,
       '',
       '## Controls',
       '',
@@ -4234,6 +7418,82 @@ export class AgentOrchestrator {
     });
   }
 
+  private _deterministicGreetingCliPackageJson(packageName: string, projectName: string): string {
+    return prettyJson({
+      name: packageName,
+      version: '1.0.0',
+      description: `${projectName} - a dependency-free greeting CLI.`,
+      main: 'src/cli.js',
+      bin: { [packageName]: 'src/cli.js' },
+      scripts: {
+        test: 'node --test test/*.test.js',
+        demo: 'node src/cli.js --name Codex',
+        start: 'node src/cli.js',
+      },
+      keywords: ['cli', 'greeting'],
+      license: 'MIT',
+    });
+  }
+
+  private _deterministicGreetingCliSource(): string {
+    return [
+      '#!/usr/bin/env node',
+      'function parseName(args) {',
+      "  const index = args.indexOf('--name');",
+      "  if (index === -1 || !args[index + 1] || args[index + 1].startsWith('-')) {",
+      "    throw new Error('Usage: greet --name <name>');",
+      '  }',
+      '  return args[index + 1];',
+      '}',
+      '',
+      'function greetingFor(name) {',
+      '  return `Hello, ${name}!`;',
+      '}',
+      '',
+      'function run(args = process.argv.slice(2), io = console) {',
+      '  try {',
+      '    io.log(greetingFor(parseName(args)));',
+      '    return 0;',
+      '  } catch (error) {',
+      '    io.error(error.message);',
+      '    return 1;',
+      '  }',
+      '}',
+      '',
+      'if (require.main === module) process.exitCode = run();',
+      'module.exports = { greetingFor, parseName, run };',
+      '',
+    ].join('\n');
+  }
+
+  private _deterministicGreetingCliTests(): string {
+    return [
+      "const assert = require('node:assert/strict');",
+      "const test = require('node:test');",
+      "const { greetingFor, parseName, run } = require('../src/cli');",
+      "test('parses the --name flag', () => { assert.equal(parseName(['--name', 'Ada']), 'Ada'); });",
+      "test('formats the required greeting', () => { assert.equal(greetingFor('Ada'), 'Hello, Ada!'); });",
+      "test('runner writes the greeting to stdout', () => { const lines = []; const code = run(['--name', 'Grace'], { log: value => lines.push(value), error: () => {} }); assert.equal(code, 0); assert.deepEqual(lines, ['Hello, Grace!']); });",
+      "test('missing name fails with usage guidance', () => { const errors = []; const code = run([], { log: () => {}, error: value => errors.push(value) }); assert.equal(code, 1); assert.match(errors[0], /--name/); });",
+      '',
+    ].join('\n');
+  }
+
+  private _deterministicGreetingCliReadme(projectName: string): string {
+    return [
+      `# ${projectName}`,
+      '',
+      `${projectName} is a dependency-free Node.js CLI that prints a personalized greeting.`,
+      '',
+      '```sh',
+      'node src/cli.js --name Ada',
+      '# Hello, Ada!',
+      'npm test',
+      '```',
+      '',
+    ].join('\n');
+  }
+
   private _deterministicCliSource(): string {
     return [
       '#!/usr/bin/env node',
@@ -4538,6 +7798,31 @@ export class AgentOrchestrator {
     });
   }
 
+  /**
+   * Ask the boss to approve a command the safety policy flagged as risky.
+   * Honors the ask-policy: in fully autonomous / never-ask mode there is no human
+   * to answer, so the command is DECLINED with a clearly logged, journaled reason
+   * instead of either hanging forever or silently running. When the ask-policy
+   * permits and a UI handler is wired, the boss gets a real prompt.
+   */
+  private _requestCommandApproval(command: string, reason: string): Promise<boolean> {
+    if (!this._shouldAskUser() || !this.callbacks.onCommandApprovalNeeded) {
+      logWarn(
+        `Command needs approval but ask-policy is "${this.modelConfig.askPolicy}" (autonomous=${this.modelConfig.autonomousMode}); declining: ${command} — ${reason}`
+      );
+      this._journal('warn', 'Command blocked by policy (no approval prompt available)',
+        `\`${command}\`\n\n${reason}\n\nEnable an interactive ask-policy to approve commands like this.`);
+      return Promise.resolve(false);
+    }
+    const commandId = `cmd-${++this._approvalCounter}`;
+    this._journal('waiting', 'Awaiting boss approval for a command',
+      `\`${command}\`\n\n${reason}`);
+    return new Promise((resolve) => {
+      this._pendingCommandResolvers.set(commandId, resolve);
+      this.callbacks.onCommandApprovalNeeded?.(commandId, command, reason);
+    });
+  }
+
   private _shouldAskUser(): boolean {
     return !this.modelConfig.autonomousMode && this.modelConfig.askPolicy !== 'never';
   }
@@ -4573,7 +7858,7 @@ export class AgentOrchestrator {
       targetPlatforms: isBrowserGame ? ['modern web browser'] : isMobile || isGame ? ['iOS', 'Android'] : ['local development environment'],
       chosenStack,
       coreFeatures: isArcadeGame
-        ? ['Arkanoid-style paddle and ball gameplay', 'Exactly 10 playable levels', 'Brick collisions, scoring, lives, pause, restart, and win state']
+        ? ['Arkanoid-style paddle and ball gameplay', `Exactly ${this._extractRequestedLevelCount(prompt)} playable levels`, 'Brick collisions, scoring, lives, pause, restart, and win state']
         : ['Complete implementation of the requested product', 'Usable default UX', 'Documented build and run workflow'],
       assumptions: [
         'Ambiguous product details are resolved with practical defaults.',
@@ -4774,6 +8059,15 @@ export class AgentOrchestrator {
   }
 
   private _fallbackProjectStructure(brief: ProjectBrief): string[] {
+    if (Array.isArray(brief.deliveryArtifacts) && brief.deliveryArtifacts.length > 0) {
+      // The brief already named the exact files this project needs — trust
+      // that over a generic appType guess. A real run had the brief model
+      // classify a browser game as appType "web" (a defensible label) with a
+      // correct HTML5/Phaser.js deliveryArtifacts list; the appType-only
+      // heuristic below doesn't recognize "web" as a game and fell through to
+      // an unrelated React+Vite+TypeScript scaffold, corrupting the project.
+      return brief.deliveryArtifacts;
+    }
     const appType = (brief.appType || '').toLowerCase();
     if (/api|server|backend/.test(appType)) {
       return ['package.json', 'tsconfig.json', 'src/index.ts', 'src/server.ts', 'test/server.test.ts', 'README.md'];
@@ -4876,20 +8170,29 @@ export class AgentOrchestrator {
       .filter(file => file && typeof file.path === 'string' && file.path.trim().length > 0)
       .map(file => {
         const normalizedAction = validActions.has(file.action) ? file.action : 'modify';
-        const normalizedContent = file.content === undefined
+        const normalizedContent = file.content == null
           ? undefined
           : Array.isArray(file.content)
             ? (file.content as unknown[]).join('\n')
             : typeof file.content === 'string'
               ? file.content
               : String(file.content);
+        const description = file.description === undefined ? undefined : String(file.description);
+        let normalizedPath = this._normalizeRelativePath(file.path);
+        // Models sometimes describe a directory correctly but omit the final
+        // slash. Do not materialize that explicit directory as an empty file:
+        // later tasks cannot create children below it (ENOTDIR).
+        if (normalizedAction !== 'delete' && !file.patch && !(normalizedContent ?? '').trim()
+          && /\b(directory|folder)\b/i.test(description ?? '') && !/\bfile\b/i.test(description ?? '')) {
+          normalizedPath = `${normalizedPath.replace(/\/+$/, '')}/`;
+        }
         return {
           ...file,
-          path: this._normalizeRelativePath(file.path),
+          path: normalizedPath,
           action: normalizedAction,
           content: normalizedContent,
-          patch: file.patch === undefined ? undefined : String(file.patch),
-          description: file.description === undefined ? undefined : String(file.description),
+          patch: typeof file.patch === 'string' && file.patch.trim() ? file.patch : undefined,
+          description,
         };
       });
     output.toolRequests = Array.isArray(output.toolRequests)
@@ -4910,26 +8213,81 @@ export class AgentOrchestrator {
     review.suggestions = Array.isArray(review.suggestions) ? review.suggestions.map(String) : [];
     review.securityConcerns = Array.isArray(review.securityConcerns) ? review.securityConcerns.map(String) : [];
     review.fixSuggestions = Array.isArray(review.fixSuggestions) ? review.fixSuggestions.map(String) : [];
+    // Local models occasionally emit `uncertainties` as an array of objects
+    // instead of strings; coerce so downstream string ops (dedupe/join/trim)
+    // can never throw "x.trim is not a function" and kill the whole run.
+    review.uncertainties = Array.isArray(review.uncertainties) ? review.uncertainties.map(String) : [];
     review.needsFix = review.needsFix === true || review.approved === false || review.issues.length > 0 || review.securityConcerns.length > 0;
     review.approved = review.needsFix ? false : review.approved === true;
     review.reviewedAt = review.reviewedAt || new Date().toISOString();
   }
 
-  private _normalizeTaskItem(task: TaskItem, index: number, now: string): TaskItem {
-    const allowedFiles = Array.isArray(task.allowedFiles)
+  private _normalizeTaskItem(task: TaskItem, index: number, now: string, validSpecialistIds?: Set<string>): TaskItem {
+    const normalizedAllowedFiles = Array.isArray(task.allowedFiles)
       ? task.allowedFiles.map(file => this._normalizeRelativePath(String(file))).filter(Boolean)
       : [];
-    const acceptanceCriteria = Array.isArray(task.acceptanceCriteria)
-      ? task.acceptanceCriteria.map(String)
-      : [];
+    const taskId = task.id || `task-${String(index + 1).padStart(3, '0')}`;
+    const hoisted = this._hoistMisplacedRootManifests(taskId, normalizedAllowedFiles);
+    if (hoisted.size > 0) {
+      const rewrite = (text: string) => [...hoisted].reduce((acc, [from, to]) => acc.split(from).join(to), text);
+      task = {
+        ...task,
+        description: rewrite(String(task.description ?? '')),
+        acceptanceCriteria: Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria.map(c => rewrite(String(c))) : task.acceptanceCriteria,
+      };
+      normalizedAllowedFiles.splice(0, normalizedAllowedFiles.length,
+        ...[...new Set(normalizedAllowedFiles.map(file => hoisted.get(file) ?? file))]);
+    }
+    const allowedFiles = normalizedAllowedFiles.filter(file => {
+      if (this._isOffStackToolchainMarker(file)) {
+        this.workspace.appendAssumption(
+          'taskManager',
+          `Task ${taskId} planned toolchain manifest "${file}", which does not match the project's chosen stack; removed it from allowedFiles.`
+        );
+        return false;
+      }
+      if (!isBinaryAssetPath(file)) { return true; }
+      this.workspace.appendAssumption(
+        'taskManager',
+        `Task ${taskId} planned binary asset "${file}", which a text-only model cannot author; removed it from allowedFiles. Assets must be generated procedurally in code instead.`
+      );
+      return false;
+    });
+    const acceptanceCriteria = this._reconcileEmptyFileAcceptanceCriteria(
+      taskId,
+      Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria.map(String) : []
+    );
+    // A task that writes JS/TS tests must be able to make them runnable
+    // (benchmark run 8: tests were written but package.json ran `echo`).
+    const writesJsTests = allowedFiles.some(file => TEST_FILE.test(file) && (/\.(m?[jt]sx?|cjs)$/.test(file) || /\*|\/$/.test(file)));
+    if (writesJsTests && !this._briefIsPythonOnly()) {
+      if (!allowedFiles.includes('package.json')) { allowedFiles.push('package.json'); }
+      acceptanceCriteria.push('package.json declares a real test runner (e.g. vitest or jest) in devDependencies and its "test" script runs these test files; tests are written in the project\'s language and every test makes at least one real assertion.');
+    }
     const forbiddenActions = Array.isArray(task.forbiddenActions)
       ? task.forbiddenActions.map(String)
       : [];
 
+    // Only trust a specialistId that names a real member of THIS run's
+    // designed team — an id the model invented, or one left over from a
+    // stale/mismatched team plan, must never silently route coding work to
+    // a nonexistent agent or (worse) collide with an unrelated one.
+    const requestedSpecialistId = typeof task.specialistId === 'string' ? task.specialistId.trim() : '';
+    let specialistId: string | undefined;
+    if (requestedSpecialistId && validSpecialistIds?.has(requestedSpecialistId)) {
+      specialistId = requestedSpecialistId;
+    } else if (requestedSpecialistId) {
+      this.workspace.appendAssumption(
+        'taskManager',
+        `Task ${taskId} named specialistId "${requestedSpecialistId}", which is not a member of the current team plan; ignored — the task will use the standard code worker instead.`
+      );
+    }
+
     return {
       ...task,
-      id: task.id || `task-${String(index + 1).padStart(3, '0')}`,
+      id: taskId,
       assignedAgent: task.assignedAgent || 'codeWorker',
+      specialistId,
       dependsOn: Array.isArray(task.dependsOn) ? task.dependsOn.map(String) : [],
       allowedFiles,
       forbiddenActions: this._removeContradictoryForbiddenActions(forbiddenActions, allowedFiles, acceptanceCriteria),
@@ -4937,6 +8295,126 @@ export class AgentOrchestrator {
       createdAt: task.createdAt || now,
       status: 'pending',
     };
+  }
+
+  /**
+   * Real failure mode (benchmark run 6, 2026-09-26): the task manager planned
+   * "src/package.json" and "src/README.md" for a new project. The manifest's
+   * content was a root manifest ("main": "src/game/main.js"), but at src/ the
+   * dependency-install phase found no package.json, Phaser was never
+   * installed, and the page failed on its bare import. A project manifest
+   * directly under a top-level src/ of a new project is hoisted to the root.
+   * Files that already exist (the user's real layout) are left alone.
+   */
+  private _hoistMisplacedRootManifests(taskId: string, files: string[]): Map<string, string> {
+    const hoisted = new Map<string, string>();
+    for (const file of files) {
+      const match = /^src\/(package\.json|README\.md|requirements\.txt|pyproject\.toml)$/i.exec(file);
+      if (!match || this.fileManager.fileExists(file) || this.fileManager.fileExists(match[1])) { continue; }
+      hoisted.set(file, match[1]);
+      this.workspace.appendAssumption(
+        'taskManager',
+        `Task ${taskId} planned project manifest "${file}" under src/; moved it to the project root as "${match[1]}" so install, run and test tooling can find it.`
+      );
+    }
+    return hoisted;
+  }
+
+  /**
+   * Real failure mode (benchmark run 4, 2026-09-26): the task manager put 21
+   * files (level1.js…level20.js + index.js) into ONE task. Every 14B/24B
+   * code-worker and fixer call for it hit the 10-minute request timeout; only
+   * the compact-context 7B retry finished, and it wrote an "add more…"
+   * placeholder that review correctly rejected — so the task could never pass.
+   * A single model call cannot author that much output on this hardware, so a
+   * task with more than MAX_FILES_PER_TASK files is split deterministically
+   * into sequential parts. The last part keeps the original id (so existing
+   * dependsOn references still hold), the original acceptance criteria, and
+   * the aggregator files (index.*), which are written after the parts they
+   * import already exist.
+   */
+  private _splitOversizedTasks(tasks: TaskItem[]): TaskItem[] {
+    const MAX_FILES_PER_TASK = 6;
+    const isAggregator = (file: string) => /(^|\/)(index|main|app)\.[^/]+$/i.test(file);
+    // Directory/glob entries ("src/scenes/", "tests/**/*") are scopes, not
+    // files to author: they do not count toward the limit and every part keeps them.
+    const isScope = (file: string) => file.endsWith('/') || file.includes('*');
+    return tasks.flatMap(task => {
+      const scopes = task.allowedFiles.filter(isScope);
+      const realFiles = task.allowedFiles.filter(file => !isScope(file));
+      if (realFiles.length <= MAX_FILES_PER_TASK) { return [task]; }
+      const ordered = [
+        ...realFiles.filter(file => !isAggregator(file)),
+        ...realFiles.filter(isAggregator),
+      ];
+      // Balanced parts (7 files → 4+3, not 6+1).
+      const chunkSize = Math.ceil(ordered.length / Math.ceil(ordered.length / MAX_FILES_PER_TASK));
+      const chunks: string[][] = [];
+      for (let i = 0; i < ordered.length; i += chunkSize) {
+        chunks.push(ordered.slice(i, i + chunkSize));
+      }
+      const total = chunks.length;
+      const partId = (k: number) => (k === total ? task.id : `${task.id}-part-${k}`);
+      this.workspace.appendAssumption(
+        'taskManager',
+        `Task ${task.id} listed ${realFiles.length} files, more than one model call can author reliably; split it into ${total} sequential parts of at most ${MAX_FILES_PER_TASK} files.`
+      );
+      this._emit('log', `Task "${task.id}" split into ${total} parts (${realFiles.length} files).`, 'info');
+      return chunks.map((files, index): TaskItem => {
+        const k = index + 1;
+        const isLast = k === total;
+        const scope = [
+          `This is part ${k} of ${total} of "${task.title}". Write ONLY these files, each complete (no placeholders or "add more" comments): ${files.join(', ')}.`,
+          k > 1 ? `Files from earlier parts already exist and must NOT be returned or rewritten: ${chunks.slice(0, index).flat().join(', ')}. Only import from them.` : '',
+          isLast ? '' : `Later parts will write: ${chunks.slice(index + 1).flat().join(', ')}. Do not import from those files yet.`,
+        ].filter(Boolean).join(' ');
+        return {
+          ...task,
+          id: partId(k),
+          title: `${task.title} (part ${k}/${total})`,
+          description: `${task.description}\n\n${scope}`,
+          dependsOn: k === 1 ? task.dependsOn : [partId(k - 1)],
+          allowedFiles: [...files, ...scopes],
+          acceptanceCriteria: isLast
+            ? task.acceptanceCriteria
+            : [
+                `Each of ${files.join(', ')} is fully implemented with real content that serves this goal: ${task.title}.`,
+                'No file contains placeholder, TODO, or "add more / and so on" content.',
+              ],
+        };
+      });
+    });
+  }
+
+  /**
+   * Deterministic cross-check for a real failure mode (2026-09-18): the task
+   * manager planned task-001 with acceptance criteria "All required files
+   * are present and empty" — directly contradicting TASK_MANAGER_SYSTEM rule
+   * 9 ("Do not assign empty source files... as completed implementation
+   * work"), which the model itself wrote the task plan under. Whatever the
+   * code worker did, the heuristic "file is empty" review check (itself
+   * correct — a genuinely empty file is never a real deliverable) then
+   * blocked the task identically on every fix attempt, tripping the
+   * stuck-loop guard and failing the whole build (0/30 tasks) over a task
+   * that was unwinnable by construction. Rather than weaken the empty-file
+   * check (which exists for good reason — see moduleContracts/heuristic
+   * history), this rewrites the contradiction at the source, the moment the
+   * task is planned, so the code worker is never handed a task it cannot
+   * both satisfy and pass review.
+   */
+  private _reconcileEmptyFileAcceptanceCriteria(taskId: string, acceptanceCriteria: string[]): string[] {
+    const emptyFileClaim = /\bfiles?\b[^.!?]{0,60}\b(empty|blank)\b|\b(empty|blank)\b[^.!?]{0,60}\bfiles?\b/i;
+    if (!acceptanceCriteria.some(c => emptyFileClaim.test(c))) { return acceptanceCriteria; }
+
+    this.workspace.appendAssumption(
+      'taskManager',
+      `Task ${taskId} had acceptance criteria describing files as "empty"/"blank", which no file can ever satisfy alongside the review's ` +
+      `"file is empty" check — added a criterion requiring real, minimal, non-empty content instead so the task is actually achievable.`
+    );
+    return [
+      ...acceptanceCriteria,
+      'Every file listed in allowedFiles must be created with real, minimal, working content (e.g. a valid empty JSON object/array, or a real module with actual exports) — never a literally empty 0-byte file, regardless of any other wording above.',
+    ];
   }
 
   private _removeContradictoryForbiddenActions(
@@ -4967,19 +8445,53 @@ export class AgentOrchestrator {
   }
 
   private _heuristicReviewIssues(workerOutput: CodeWorkerOutput): string[] {
+    return this._heuristicFileIssues(workerOutput.files, 'No file changes were produced.');
+  }
+
+  private _heuristicFileIssues(files: FileChange[], emptyMessage = 'No files to check.'): string[] {
     const issues: string[] = [];
-    if (!Array.isArray(workerOutput.files) || workerOutput.files.length === 0) {
-      issues.push('No file changes were produced.');
+    if (!Array.isArray(files) || files.length === 0) {
+      issues.push(emptyMessage);
       return issues;
     }
 
-    for (const file of workerOutput.files) {
+    for (const file of files) {
       const content = file.content ?? '';
-      if (file.action !== 'delete' && content.trim().length === 0) {
-        issues.push(`${file.path} is empty.`);
+      if (file.action === 'delete') { continue; }
+      if (file.path.endsWith('/')) {
+        if (content.trim() || file.patch) { issues.push(`${file.path} is a directory entry and must not contain file content or a patch.`); }
+        continue;
       }
-      if (/\bTODO\b|not implemented|throw new Error\(["']not implemented/i.test(content)) {
+      if (content.trim().length === 0) {
+        issues.push(`${file.path} is empty.`);
+        continue;
+      }
+      if (/\bTODO\b|\bFIXME\b|not implemented|NotImplementedError|throw new Error\(["']not implemented/i.test(content)) {
         issues.push(`${file.path} appears to contain placeholder implementation text.`);
+      }
+      // Common stub smells observed in real runs: fake endpoints, "placeholder"/
+      // "example" comments, and obviously hardcoded sample data standing in for
+      // real logic. These pass a syntax check but do not implement the goal.
+      if (/example\.com|\bplaceholder\b|placeholder logic|example extraction|example parsing|dummy data|not actual/i.test(content)) {
+        issues.push(`${file.path} contains placeholder/example stand-in code (e.g. example.com or "placeholder/example" logic) instead of a real implementation.`);
+      }
+      // Observed in a real run: a model wrote 2 of 20 requested game levels, then
+      // a comment telling itself (or a future pass) to add the rest — a stub that
+      // "TODO"/"FIXME" scanning above does not catch, but that a reviewer or test
+      // would never notice either since nothing throws or fails to compile.
+      if (/\/\/[^\n]*\b(add\s+(\d+\s+)?more\b|and so on\b|following the same (pattern|structure)\b)/i.test(content)) {
+        issues.push(`${file.path} contains a "add more / and so on" comment instead of the complete implementation.`);
+      }
+      // A file with a .json extension is claimed to be data, not prose — if it
+      // does not parse, nothing that reads it at runtime will work, and no LLM
+      // review pass reliably catches this by eye (a real run shipped invalid
+      // JSON with a "// Add 19 more levels here" comment that passed both the
+      // reviewer and the quality auditor).
+      if (/\.json$/i.test(file.path)) {
+        try { JSON.parse(content); }
+        catch (err) {
+          issues.push(`${file.path} is not valid JSON: ${err instanceof Error ? err.message : String(err)}.`);
+        }
       }
     }
     return issues;
@@ -5087,7 +8599,340 @@ export class AgentOrchestrator {
     return lines.join('\n');
   }
 
+  /**
+   * Detect, from the goal text alone, which capabilities the task genuinely
+   * needs: live web access, public-repo reading, a user-supplied file (e.g. a
+   * CV), or external credentials. Pure and deterministic so it is unit-testable
+   * and runs before any expensive work. Bilingual (EN/VI) keyword heuristics.
+   */
+  _assessGoalCapabilities(goal: string): {
+    needsWeb: boolean;
+    needsRepoReads: boolean;
+    needsVisualAssets: boolean;
+    needsUserFiles: string[];
+    needsCredentials: string[];
+  } {
+    const g = (goal || '').toLowerCase();
+    const needsWeb = /\b(scan|scrape|crawl|browse|web|internet|online|website|web ?site|search the web|find .*(job|jobs|vacanc|product|price|listing)|tuy[eể]n d[uụ]ng|qu[eé]t|trang web|tr[eê]n m[aạ]ng|tr[uự]c tuy[eế]n|t[iì]m .*(vi[eệ]c|s[aả]n ph[aẩ]m))\b/i.test(g);
+    const needsRepoReads = /\b(github|gitlab|open ?source|public repo|repositor|library code|example code|m[aã] ngu[oồ]n)\b/i.test(g);
+    const needsVisualAssets = /\b(game|character|sprite|artwork|illustration|icon set|thumbnail image|nh[aâ]n v[aậ]t|h[iì]nh [aả]nh|[aả]nh minh h[oọ]a|đ[oồ]? h[oọ]a|sprite ?sheet)\b/i.test(g);
+
+    const needsUserFiles: string[] = [];
+    // "Resume" is also a control verb (pause/resume, resume playback or a
+    // workflow). Require document context instead of inventing a CV input for
+    // every product that can continue an interrupted operation.
+    const resumeDocument =
+      /\br[eé]sumé(?=$|[^\p{L}])/u.test(g) ||
+      /\bresumes?\.(?:pdf|docx?|txt|md)\b/.test(g) ||
+      /\bresumes?[\s-]+(?:file|document|parser|parsing|builder|editor|review|reviewer|analysis|analy[sz]er|screening|ranking|template|optimizer|pdf|docx?)\b/.test(g) ||
+      /\b(?:my|your|his|her|their|our|candidate['’]s|applicant['’]s|user['’]s)\s+(?:professional\s+)?resumes?\b(?![\s-]+(?:button|control|feature|function|workflow|session|playback|download))/i.test(g) ||
+      /\b(?:read|parse|analy[sz]e|review|improve|optimi[sz]e|tailor|rewrite|format|score|rank|match|screen|upload|attach)\s+(?:(?:a|an|the|my|your|their|candidate|user|uploaded|existing|professional)\s+){0,3}resumes?\b/.test(g) ||
+      /\b(?:create|write|generate|build)\s+(?:a|an|my|your|professional)\s+resume\b(?![\s-]+(?:button|control|feature|function|workflow|session|playback|download))/.test(g);
+    if (/\b(cv|curriculum vitae|h[oồ] s[oơ]|s[oơ] y[eế]u|c[aá] nh[aâ]n)\b/i.test(g) || resumeDocument) {
+      needsUserFiles.push('your CV/resume file (provide its path in the prompt)');
+    } else if (/\b(read|[dđ][oọ]c|parse|analy[sz]e|ph[aâ]n t[ií]ch) .{0,30}\b(file|document|t[aà]i li[eệ]u|pdf|docx?)\b/i.test(g)) {
+      needsUserFiles.push('the input document/file to process (provide its path in the prompt)');
+    }
+
+    const needsCredentials: string[] = [];
+    if (/\b(api key|api-key|apikey|oauth|access token|client secret|client id|credential|secret key|youtube api|đăng nh[aậ]p|token)\b/i.test(g)) {
+      needsCredentials.push('the required API key / credentials');
+    }
+
+    return { needsWeb, needsRepoReads, needsVisualAssets, needsUserFiles, needsCredentials };
+  }
+
+  /**
+   * Capability pre-flight: before building, make the agent honest about what the
+   * goal needs. Safe capabilities (web research, public-repo reads) are
+   * auto-enabled for the run; inputs only the boss can supply (a CV file, API
+   * credentials) are surfaced — and if they are missing and cannot be asked, the
+   * run STOPS with a precise message instead of wasting hours building a
+   * placeholder that can never actually complete the task.
+   */
+  /**
+   * Refuse to build into this extension's own development source tree unless
+   * explicitly allowed. A real run once merged a generated Python "job
+   * application agent" straight into this extension's src/, silently
+   * corrupting it and shipping in a release archive — this check is a direct
+   * response to that incident.
+   */
+  private _guardAgainstSelfWorkspace(): void {
+    if (this.modelConfig.allowSelfWorkspace === true) { return; }
+    const markerFile = path.join(this.workspace.rootDir, 'src', 'orchestrator', 'AgentOrchestrator.ts');
+    let isOwnPackage = false;
+    try {
+      const pkgRaw = fs.readFileSync(path.join(this.workspace.rootDir, 'package.json'), 'utf8');
+      isOwnPackage = (JSON.parse(pkgRaw) as { name?: string }).name === 'local-multi-agent-coder';
+    } catch { /* no readable package.json here: not a match */ }
+    if (!isOwnPackage || !fs.existsSync(markerFile)) { return; }
+
+    const msg =
+      "This workspace is the Local Multi-Agent Coder extension's own source tree. " +
+      'Building an unrelated product here would mix generated files into the ' +
+      "extension's own src/ (this has previously corrupted the extension's codebase " +
+      'and leaked into a release archive). Open a separate, empty folder for the ' +
+      'generated product and re-run there, or set "allowSelfWorkspace": true in ' +
+      '.agent-workspace/model_config.json if you intentionally want the agent to ' +
+      'modify this extension itself.';
+    throw new SelfWorkspaceGuardError(msg);
+  }
+
+  /**
+   * Before the resource gate runs, offer to close foreground apps to reach
+   * the boss's configured RAM headroom target for running local LLMs. This
+   * NEVER closes anything without an explicit yes from the boss — unlike
+   * other autonomous decisions (askPolicy/autonomousMode gate those), this
+   * one is exempted from "never ask" because it reaches outside the project
+   * sandbox into apps the boss has open for other work, which the run has no
+   * business touching without permission. If there is no interactive UI
+   * wired up to ask (a headless run), or the boss doesn't respond within a
+   * short window, it does nothing and proceeds — the resource gate right
+   * after this still protects against genuinely insufficient memory.
+   */
+  private async _offerRamOptimizationIfNeeded(): Promise<void> {
+    const config = this.modelConfig.resourceGuard ?? { enabled: true, minFreeMemoryPercent: 10, topProcessCount: 5, targetFreeGb: 20 };
+    if (!config.enabled || !(config.targetFreeGb > 0)) { return; }
+    const service = new SystemResourceService(config);
+    const before = service.check().snapshot;
+    const targetFreeMb = config.targetFreeGb * 1024;
+    if (before.freeMemoryMb >= targetFreeMb) { return; }
+
+    const apps = service.closableApps(before.freeMemoryMb, targetFreeMb);
+    if (apps.length === 0) {
+      this._journal('research', 'RAM optimization skipped',
+        `Free memory is ${before.freeMemoryMb} MB, short of the ${config.targetFreeGb} GB target, but no closeable ` +
+        `foreground app is using enough RAM to close the gap. Continuing as-is.`);
+      return;
+    }
+
+    if (!this.callbacks.onRamOptimizationNeeded) {
+      this._journal('research', 'RAM optimization skipped (no UI available)',
+        `Free memory is ${before.freeMemoryMb} MB, short of the ${config.targetFreeGb} GB target. Closing ` +
+        `${apps.map(a => `${a.name} (~${a.residentMb} MB)`).join(', ')} could help, but this run has no interactive ` +
+        `UI to ask permission, and apps are never closed without it. Continuing without closing anything.`);
+      return;
+    }
+
+    const proposalId = `ram-${++this._approvalCounter}`;
+    this._journal('waiting', 'Awaiting boss approval to close apps for RAM headroom',
+      `Free: ${before.freeMemoryMb} MB. Target: ${config.targetFreeGb} GB. Proposed: ` +
+      `${apps.map(a => `${a.name} (~${a.residentMb} MB)`).join(', ')}.`);
+    const approved = await this._requestRamOptimization({
+      id: proposalId,
+      currentFreeMb: before.freeMemoryMb,
+      targetFreeMb,
+      apps,
+    });
+
+    if (!approved) {
+      this._journal('research', 'RAM optimization declined', 'The boss declined (or did not respond in time); continuing without closing anything.');
+      return;
+    }
+
+    const closed: string[] = [];
+    for (const app of apps) {
+      try {
+        const result = await this.terminal.runSafeCommand(
+          `osascript -e ${this._quoteShell(`tell application "${app.name.replace(/"/g, '\\"')}" to quit`)}`,
+          10_000
+        );
+        if (result.success) { closed.push(app.name); }
+      } catch {
+        // Best-effort — an app that fails to quit just stays open; never treat this as fatal.
+      }
+    }
+    const after = service.check().snapshot;
+    this._journal('research', 'RAM optimization applied',
+      `Closed: ${closed.join(', ') || 'none'}. Free memory: ${before.freeMemoryMb} MB → ${after.freeMemoryMb} MB.`);
+  }
+
+  private _requestRamOptimization(proposal: RamOptimizationProposal): Promise<boolean> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (approved: boolean) => {
+        if (settled) { return; }
+        settled = true;
+        this._pendingRamOptimizationResolvers.delete(proposal.id);
+        resolve(approved);
+      };
+      this._pendingRamOptimizationResolvers.set(proposal.id, finish);
+      this.callbacks.onRamOptimizationNeeded?.(proposal);
+      setTimeout(() => finish(false), this._ramOptimizationTimeoutMs);
+    });
+  }
+
+  /**
+   * Always show a resource advisory (free RAM/swap, top RAM-consuming apps)
+   * before the first model call, and hard-stop when the host is genuinely
+   * under memory pressure. Five local models run sequentially over a long
+   * debate; starting that on an already-struggling machine risks the exact
+   * kind of mid-debate model crash a resource-starved host produces, and
+   * wastes whatever time the debate manages to complete before it happens.
+   */
+  private _preflightSystemResources(): void {
+    const config = this.modelConfig.resourceGuard ?? { enabled: true, minFreeMemoryPercent: 10, topProcessCount: 5, targetFreeGb: 20 };
+    const result = new SystemResourceService(config).check();
+    this._journal('research', 'Pre-run resource check', result.advisory);
+    this._emit('log', result.advisory, result.blocked ? 'error' : 'warn');
+    if (result.blocked) {
+      throw new InsufficientResourcesError(
+        'Not enough free memory headroom to safely start a five-model run.',
+        result.advisory
+      );
+    }
+  }
+
+  private async _preflightCapabilities(goal: string): Promise<void> {
+    this._guardAgainstSelfWorkspace();
+    const a = this._assessGoalCapabilities(goal);
+    const enabled: string[] = [];
+
+    if (a.needsWeb && this.modelConfig.webSearch?.enabled !== true) {
+      this.modelConfig.webSearch = {
+        ...this.modelConfig.webSearch,
+        enabled: true,
+        officialDocsOnly: false,
+        allowedDomains: [],
+      };
+      enabled.push('web research');
+    }
+    if (a.needsRepoReads && this.modelConfig.githubIntegration?.allowExternalRepoReads !== true) {
+      this.modelConfig.githubIntegration = {
+        ...this.modelConfig.githubIntegration,
+        allowExternalRepoReads: true,
+      };
+      enabled.push('public repository reading');
+    }
+    if (a.needsVisualAssets && this.modelConfig.assetLibrary?.enabled !== true) {
+      this.modelConfig.assetLibrary = {
+        ...this.modelConfig.assetLibrary,
+        enabled: true,
+      };
+      enabled.push('visual asset search (Openverse)');
+    }
+    if (enabled.length > 0) {
+      this._rebuildResearchAndTools();
+      this._emit('log', `Auto-enabled ${enabled.join(' and ')} because the goal requires it.`, 'info');
+      this._journal('research', 'Auto-enabled capabilities for this goal',
+        `The goal requires: ${enabled.join(', ')}. Enabled for this run (local, opt-in). Disable in model_config.json to forbid.`);
+    }
+
+    // Distinguish BUILD-time inputs from the finished product's RUNTIME inputs.
+    const providedFiles = this._promptReferencedFilePaths();
+    const missingFiles = providedFiles.length > 0 ? [] : a.needsUserFiles;
+    const runtimeInputs = [...missingFiles, ...a.needsCredentials];
+    if (runtimeInputs.length === 0) { return; }
+
+    if (this._goalHasBuildIntent(goal)) {
+      // The goal is to BUILD a reusable tool/agent. A CV/resume or API key is a
+      // RUNTIME input the END USER will supply when they run the product — NOT
+      // something needed to build it. So build the complete tool now: make it
+      // accept these inputs at runtime, generate sample fixtures so it can be
+      // developed and tested, and document the real-input contract. Do NOT block.
+      this._deferRuntimeInputs(goal, runtimeInputs);
+      return;
+    }
+
+    // A one-shot task that operates directly on data we do not have and cannot
+    // build a reusable tool around: honestly stop and ask the boss for it.
+    const msg =
+      `This goal needs input only you can provide: ${runtimeInputs.join('; ')}. ` +
+      `Add it and re-run (e.g. include the file path in your prompt, or set the API key). ` +
+      `Stopping now instead of building a placeholder that cannot truly complete the task.`;
+    this._journal('waiting', 'Missing required input from boss', msg);
+    this.workspace.appendFile(
+      this.workspace.openQuestionsPath,
+      `\n## Required input (run blocked)\n\n${runtimeInputs.map(n => `- ${n}`).join('\n')}\n\n_Raised at: ${new Date().toISOString()}_\n`
+    );
+    if (this._shouldAskUser()) {
+      runtimeInputs.forEach((need, i) =>
+        this.callbacks.onQuestionNeeded?.({
+          id: `capability-${i}`,
+          agentRole: 'briefBuilder',
+          phase: 'briefing',
+          question: `Please provide: ${need}`,
+        }));
+    }
+    this._emit('error', msg);
+    throw new MissingCapabilityError(msg, runtimeInputs);
+  }
+
+  /** True when the goal asks to BUILD a reusable artifact (vs. a one-shot task). */
+  _goalHasBuildIntent(goal: string): boolean {
+    return /\b(t[aạ]o|x[aâ]y|build|create|generate|develop|l[aà]m|vi[eế]t|scaffold|implement|agent|tool|app|application|script|system|service|api|cli|bot|website|web ?app|ph[aầ]n m[eề]m|[uứ]ng d[uụ]ng|c[oô]ng c[uụ]|h[eệ] th[oố]ng|trang web|chương tr[iì]nh)\b/i.test(goal || '');
+  }
+
+  /**
+   * Treat boss-only inputs as the finished product's RUNTIME parameters instead
+   * of blocking the build: create sample fixtures for development/testing, write
+   * a clear runtime-input contract, and inject it so the brief/architect build a
+   * tool that accepts the real inputs later and documents how to provide them.
+   */
+  private _deferRuntimeInputs(goal: string, runtimeInputs: string[]): void {
+    const fixtures = this._writeRuntimeFixtures(runtimeInputs);
+    const contract = [
+      '## BUILD DIRECTIVE — runtime inputs (do NOT block the build on these)',
+      'This goal is to BUILD a reusable tool/agent. The items below are RUNTIME inputs the END USER supplies when they RUN the product — they are NOT needed to build it. Build the complete, runnable tool now.',
+      ...runtimeInputs.map(i => `- ${i} → the product MUST accept this at runtime (CLI argument, config file, or environment variable). NEVER hardcode it.`),
+      fixtures.length
+        ? `For development and tests, use the sample fixture(s): ${fixtures.join(', ')}. The tool must run end-to-end against these.`
+        : 'Create a small sample fixture so the tool can be developed and tested end-to-end.',
+      'Document in the README exactly how the user provides the real input at runtime.',
+      'Acceptance: the tool runs end-to-end on the sample fixture(s) and clearly documents the real-input contract.',
+    ].join('\n');
+
+    // Propagate the directive through the user prompt (read by brief + architect).
+    const original = this.workspace.readUserPrompt();
+    if (!original.includes('BUILD DIRECTIVE — runtime inputs')) {
+      this.workspace.writeUserPrompt(`${original}\n\n---\n${contract}`);
+    }
+    this.workspace.appendRollingSummary(`## Runtime Input Contract\n${contract}`);
+    this.workspace.appendAssumption('briefBuilder',
+      `Runtime inputs deferred (built as parameters, not blockers): ${runtimeInputs.join('; ')}. Sample fixtures: ${fixtures.join(', ') || 'none'}.`);
+    this._journal('research', 'Deferred boss inputs to runtime (built complete tool instead of blocking)',
+      contract);
+    this._emit('log', `Building the tool to accept these at runtime instead of blocking: ${runtimeInputs.join('; ')}.`, 'info');
+  }
+
+  /** Create small sample fixtures so a tool needing a CV / credentials is testable. */
+  private _writeRuntimeFixtures(runtimeInputs: string[]): string[] {
+    const created: string[] = [];
+    const joined = runtimeInputs.join(' ').toLowerCase();
+    try {
+      if (/cv|resume|r[eé]sum[eé]|document|file|t[aà]i li[eệ]u|h[oồ] s[oơ]/.test(joined)) {
+        const rel = 'examples/sample_resume.txt';
+        const full = path.join(this.workspace.rootDir, rel);
+        if (!this.fileManager.fileExists(rel)) {
+          this.workspace.writeFile(full, SAMPLE_RESUME_FIXTURE);
+        }
+        created.push(rel);
+      }
+      if (/key|credential|token|secret|oauth|api/.test(joined)) {
+        const rel = '.env.example';
+        const full = path.join(this.workspace.rootDir, rel);
+        if (!this.fileManager.fileExists(rel)) {
+          this.workspace.writeFile(full, '# Fill in real values at runtime. Never commit real secrets.\nAPI_KEY=your-api-key-here\n');
+        }
+        created.push(rel);
+      }
+    } catch (err) {
+      logWarn(`Could not write runtime fixtures: ${formatError(err)}`);
+    }
+    return created;
+  }
+
   private _selectWorkflowRoute(state: ProjectState): WorkflowRoute {
+    // An autonomous-goal run already debated via the dynamic team; skip the
+    // fixed 4-round debate and go straight to building the agreed direction.
+    if (this._skipFixedDebate) {
+      return {
+        kind: 'full_project',
+        skipDebate: true,
+        reason: 'A dynamic agent team already debated and chose the direction, so the fixed debate is skipped and the build implements the team verdict.',
+      };
+    }
+
     const prompt = (state.projectGoal || this.workspace.readUserPrompt()).toLowerCase();
     const looksLikeMaintenance =
       /(fix|bug|failing|failure|error|lint|compile|test|review|refactor|update|change|patch|sửa|lỗi|kiểm tra|cải tiến)/i.test(prompt);
@@ -5130,16 +8975,43 @@ export class AgentOrchestrator {
       this.workspace.logsDir,
       this.modelConfig.commandPolicy
     );
-    this.toolRegistry = new AutonomousToolRegistry(
+    this.webSearch = new WebSearchService(this.modelConfig.webSearch);
+    this.research = this._buildResearchService();
+    this.assetLibrary = new AssetLibraryService(this.workspace.rootDir, this.modelConfig.assetLibrary);
+    this.toolRegistry = this._buildToolRegistry();
+    this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig.skills);
+    this.githubIntegration = new GitHubIntegrationService(this.workspace.rootDir, this.modelConfig.githubIntegration);
+  }
+
+  private _buildResearchService(): ResearchService {
+    return new ResearchService({
+      webSearch: this.modelConfig.webSearch,
+      github: this.modelConfig.githubIntegration,
+      allowExternalRepoReads:
+        this.modelConfig.githubIntegration?.allowExternalRepoReads === true,
+      maxResults: this.modelConfig.webSearch?.maxResults,
+    });
+  }
+
+  private _buildToolRegistry(): AutonomousToolRegistry {
+    return new AutonomousToolRegistry(
       this.fileManager,
       this.searchService,
       this.terminal,
       this.patchService,
-      this.webFetcher
+      this.webFetcher,
+      (command, reason) => this._requestCommandApproval(command, reason),
+      this.research ?? (this.research = this._buildResearchService()),
+      this.connectorManager,
+      this.assetLibrary ?? (this.assetLibrary = new AssetLibraryService(this.workspace.rootDir, this.modelConfig.assetLibrary))
     );
-    this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig.skills);
-    this.githubIntegration = new GitHubIntegrationService(this.workspace.rootDir, this.modelConfig.githubIntegration);
-    this.webSearch = new WebSearchService(this.modelConfig.webSearch);
+  }
+
+  /** Rebuild research + tools after a capability flag changed at runtime. */
+  private _rebuildResearchAndTools(): void {
+    this.research = this._buildResearchService();
+    this.assetLibrary = new AssetLibraryService(this.workspace.rootDir, this.modelConfig.assetLibrary);
+    this.toolRegistry = this._buildToolRegistry();
   }
 
   private _ensureCapabilityServices(): void {
@@ -5151,13 +9023,7 @@ export class AgentOrchestrator {
       );
     }
     if (!this.toolRegistry) {
-      this.toolRegistry = new AutonomousToolRegistry(
-        this.fileManager,
-        this.searchService,
-        this.terminal,
-        this.patchService,
-        this.webFetcher
-      );
+      this.toolRegistry = this._buildToolRegistry();
     }
     if (!this.skillManager) {
       this.skillManager = new SkillManager(this.workspace.rootDir, this.modelConfig?.skills);
@@ -5174,10 +9040,82 @@ export class AgentOrchestrator {
     return this.modelConfig.agents[role];
   }
 
-  private _buildMessages(role: AgentRole, userContent: string): OllamaMessage[] {
+  private async _requireReadyDebateModels(): Promise<void> {
+    const readiness = await new ModelReadinessService(this.ollama, 5).assess(this._modelRoster());
+    this.workspace.writeFile(this.workspace.modelReadinessPath, prettyJson(readiness));
+    this._journal(
+      readiness.status === 'blocked' ? 'error' : readiness.status === 'degraded' ? 'warn' : 'audit',
+      `Model readiness: ${readiness.status}`,
+      [
+        `Selected (${readiness.selectedModels.length} distinct): ${readiness.selectedModels.join(', ') || 'none'}`,
+        readiness.missingConfiguredModels.length > 0
+          ? `Missing configured: ${readiness.missingConfiguredModels.join(', ')}`
+          : 'All configured roster names resolved.',
+        ...readiness.guidance,
+      ].join('\n')
+    );
+    if (readiness.status === 'blocked') {
+      throw new WorkflowError(
+        `Five-model debate blocked: ${readiness.guidance.join(' ') || 'fewer than five distinct local models passed the readiness probe.'}`,
+        'intake'
+      );
+    }
+    this._readyModelRoster = readiness.selectedModels;
+    this._readyTieBreakerModels = readiness.reserveModels;
+    this._modelReadinessStatus = readiness.status;
+    this._emit(
+      'log',
+      `Model preflight ${readiness.status}: ${readiness.selectedModels.length} distinct local models are responsive.`,
+      readiness.status === 'degraded' ? 'warn' : 'info'
+    );
+  }
+
+  /** Unique pool of every model referenced in the roster (primary + fallback). */
+  private _modelRoster(): string[] {
+    const pool: string[] = [];
+    for (const cfg of Object.values(this.modelConfig.agents)) {
+      if (cfg?.model) { pool.push(cfg.model); }
+      if (cfg?.fallbackModel) { pool.push(cfg.fallbackModel); }
+    }
+    return [...new Set(pool)];
+  }
+
+  /**
+   * Assign a DISTINCT local model to each debate judge so the round-4 panel
+   * genuinely satisfies the "at least 5 agents of different models vote" rule,
+   * even when two roles share a primary model in config (e.g. critic and
+   * reviewer). Each judge keeps its role lens but borrows a still-unused model
+   * — its own primary first, then its fallback, then any other model in the
+   * roster — whenever the natural choice would collide with an earlier judge.
+   * Returns the assignment plus the count of distinct models actually achieved
+   * so the caller can surface a visible warning if the roster is too small.
+   */
+  private _assignDiversePanelModels(
+    panelRoles: AgentRole[]
+  ): { assignments: Map<AgentRole, { model: string; fallbackModel: string }>; distinctCount: number } {
+    const roster = this._modelRoster();
+    const used = new Set<string>();
+    const assignments = new Map<AgentRole, { model: string; fallbackModel: string }>();
+
+    for (const role of panelRoles) {
+      const cfg = this._agentConfig(role);
+      const candidates = [cfg.model, cfg.fallbackModel, ...roster].filter(Boolean) as string[];
+      const chosen = candidates.find(m => !used.has(m)) ?? cfg.model;
+      used.add(chosen);
+      // Prefer a fallback that differs from the chosen primary so a single
+      // unavailable model never collapses two judges onto the same backup.
+      const fallback =
+        [cfg.fallbackModel, cfg.model, ...roster].find(m => m && m !== chosen) ?? cfg.fallbackModel;
+      assignments.set(role, { model: chosen, fallbackModel: fallback });
+    }
+
+    return { assignments, distinctCount: used.size };
+  }
+
+  private _buildMessages(role: AgentRole, userContent: string, specialist?: AgentSpec | null): OllamaMessage[] {
     const { systemPrompt } = getAgentPrompt(role);
     return [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: specialist ? `${this._specialistFraming(specialist)}\n\n${systemPrompt}` : systemPrompt },
       { role: 'user',   content: buildUserMessage(userContent, role) },
     ];
   }
@@ -5293,8 +9231,8 @@ export class AgentOrchestrator {
    * `_contextBudget()` characters.  Uses `ContextCache.buildContext`
    * internally so the budget logic and middle-truncation are centralised.
    */
-  private _assembleContext(sections: ContextSection[]): string {
-    return this._contextCache.buildContext(sections, this._contextBudget());
+  private _assembleContext(sections: ContextSection[], budget = this._contextBudget()): string {
+    return this._contextCache.buildContext(sections, budget);
   }
 
   private async _callWithFallback(
@@ -5443,6 +9381,22 @@ export class AgentOrchestrator {
     };
   }
 
+  /**
+   * How many times a dynamic-team debate call retries against its OWN model
+   * (never a different participant's) before giving up. Reuses the existing
+   * selfHealing config so this isn't a new knob to learn. A real run once lost
+   * a fully-succeeding two-round debate to a single transient Ollama crash
+   * (llama-server process terminated) with zero retries — this closes that gap
+   * without weakening the "five genuinely distinct models" guarantee, since
+   * every retry targets the exact same model that was already assigned.
+   */
+  private _dynamicDebateRetryPolicy(): { retries: number; delayMs: number; shouldAbort: () => boolean } {
+    const healing = this._selfHealingConfig();
+    return healing.enabled
+      ? { retries: healing.modelCallRetries, delayMs: healing.retryDelayMs, shouldAbort: () => this._aborted }
+      : { retries: 0, delayMs: 0, shouldAbort: () => this._aborted };
+  }
+
   private _compactMessagesForRecovery(messages: OllamaMessage[], maxUserChars: number): OllamaMessage[] {
     return messages.map(message => {
       if (message.role !== 'user' || message.content.length <= maxUserChars) {
@@ -5470,6 +9424,7 @@ export class AgentOrchestrator {
       const excluded = new Set(excludedModels.map(model => this._normalizeModelName(model)));
       const models = await this.ollama.listModels();
       return models
+        .filter(isAutomaticTextModelCandidate)
         .filter(model => !excluded.has(this._normalizeModelName(model)))
         .slice(0, limit);
     } catch (err) {
@@ -5543,6 +9498,14 @@ export class AgentOrchestrator {
       summary: message,
     });
     logInfo(`Phase: ${phase} – ${message}`);
+    this.telegram.notify(`🔷 ${this._telegramGoalHeader(state)}${this._phaseTitle(phase)}: ${message}`);
+  }
+
+  /** Short "[goal] " prefix so a Telegram message stays legible if the boss runs more than one project. */
+  private _telegramGoalHeader(state: ProjectState): string {
+    const goal = (state.projectGoal || '').trim();
+    if (!goal) { return ''; }
+    return `[${goal.length > 60 ? `${goal.slice(0, 60)}…` : goal}]\n`;
   }
 
   private _createQuestion(
@@ -5565,7 +9528,22 @@ export class AgentOrchestrator {
   }
 
   private _maxDevelopmentSprints(): number {
-    return Math.max(1, Math.min(5, this.modelConfig.debateRounds || 3));
+    const configured = this.modelConfig.maxDevelopmentSprints ?? 5;
+    return Number.isFinite(configured) ? Math.max(1, Math.min(20, Math.floor(configured))) : 5;
+  }
+
+  private _sprintPlanningContext(state: ProjectState): string {
+    if ((state.developmentSprint ?? 1) <= 1) { return ''; }
+    const files = this.fileManager.listWorkspaceFiles('').filter(file =>
+      !file.startsWith('.agent-workspace/') && !file.startsWith('dist/')
+    );
+    return [
+      `This is implementation sprint ${state.developmentSprint}. A product already exists.`,
+      'Preserve working code and the chosen stack. Plan only the remaining requirements and verified defects below; do not scaffold the project again.',
+      `Current files:\n${files.slice(0, 150).join('\n')}`,
+      `Recent decisions and remaining work:\n${(this.workspace.readFile(this.workspace.rollingSummaryPath) ?? '').slice(-10_000)}`,
+      `Latest verification:\n${(this.workspace.readFile(this.workspace.testResultLogPath) ?? '').slice(-6_000)}`,
+    ].join('\n\n');
   }
 
   private _scopeTaskPlanForSprint(sprint: number): void {
@@ -5635,7 +9613,7 @@ export class AgentOrchestrator {
     const remainingWork = Array.isArray(value?.remainingWork)
       ? value.remainingWork.map(item => String(item).trim()).filter(Boolean).slice(0, 6)
       : [];
-    const readyToStop = Boolean(value?.readyToStop) && remainingWork.length === 0;
+    const readyToStop = value?.readyToStop === true && remainingWork.length === 0;
     return {
       agentRole: role,
       readyToStop,
@@ -5657,7 +9635,7 @@ export class AgentOrchestrator {
     const hasVerificationFailure = !hasExplicitPass && (
       /"passed"\s*:\s*false|"needsFix"\s*:\s*true|Project checks still fail|Exit:\s*[1-9]|Failed:/i.test(testerNote)
     );
-    const readyToStop = sprint > 1 && !hasFailedTasks && !hasVerificationFailure;
+    const readyToStop = sprint > 1 && hasExplicitPass && !hasFailedTasks && !hasVerificationFailure;
     return {
       agentRole: role,
       readyToStop,
@@ -5739,11 +9717,64 @@ export class AgentOrchestrator {
   }
 
   private _resumePhase(state: ProjectState): WorkflowPhase {
+    // Retrospectives reuse the brainstorm UI phase. Their durable checkpoint
+    // must not send resume back through the original debate or overwrite code.
+    if (state.sprintStage) { return state.sprintStage === 'retrospective' ? 'testing' : state.sprintStage; }
     if (state.currentPhase === 'reviewing') { return 'coding'; }
     if (state.currentPhase === 'fixing') {
       return state.currentTaskId ? 'coding' : 'testing';
     }
     return state.currentPhase;
+  }
+
+  private _briefIsPythonOnly(): boolean {
+    const raw = this.workspace.readFile(this.workspace.projectBriefPath);
+    if (!raw) { return false; }
+    const text = raw.toLowerCase();
+    return /\bpython\b/.test(text) && !/\b(javascript|typescript|node(\.js)?|npm|browser|html)\b/.test(text);
+  }
+
+  /**
+   * Remove changes that the baseline guard would reject (an existing file the
+   * agent "creates" without having read it, or a file changed since it was
+   * read), so one bad file no longer blocks the whole patch. A re-created file
+   * whose content is identical to the current file is a harmless no-op and is
+   * dropped silently. Returns the paths of the real conflicts.
+   */
+  private _dropConflictingChanges(task: TaskItem, output: CodeWorkerOutput, role: 'codeWorker' | 'fixer'): string[] {
+    const baseline = this._changeBaselines.get(output);
+    const conflicts: string[] = [];
+    const keep = output.files.filter(change => {
+      if (this.fileManager.detectConflictingChanges([change], baseline).length === 0) { return true; }
+      const normalized = this._normalizeRelativePath(change.path);
+      const current = this.fileManager.readWorkspaceFile(normalized);
+      if (change.action === 'create' && current !== null && typeof change.content === 'string' && change.content === current) {
+        return false; // identical re-creation: nothing to do
+      }
+      conflicts.push(normalized);
+      return false;
+    });
+    output.files = keep;
+    if (conflicts.length > 0) {
+      const detail = `Task ${task.id}: ignored ${role} change(s) to existing files it had not read or that changed since: ${conflicts.join(', ')}`;
+      this._emit('log', `${detail}; kept ${keep.length} other change(s).`, 'warn');
+      this.workspace.appendAssumption(role, `${detail}.`);
+    }
+    return conflicts;
+  }
+
+  /** Remove changes outside the task's allowedFiles from a fixer's output; returns their paths. */
+  private _dropOutOfScopeChanges(task: TaskItem, output: CodeWorkerOutput): string[] {
+    if (task.allowedFiles.length === 0) { return []; }
+    const dropped = output.files
+      .filter(change => !this._matchesAllowedPath(change.path, task.allowedFiles))
+      .map(change => change.path);
+    if (dropped.length === 0) { return []; }
+    output.files = output.files.filter(change => this._matchesAllowedPath(change.path, task.allowedFiles));
+    const detail = `Task ${task.id}: ignored fixer change(s) outside the task scope: ${dropped.join(', ')}`;
+    this._emit('log', `${detail}; kept ${output.files.length} in-scope change(s).`, 'warn');
+    this.workspace.appendAssumption('fixer', `${detail}.`);
+    return dropped;
   }
 
   private _validateTaskFileChanges(task: TaskItem, output: CodeWorkerOutput): string[] {
@@ -5758,13 +9789,56 @@ export class AgentOrchestrator {
     return errors;
   }
 
+  /**
+   * True for a NEW build manifest (Package.swift, Cargo.toml, go.mod, ...) whose
+   * stack the brief/prompt never asked for. Its existence alone makes the
+   * verification planner demand that stack's test command, so a model that
+   * invents one mid-fix creates a check the project can never pass. Existing
+   * files (e.g. a user's own repo) and runs without a parsed brief are trusted.
+   */
+  private _isOffStackToolchainMarker(filePath: string): boolean {
+    const stack = toolchainMarkerStack(filePath);
+    if (!stack) { return false; }
+    const normalized = this._normalizeRelativePath(filePath);
+    if (this.fileManager.fileExists(normalized)) { return false; }
+    const raw = this.workspace.readFile(this.workspace.projectBriefPath);
+    if (!raw) { return false; }
+    let brief: ProjectBrief;
+    try { brief = JSON.parse(raw) as ProjectBrief; } catch { return false; }
+    const list = (value: unknown): string => Array.isArray(value) ? `, ${value.map(String).join(', ')},` : '';
+    const stackText = [list(brief.chosenStack), list(brief.targetPlatforms), this.workspace.readUserPrompt()].join(' | ');
+    return !stackTextMentions(stack, stackText);
+  }
+
+  /** Drop off-stack toolchain manifests from a model's output before it is validated or applied. */
+  private _dropOffStackToolchainMarkers(task: TaskItem, output: CodeWorkerOutput, role: 'codeWorker' | 'fixer'): void {
+    const dropped = output.files
+      .filter(change => change.action !== 'delete' && this._isOffStackToolchainMarker(change.path))
+      .map(change => change.path);
+    if (dropped.length === 0) { return; }
+    output.files = output.files.filter(change => !dropped.includes(change.path));
+    const detail = `Task ${task.id}: ignored ${role} change(s) creating off-stack toolchain manifest(s): ${dropped.join(', ')}`;
+    this._emit('log', `${detail}.`, 'warn');
+    this.workspace.appendAssumption(role, `${detail}. They do not match the brief's chosen stack and would force an unrelated verification command.`);
+  }
+
   private _selfHealAllowedFiles(
     task: TaskItem,
     output: CodeWorkerOutput,
     role: 'codeWorker' | 'fixer'
   ): string[] {
+    this._dropOffStackToolchainMarkers(task, output, role);
     if (!this._selfHealingConfig().enabled || task.allowedFiles.length === 0) { return []; }
 
+    // Files another planned task owns are never self-healed into this task
+    // (benchmark run 10: part 2 of a split task absorbed part 1's files because
+    // its description names them). Synthesized tasks (test-fix-*) are not in the
+    // plan and may still reach any project file.
+    const plan = this._loadTaskPlan();
+    const ownedElsewhere = new Set(plan?.tasks.some(t => t.id === task.id)
+      ? plan.tasks.filter(t => t.id !== task.id)
+        .flatMap(t => t.allowedFiles.filter(f => !f.endsWith('/') && !f.includes('*')).map(f => this._normalizeRelativePath(f)))
+      : []);
     const added: string[] = [];
     for (const change of output.files) {
       if (path.isAbsolute(change.path) || path.win32.isAbsolute(change.path)) {
@@ -5773,6 +9847,7 @@ export class AgentOrchestrator {
       const normalized = this._normalizeRelativePath(change.path);
       if (
         this._matchesAllowedPath(normalized, task.allowedFiles) ||
+        ownedElsewhere.has(normalized) ||
         !this._isSelfHealSafeFileChange(task, normalized, change.action)
       ) {
         continue;
@@ -5891,25 +9966,86 @@ export class AgentOrchestrator {
     for (const resolver of this._pendingCommandResolvers.values()) {
       resolver(approved);
     }
+    for (const resolver of this._pendingRamOptimizationResolvers.values()) {
+      resolver(false);
+    }
     this._pendingPatchResolvers.clear();
     this._pendingCommandResolvers.clear();
+    this._pendingRamOptimizationResolvers.clear();
   }
 
+  /**
+   * The single, guaranteed place a top-level run failure is recorded. Every
+   * entry point (start/resume/runAutonomousGoal/designAndRunTeam) funnels its
+   * catch block here, including failures from pre-flight gates (resource
+   * check, model readiness, capability check) that fire BEFORE _runWorkflow
+   * — and therefore before its own try/catch — ever starts. Those used to
+   * reach the boss only via the transient onError callback and never appear
+   * in AGENT_JOURNAL.md at all, so a run that never got past a pre-flight
+   * gate left no durable record of why. Ensuring the journal file exists
+   * (even if some earlier step never got to call initializeJournal) and
+   * always appending exactly one entry here — instead of also journaling
+   * inside _runWorkflow's own catch, which would double up for the common
+   * case — makes the journal a complete log of the run regardless of which
+   * gate or phase ended it.
+   */
   private _handleTopLevelError(err: unknown): void {
+    if (!this.workspace.fileExists(this.workspace.journalPath)) {
+      this.workspace.initializeJournal(this.workspace.readUserPrompt());
+    }
     if (err instanceof UserAbortError) {
       this._emit('log', 'Workflow stopped by user.', 'warn');
+      this._journal('warn', 'Workflow stopped by user', undefined);
       this._updateTimeline('stopped', 'skipped');
+      return;
+    }
+    if (err instanceof InsufficientResourcesError) {
+      // Not a crash — an honest stop before any model call, because the host
+      // machine does not currently have enough headroom to run five local
+      // models sequentially without risking a mid-debate crash.
+      this._emit('error', `${err.message}\n\n${err.advisory}`);
+      this._journal('error', 'Workflow stopped: insufficient resources', `${err.message}\n\n${err.advisory}`);
+      this._persistFailedState();
+      this._updateTimeline('failed', 'failed');
+      return;
+    }
+    if (err instanceof MissingCapabilityError || err instanceof SelfWorkspaceGuardError) {
+      // Not a crash — an honest stop because the boss must supply something,
+      // or because the workspace itself is unsafe to build into.
+      this._emit('error', err.message);
+      this._journal('error', 'Workflow stopped: missing capability or unsafe workspace', err.message);
+      this._persistFailedState();
+      this._updateTimeline('failed', 'failed');
       return;
     }
     const msg = formatError(err);
     logError(`Workflow failed: ${msg}`);
     this._emit('error', `Workflow failed: ${msg}`);
-    const state = this.workspace.readProjectState();
-    state.status = 'failed';
-    state.currentPhase = 'failed';
-    this.workspace.writeProjectState(state);
-    this.callbacks.onStateUpdate?.(state);
+    this._journal('error', 'Workflow stopped with an error', msg);
+    this._persistFailedState();
     this._updateTimeline('failed', 'failed');
+  }
+
+  /**
+   * Record a failed run in project_state.json. Guarded on its own: a real run
+   * once hit a transient filesystem hiccup exactly here (an ENOENT on a
+   * cloud-synced workspace volume), which — unguarded — replaced the real
+   * failure with an uncaught crash and left project_state.json stuck showing
+   * "running" forever, hiding the actual failure from the UI. Losing this
+   * write is a shame, not a second failure: the boss already saw the real
+   * error via onError above.
+   */
+  private _persistFailedState(): void {
+    try {
+      const state = this.workspace.readProjectState();
+      state.status = 'failed';
+      // Preserve the failed phase so older runs without sprint checkpoints
+      // can still resume meaningfully and the UI shows where they stopped.
+      this.workspace.writeProjectState(state);
+      this.callbacks.onStateUpdate?.(state);
+    } catch (persistErr) {
+      logError(`Could not persist failed state to project_state.json: ${formatError(persistErr)}`);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -5967,7 +10103,64 @@ export class AgentOrchestrator {
         totalRounds: activity.totalRounds,
       },
     });
+    // Mirror every activity into the human-readable journal so the boss can
+    // follow the entire run chronologically.
+    const statusIcon: Record<string, string> = {
+      running: '▶️', completed: '✅', warn: '⚠️', failed: '❌',
+    };
+    const roundSuffix = activity.round && activity.totalRounds
+      ? ` (round ${activity.round}/${activity.totalRounds})`
+      : '';
+    const detail = [activity.detail, activity.files?.length ? `Files: ${activity.files.join(', ')}` : '']
+      .filter(Boolean).join('\n\n');
+    try {
+      this.workspace.appendJournal(
+        statusIcon[activity.status] ?? '•',
+        activity.agentRole ?? activity.phase,
+        `${activity.title}${roundSuffix}`,
+        detail
+      );
+    } catch { /* journaling must never break the workflow */ }
     this.callbacks.onActivityUpdate?.(this._activities);
+  }
+
+  /**
+   * Append a rich, human-readable entry to the run journal. Used for the
+   * narrative moments (thoughts, opinions, critiques, decisions, reports) that
+   * are not already captured as terse activities. Never throws.
+   */
+  private _journal(kind: string, title: string, body?: string): void {
+    const map: Record<string, { icon: string; author: string }> = {
+      start:      { icon: '🚀', author: 'system' },
+      phase:      { icon: '📍', author: 'system' },
+      brainstorm: { icon: '💡', author: 'brainstorm' },
+      critique:   { icon: '🔍', author: 'critic' },
+      product:    { icon: '🎨', author: 'secondBrainstorm' },
+      response:   { icon: '🗣️', author: 'brainstorm' },
+      decision:   { icon: '⚖️', author: 'debate-panel' },
+      brief:      { icon: '🧠', author: 'briefBuilder' },
+      architect:  { icon: '🏛️', author: 'architect' },
+      plan:       { icon: '📋', author: 'taskManager' },
+      code:       { icon: '⚙️', author: 'codeWorker' },
+      review:     { icon: '🔎', author: 'reviewer' },
+      audit:      { icon: '🕵️', author: 'quality-auditor' },
+      fix:        { icon: '🔧', author: 'fixer' },
+      test:       { icon: '🧪', author: 'tester' },
+      consensus:  { icon: '🤝', author: 'retrospective' },
+      report:     { icon: '📊', author: 'finalIntegrator' },
+      done:       { icon: '✅', author: 'system' },
+      warn:       { icon: '⚠️', author: 'quality-auditor' },
+      error:      { icon: '❌', author: 'system' },
+      waiting:    { icon: '⏳', author: 'system' },
+      research:   { icon: '🌐', author: 'researcher' },
+      github:     { icon: '🐙', author: 'researcher' },
+      spawn:      { icon: '🧬', author: 'meta-agent' },
+      team:       { icon: '👥', author: 'dynamic-team' },
+    };
+    const meta = map[kind] ?? { icon: '📝', author: 'agent' };
+    try {
+      this.workspace.appendJournal(meta.icon, meta.author, title, body);
+    } catch { /* journaling must never break the workflow */ }
   }
 
   private _agentRoleForPhase(phase: WorkflowPhase): AgentRole | undefined {
@@ -6018,6 +10211,7 @@ export class AgentOrchestrator {
       this.callbacks.onLog?.(a, (b as 'info' | 'warn' | 'error') ?? 'info');
     } else if (type === 'error') {
       this.callbacks.onError?.(a);
+      this.telegram.notify(`❌ ${a}`);
     } else {
       this.callbacks.onLog?.(a, 'info');
     }

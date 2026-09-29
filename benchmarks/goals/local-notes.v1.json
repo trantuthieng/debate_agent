@@ -1,0 +1,15 @@
+{
+  "id": "local-notes",
+  "version": 1,
+  "goal": "Build a polished static browser notes app for personal use, with no backend or external service dependency. Users can create a note with a required nonblank title and optional body, edit it, delete it after confirmation, and search titles and bodies case-insensitively. Persist notes in localStorage across reloads. Show useful empty, validation, and storage-error states. Render user text safely as text. Support keyboard and pointer/touch use on desktop and mobile. Deliver a README with an exact local serving command and meaningful automated tests covering CRUD, search, persistence, and invalid storage. The app must run from a clean copy with only documented dependencies.",
+  "requirements": [
+    {"id": "N01", "behavior": "Create two distinct notes; both visible with exact entered title/body; whitespace-only title rejected without mutation."},
+    {"id": "N02", "behavior": "Edit one note, preserve the other, reload, and verify edited content and identities remain correct."},
+    {"id": "N03", "behavior": "Cancel deletion leaves state unchanged; confirm deletion removes only the chosen note and persists after reload."},
+    {"id": "N04", "behavior": "Search finds title/body matches regardless of case; no-match state clear; clearing search restores all remaining notes."},
+    {"id": "N05", "behavior": "New empty store has a useful empty state; corrupt stored JSON and denied/quota-exceeded writes produce a visible recoverable error without crashing or reporting a false save."},
+    {"id": "N06", "behavior": "HTML-looking user input remains text and executes no script or event handler after save/reload."},
+    {"id": "N07", "behavior": "Keyboard and pointer can complete CRUD/search; labels and focus usable; desktop/mobile controls not clipped."},
+    {"id": "N08", "behavior": "Documented install/serve/test commands work in a clean copy; tests execute assertions, and an intentionally broken persistence fixture is detected."}
+  ]
+}

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { PanelProvider } from './webview/PanelProvider';
 import { initLogger } from './utils/logging';
+import { loadEnvFile } from './utils/loadEnvFile';
 
 // Extension activation entry point
 export function activate(context: vscode.ExtensionContext): void {
@@ -9,6 +10,10 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(outputChannel);
 
   const workspaceRoot = getWorkspaceRoot();
+  // A GUI-launched VS Code often does not inherit the boss's shell env (e.g.
+  // TELEGRAM_BOT_TOKEN exported in ~/.zshrc), so fill in from a project-root
+  // .env file when present — a real shell-exported var always wins.
+  if (workspaceRoot) { loadEnvFile(path.join(workspaceRoot, '.env')); }
   const initialLogPath = getInitialLogPath(workspaceRoot);
   initLogger(outputChannel, initialLogPath);
 
@@ -61,10 +66,13 @@ function registerCommands(context: vscode.ExtensionContext, panelProvider: Panel
   const commands: Array<[string, () => void | Promise<void>]> = [
     ['localMultiAgentCoder.openPanel', () => panelProvider.openPanel()],
     ['localMultiAgentCoder.startNewProject', () => panelProvider.startNewProject()],
+    ['localMultiAgentCoder.designAgentTeam', () => panelProvider.designAgentTeam()],
+    ['localMultiAgentCoder.runAutonomousGoal', () => panelProvider.runAutonomousGoal()],
     ['localMultiAgentCoder.resumeWorkflow', () => panelProvider.resumeWorkflow()],
     ['localMultiAgentCoder.stopWorkflow', () => panelProvider.stopWorkflow()],
     ['localMultiAgentCoder.showAgentNotes', () => panelProvider.showAgentNotes()],
     ['localMultiAgentCoder.openSettingsFile', () => panelProvider.openSettingsFile()],
+    ['localMultiAgentCoder.configureYouTube', () => panelProvider.configureYouTubeConnector()],
   ];
 
   for (const [id, handler] of commands) {

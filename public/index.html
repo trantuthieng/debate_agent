@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hội đồng AI</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Hội đồng AI</h1>
+    <div class="topbar-actions">
+      <span id="connStatus" class="conn-status" title="Trạng thái kết nối">●</span>
+      <button id="settingsBtn" class="icon-btn" aria-label="Cài đặt" title="Cài đặt">⚙️</button>
+    </div>
+  </header>
+
+  <main id="chat" class="chat" aria-live="polite"></main>
+
+  <section id="logPanel" class="log-panel" aria-label="Nhật ký tiến trình">
+    <div class="log-toolbar">
+      <div class="log-title">
+        <span class="log-dot"></span>
+        <span>Process log</span>
+      </div>
+      <div class="log-actions">
+        <button id="toggleLogBtn" type="button" class="log-btn" aria-label="Thu gọn log" title="Thu gọn log">▾</button>
+        <button id="clearLogBtn" type="button" class="log-btn" aria-label="Xóa log" title="Xóa log">Clear</button>
+      </div>
+    </div>
+    <pre id="logOutput" class="log-output" aria-live="polite"></pre>
+  </section>
+
+  <form id="composer" class="composer">
+    <textarea id="question" rows="1" placeholder="Hỏi hội đồng AI... (vd: Có nên mua iPhone 18 không?)" required></textarea>
+    <button id="sendBtn" type="submit">Gửi</button>
+  </form>
+
+  <div id="settingsOverlay" class="overlay" hidden>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="sheet-header">
+        <h2 id="settingsTitle">Cài đặt tranh luận</h2>
+        <button id="closeSettingsBtn" class="icon-btn" aria-label="Đóng">✕</button>
+      </div>
+
+      <label class="field">
+        <span>Số vòng tranh luận: <b id="roundsValue">2</b></span>
+        <input id="roundsInput" type="range" min="1" max="6" step="1" value="2">
+        <span class="field-hint">1 = mỗi agent trả lời song song rồi tổng hợp ngay (nhanh nhất). Nhiều hơn = các agent đọc ý kiến của nhau và tranh luận thêm.</span>
+      </label>
+
+      <label class="field">
+        <span>Số AI Agent: <b id="agentCountValue">5</b></span>
+        <input id="agentCountInput" type="range" min="3" max="8" step="1" value="5">
+        <span class="field-hint" id="agentCountHint">Cần model local riêng biệt cho mỗi agent.</span>
+      </label>
+
+      <label class="field field-row">
+        <span>Tìm kiếm thông tin trên Internet</span>
+        <input id="webSearchInput" type="checkbox" checked>
+      </label>
+
+      <div id="settingsError" class="settings-error" hidden></div>
+
+      <button id="saveSettingsBtn" type="button" class="primary-btn">Lưu cài đặt</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

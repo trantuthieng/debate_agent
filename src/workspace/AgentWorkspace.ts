@@ -3,6 +3,8 @@ import * as path from 'path';
 import type { ModelConfig, ProjectState, StructuredMemoryEvent } from '../types';
 import { prettyJson } from '../utils/json';
 import { logInfo } from '../utils/logging';
+import { withFsRetry } from '../utils/atomicFile';
+import { FileManager } from './FileManager';
 
 // -----------------------------------------------------------------------
 // Default model configuration
@@ -14,13 +16,17 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
   autonomousMode: true,
   askPolicy: 'never',
   debateRounds: 3,
+  maxDevelopmentSprints: 5,
   maxFixRetries: 8,
   autoInstallDependencies: true,
+  perTaskVerification: true,
   artifactDir: 'dist',
   createFinalArchive: true,
   requireVerificationScripts: true,
+  allowSelfWorkspace: false,
   selfHealing: {
     enabled: true,
+    allowProductTemplates: false,
     modelCallRetries: 2,
     retryDelayMs: 5_000,
     alternateModelLimit: 3,
@@ -44,15 +50,29 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
       'typescriptlang.org',
     ],
   },
+  assetLibrary: {
+    enabled: false,
+    maxResults: 8,
+    maxBytes: 5_000_000,
+    allowedLicenses: ['cc0', 'pdm', 'by', 'by-sa'],
+  },
+  resourceGuard: {
+    enabled: true,
+    minFreeMemoryPercent: 10,
+    topProcessCount: 5,
+    // Optional app-closing flow; normal runs rely on the OS pressure guard.
+    targetFreeGb: 0,
+  },
   appVerification: {
     enabled: true,
     startServer: true,
     httpSmokeTest: true,
-    browserSmokeTest: false,
+    browserSmokeTest: true,
   },
   githubIntegration: {
     enabled: true,
     preferGhCli: true,
+    allowExternalRepoReads: false,
   },
   skills: {
     enabled: true,
@@ -73,8 +93,8 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
       fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
     brainstorm: {
-      model: 'qwen3-coder:30b',
-      fallbackModel: 'devstral-small-2',
+      model: 'devstral-small-2',
+      fallbackModel: 'mistral-small3.2:24b',
     },
     critic: {
       model: 'deepseek-coder-v2:16b',
@@ -86,15 +106,15 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
     },
     architect: {
       model: 'devstral-small-2',
-      fallbackModel: 'qwen3-coder:30b',
+      fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
     taskManager: {
-      model: 'devstral-small-2',
-      fallbackModel: 'qwen2.5-coder:14b-instruct',
+      model: 'qwen2.5-coder:14b-instruct',
+      fallbackModel: 'gemma3:12b',
     },
     codeWorker: {
-      model: 'devstral-small-2',
-      fallbackModel: 'qwen2.5-coder:14b-instruct',
+      model: 'qwen2.5-coder:14b-instruct',
+      fallbackModel: 'devstral-small-2',
     },
     reviewer: {
       model: 'deepseek-coder-v2:16b',
@@ -105,12 +125,12 @@ const DEFAULT_MODEL_CONFIG: ModelConfig = {
       fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
     fixer: {
-      model: 'devstral-small-2',
-      fallbackModel: 'qwen2.5-coder:14b-instruct',
+      model: 'qwen2.5-coder:14b-instruct',
+      fallbackModel: 'devstral-small-2',
     },
     finalIntegrator: {
       model: 'devstral-small-2',
-      fallbackModel: 'qwen3-coder:30b',
+      fallbackModel: 'qwen2.5-coder:14b-instruct',
     },
   },
 };
@@ -141,12 +161,14 @@ function createDefaultProjectState(): ProjectState {
 // AgentWorkspace: manages the .agent-workspace/ folder structure
 // -----------------------------------------------------------------------
 export class AgentWorkspace {
+  private readonly fileManager: FileManager;
   readonly rootDir: string;       // Workspace root (e.g. /home/user/myproject)
   readonly agentDir: string;      // .agent-workspace/
 
   constructor(workspaceRoot: string) {
-    this.rootDir = workspaceRoot;
-    this.agentDir = path.join(workspaceRoot, '.agent-workspace');
+    this.rootDir = path.resolve(workspaceRoot);
+    this.agentDir = path.join(this.rootDir, '.agent-workspace');
+    this.fileManager = new FileManager(workspaceRoot);
   }
 
   // ------------------------------------------------------------------
@@ -156,6 +178,7 @@ export class AgentWorkspace {
   get projectStatePath(): string   { return path.join(this.agentDir, 'project_state.json'); }
   get userPromptPath(): string     { return path.join(this.agentDir, 'user_prompt.md'); }
   get modelConfigPath(): string    { return path.join(this.agentDir, 'model_config.json'); }
+  get runLockPath(): string        { return path.join(this.agentDir, 'run.lock'); }
 
   get memoryDir(): string          { return path.join(this.agentDir, 'memory'); }
   get rollingSummaryPath(): string { return path.join(this.memoryDir, 'rolling_summary.md'); }
@@ -175,6 +198,8 @@ export class AgentWorkspace {
   get taskResultsPath(): string    { return path.join(this.tasksDir, 'task_results.json'); }
 
   get ollamaCallsLogPath(): string { return path.join(this.logsDir, 'ollama_calls.jsonl'); }
+  get modelReadinessPath(): string { return path.join(this.logsDir, 'model_readiness.json'); }
+  get verificationPlanPath(): string { return path.join(this.logsDir, 'verification_plan.json'); }
   get terminalLogPath(): string    { return path.join(this.logsDir, 'terminal.log'); }
   get testResultLogPath(): string  { return path.join(this.logsDir, 'test_result.log'); }
   get dependencyInstallLogPath(): string { return path.join(this.logsDir, 'dependency_install.log'); }
@@ -182,11 +207,20 @@ export class AgentWorkspace {
 
   agentNotePath(filename: string): string { return path.join(this.agentsDir, filename); }
 
+  /**
+   * Human-readable, chronological journal of the whole run. This is the main
+   * communication channel between the boss and the agents: every thought,
+   * opinion, critique, planned task, and progress report is appended here with a
+   * timestamp and an icon. Lives at the workspace root so it is easy to open.
+   */
+  get journalPath(): string { return path.join(this.rootDir, 'AGENT_JOURNAL.md'); }
+
   // Agent note filenames
   get brainstormPath(): string      { return this.agentNotePath('01_brainstorm.md'); }
   get criticPath(): string          { return this.agentNotePath('02_critic.md'); }
   get secondBrainstormPath(): string{ return this.agentNotePath('03_second_brainstorm.md'); }
   get projectBriefPath(): string    { return this.agentNotePath('00_project_brief.json'); }
+  get acceptanceContractPath(): string { return this.agentNotePath('00_acceptance_contract.json'); }
   get toolchainReportPath(): string { return this.agentNotePath('00_toolchain_report.json'); }
   get gitSnapshotPath(): string     { return this.agentNotePath('00_git_snapshot.json'); }
   get githubContextPath(): string   { return this.agentNotePath('00_github_context.json'); }
@@ -225,24 +259,21 @@ export class AgentWorkspace {
     ];
 
     for (const dir of dirs) {
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-        logInfo(`Created directory: ${dir}`);
-      }
+      withFsRetry(() => this.fileManager.ensureDirectory(dir));
     }
 
     // Create default model_config.json only if it doesn't exist
-    if (!fs.existsSync(this.modelConfigPath)) {
-      fs.writeFileSync(this.modelConfigPath, prettyJson(DEFAULT_MODEL_CONFIG), 'utf8');
+    if (!this.fileExists(this.modelConfigPath)) {
+      this.writeFile(this.modelConfigPath, prettyJson(DEFAULT_MODEL_CONFIG));
       logInfo('Created default model_config.json');
     } else {
-      fs.writeFileSync(this.modelConfigPath, prettyJson(this.readModelConfig()), 'utf8');
+      this.writeFile(this.modelConfigPath, prettyJson(this.readModelConfig()));
       logInfo('Updated model_config.json with current defaults');
     }
 
     // Create default project_state.json only if it doesn't exist
-    if (!fs.existsSync(this.projectStatePath)) {
-      fs.writeFileSync(this.projectStatePath, prettyJson(createDefaultProjectState()), 'utf8');
+    if (!this.fileExists(this.projectStatePath)) {
+      this.writeFile(this.projectStatePath, prettyJson(createDefaultProjectState()));
       logInfo('Created default project_state.json');
     }
 
@@ -256,8 +287,8 @@ export class AgentWorkspace {
     ];
 
     for (const [filePath, content] of memoryFiles) {
-      if (!fs.existsSync(filePath)) {
-        fs.writeFileSync(filePath, content, 'utf8');
+      if (!this.fileExists(filePath)) {
+        this.writeFile(filePath, content);
       }
     }
 
@@ -269,11 +300,11 @@ export class AgentWorkspace {
   // ------------------------------------------------------------------
 
   readProjectState(): ProjectState {
-    if (!fs.existsSync(this.projectStatePath)) {
+    if (!this.fileExists(this.projectStatePath)) {
       return createDefaultProjectState();
     }
     try {
-      const raw = fs.readFileSync(this.projectStatePath, 'utf8');
+      const raw = this.readFile(this.projectStatePath) ?? '';
       return JSON.parse(raw) as ProjectState;
     } catch {
       return createDefaultProjectState();
@@ -282,7 +313,7 @@ export class AgentWorkspace {
 
   writeProjectState(state: ProjectState): void {
     state.updatedAt = new Date().toISOString();
-    fs.writeFileSync(this.projectStatePath, prettyJson(state), 'utf8');
+    this.writeFile(this.projectStatePath, prettyJson(state));
   }
 
   // ------------------------------------------------------------------
@@ -290,48 +321,56 @@ export class AgentWorkspace {
   // ------------------------------------------------------------------
 
   readModelConfig(): ModelConfig {
-    if (!fs.existsSync(this.modelConfigPath)) {
-      return DEFAULT_MODEL_CONFIG;
+    const defaults = JSON.parse(JSON.stringify(DEFAULT_MODEL_CONFIG)) as ModelConfig;
+    if (!this.fileExists(this.modelConfigPath)) {
+      return defaults;
     }
     try {
-      const raw = fs.readFileSync(this.modelConfigPath, 'utf8');
+      const raw = this.readFile(this.modelConfigPath) ?? '';
       const parsed = JSON.parse(raw) as Partial<ModelConfig>;
       // Merge with defaults so new fields are always present
       const merged: ModelConfig = {
-        ...DEFAULT_MODEL_CONFIG,
+        ...defaults,
         ...parsed,
-        agents: { ...DEFAULT_MODEL_CONFIG.agents, ...(parsed.agents ?? {}) },
-        selfHealing: { ...DEFAULT_MODEL_CONFIG.selfHealing, ...(parsed.selfHealing ?? {}) },
-        commandPolicy: { ...DEFAULT_MODEL_CONFIG.commandPolicy, ...(parsed.commandPolicy ?? {}) },
-        webSearch: { ...DEFAULT_MODEL_CONFIG.webSearch, ...(parsed.webSearch ?? {}) },
-        appVerification: { ...DEFAULT_MODEL_CONFIG.appVerification, ...(parsed.appVerification ?? {}) },
-        githubIntegration: { ...DEFAULT_MODEL_CONFIG.githubIntegration, ...(parsed.githubIntegration ?? {}) },
-        skills: { ...DEFAULT_MODEL_CONFIG.skills, ...(parsed.skills ?? {}) },
-        toolCalling: { ...DEFAULT_MODEL_CONFIG.toolCalling, ...(parsed.toolCalling ?? {}) },
-        defaultOptions: { ...DEFAULT_MODEL_CONFIG.defaultOptions, ...(parsed.defaultOptions ?? {}) },
+        agents: { ...defaults.agents, ...(parsed.agents ?? {}) },
+        selfHealing: { ...defaults.selfHealing, ...(parsed.selfHealing ?? {}) },
+        commandPolicy: { ...defaults.commandPolicy, ...(parsed.commandPolicy ?? {}) },
+        webSearch: { ...defaults.webSearch, ...(parsed.webSearch ?? {}) },
+        assetLibrary: { ...defaults.assetLibrary, ...(parsed.assetLibrary ?? {}) },
+        resourceGuard: { ...defaults.resourceGuard, ...(parsed.resourceGuard ?? {}) },
+        appVerification: { ...defaults.appVerification, ...(parsed.appVerification ?? {}) },
+        githubIntegration: { ...defaults.githubIntegration, ...(parsed.githubIntegration ?? {}) },
+        skills: { ...defaults.skills, ...(parsed.skills ?? {}) },
+        toolCalling: { ...defaults.toolCalling, ...(parsed.toolCalling ?? {}) },
+        defaultOptions: { ...defaults.defaultOptions, ...(parsed.defaultOptions ?? {}) },
       };
-      merged.debateRounds = Math.max(1, Math.min(10, Number(merged.debateRounds) || DEFAULT_MODEL_CONFIG.debateRounds));
+      merged.debateRounds = Math.max(1, Math.min(10, Number(merged.debateRounds) || defaults.debateRounds));
+      merged.maxDevelopmentSprints = Math.max(1, Math.min(20, Number(merged.maxDevelopmentSprints) || defaults.maxDevelopmentSprints || 5));
       const maxFixRetries = Number(merged.maxFixRetries);
       const requestTimeoutMs = Number(merged.requestTimeoutMs);
       const modelCallRetries = Number(merged.selfHealing.modelCallRetries);
       const retryDelayMs = Number(merged.selfHealing.retryDelayMs);
       const alternateModelLimit = Number(merged.selfHealing.alternateModelLimit);
       const compactContextChars = Number(merged.selfHealing.compactContextChars);
-      merged.maxFixRetries = Number.isFinite(maxFixRetries) ? Math.max(0, Math.min(20, maxFixRetries)) : DEFAULT_MODEL_CONFIG.maxFixRetries;
-      merged.requestTimeoutMs = Number.isFinite(requestTimeoutMs) ? Math.max(30_000, requestTimeoutMs) : DEFAULT_MODEL_CONFIG.requestTimeoutMs;
-      merged.selfHealing.modelCallRetries = Number.isFinite(modelCallRetries) ? Math.max(0, Math.min(5, modelCallRetries)) : DEFAULT_MODEL_CONFIG.selfHealing.modelCallRetries;
-      merged.selfHealing.retryDelayMs = Number.isFinite(retryDelayMs) ? Math.max(0, retryDelayMs) : DEFAULT_MODEL_CONFIG.selfHealing.retryDelayMs;
-      merged.selfHealing.alternateModelLimit = Number.isFinite(alternateModelLimit) ? Math.max(0, Math.min(10, alternateModelLimit)) : DEFAULT_MODEL_CONFIG.selfHealing.alternateModelLimit;
-      merged.selfHealing.compactContextChars = Number.isFinite(compactContextChars) ? Math.max(2_000, compactContextChars) : DEFAULT_MODEL_CONFIG.selfHealing.compactContextChars;
-      merged.webSearch!.maxResults = Math.max(1, Math.min(10, Number(merged.webSearch!.maxResults) || DEFAULT_MODEL_CONFIG.webSearch!.maxResults));
-      merged.toolCalling!.maxToolRounds = Math.max(1, Math.min(12, Number(merged.toolCalling!.maxToolRounds) || DEFAULT_MODEL_CONFIG.toolCalling!.maxToolRounds));
+      merged.maxFixRetries = Number.isFinite(maxFixRetries) ? Math.max(0, Math.min(20, maxFixRetries)) : defaults.maxFixRetries;
+      merged.requestTimeoutMs = Number.isFinite(requestTimeoutMs) ? Math.max(30_000, requestTimeoutMs) : defaults.requestTimeoutMs;
+      merged.selfHealing.modelCallRetries = Number.isFinite(modelCallRetries) ? Math.max(0, Math.min(5, modelCallRetries)) : defaults.selfHealing.modelCallRetries;
+      merged.selfHealing.retryDelayMs = Number.isFinite(retryDelayMs) ? Math.max(0, retryDelayMs) : defaults.selfHealing.retryDelayMs;
+      merged.selfHealing.alternateModelLimit = Number.isFinite(alternateModelLimit) ? Math.max(0, Math.min(10, alternateModelLimit)) : defaults.selfHealing.alternateModelLimit;
+      merged.selfHealing.compactContextChars = Number.isFinite(compactContextChars) ? Math.max(2_000, compactContextChars) : defaults.selfHealing.compactContextChars;
+      merged.webSearch!.maxResults = Math.max(1, Math.min(10, Number(merged.webSearch!.maxResults) || defaults.webSearch!.maxResults));
+      merged.assetLibrary!.maxResults = Math.max(1, Math.min(20, Number(merged.assetLibrary!.maxResults) || defaults.assetLibrary!.maxResults));
+      merged.assetLibrary!.maxBytes = Math.max(1, Math.min(10_000_000, Number(merged.assetLibrary!.maxBytes) || defaults.assetLibrary!.maxBytes));
+      merged.resourceGuard!.minFreeMemoryPercent = Math.max(0, Math.min(90, Number(merged.resourceGuard!.minFreeMemoryPercent) || defaults.resourceGuard!.minFreeMemoryPercent));
+      merged.resourceGuard!.topProcessCount = Math.max(1, Math.min(20, Number(merged.resourceGuard!.topProcessCount) || defaults.resourceGuard!.topProcessCount));
+      merged.toolCalling!.maxToolRounds = Math.max(1, Math.min(12, Number(merged.toolCalling!.maxToolRounds) || defaults.toolCalling!.maxToolRounds));
       if (merged.autonomousMode || merged.askPolicy === 'never') {
         merged.safeMode = false;
         merged.askPolicy = 'never';
       }
       return merged;
     } catch {
-      return DEFAULT_MODEL_CONFIG;
+      return defaults;
     }
   }
 
@@ -340,24 +379,24 @@ export class AgentWorkspace {
   // ------------------------------------------------------------------
 
   readFile(filePath: string): string | null {
-    if (!fs.existsSync(filePath)) { return null; }
-    try { return fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+    return this.fileManager.readWorkspaceFile(filePath);
   }
 
   writeFile(filePath: string, content: string): void {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
-    fs.writeFileSync(filePath, content, 'utf8');
+    withFsRetry(() => this.fileManager.writeWorkspaceFileAtomic(filePath, content));
   }
 
   appendFile(filePath: string, content: string): void {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
-    fs.appendFileSync(filePath, content, 'utf8');
+    withFsRetry(() => this.fileManager.appendWorkspaceFile(filePath, content));
   }
 
   fileExists(filePath: string): boolean {
-    return fs.existsSync(filePath);
+    return this.fileManager.fileExists(filePath);
+  }
+
+  /** Best-effort delete — a checkpoint superseded by a completed artifact is not worth failing the run over. */
+  deleteFile(filePath: string): void {
+    try { this.fileManager.deleteWorkspaceFile(filePath); } catch { /* rejected unsafe path or already gone */ }
   }
 
   /**
@@ -381,6 +420,43 @@ export class AgentWorkspace {
   appendRollingSummary(entry: string): void {
     const line = `\n## ${new Date().toISOString()}\n\n${entry}\n`;
     this.appendFile(this.rollingSummaryPath, line);
+  }
+
+  /**
+   * Append one timestamped, icon-prefixed entry to the run journal (AGENT_JOURNAL.md).
+   * Always appends to the bottom so the file reads top-to-bottom in chronological
+   * order. `icon` should be a short emoji; `author` is the agent/phase speaking;
+   * `body` may be multi-line markdown.
+   */
+  appendJournal(icon: string, author: string, title: string, body?: string): void {
+    const time = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+    let entry = `\n### ${icon} ${title}\n`;
+    entry += `\`${time}\` · **${author}**\n`;
+    if (body && body.trim()) {
+      entry += `\n${body.trim()}\n`;
+    }
+    this.appendFile(this.journalPath, entry);
+  }
+
+  /**
+   * Create the journal header once at the start of a run (idempotent per run is
+   * handled by the caller; this always (re)writes the top banner via append only
+   * when the file does not yet exist).
+   */
+  initializeJournal(goal: string): void {
+    if (this.fileExists(this.journalPath)) {
+      this.appendJournal('🔄', 'system', 'Workflow resumed / new session', goal ? `Goal: ${goal}` : undefined);
+      return;
+    }
+    const header =
+      `# 🤖 Agent Work Journal\n\n` +
+      `> This file is the live communication channel between the boss and the agents.\n` +
+      `> Every thought, opinion, critique, planned task, and progress report is logged below in\n` +
+      `> chronological order (newest at the bottom). Generated automatically — safe to read anytime.\n\n` +
+      `**Goal:** ${goal || '(not yet defined)'}\n\n` +
+      `**Started:** ${new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC')}\n\n` +
+      `---\n`;
+    this.appendFile(this.journalPath, header);
   }
 
   /**
@@ -429,7 +505,7 @@ export class AgentWorkspace {
    * List all files in a directory (relative paths from workspace root).
    */
   listDir(dirPath: string): string[] {
-    if (!fs.existsSync(dirPath)) { return []; }
+    if (!this.fileExists(dirPath)) { return []; }
     try {
       return fs.readdirSync(dirPath).map(f => path.join(dirPath, f));
     } catch { return []; }
