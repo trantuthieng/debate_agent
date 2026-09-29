@@ -326,6 +326,8 @@ export interface ProjectState {
   autonomousStage?: 'debate' | 'build';
   developmentSprint?: number;
   sprintStage?: 'architecture' | 'task_planning' | 'coding' | 'dependency_install' | 'testing' | 'retrospective';
+  /** SHA-256 of the locked acceptance contract; a changed file is not trusted. */
+  acceptanceContractSha256?: string;
 }
 
 // ----- Tasks -----
@@ -395,6 +397,8 @@ export interface ProjectBrief {
   deliveryArtifacts: string[];
   buildAndRunCommands: string[];
   verificationCommands: string[];
+  /** The locked browser acceptance walk-through, one line per step (set after briefing). */
+  acceptanceWalkthrough?: string[];
 }
 
 // ----- Toolchain / Delivery -----

@@ -60,6 +60,12 @@ export interface PageDriver {
   press(key: string, holdMs?: number): Promise<void>;
   /** Clicks at page coordinates. */
   click(x: number, y: number): Promise<void>;
+  /** Inserts text at the focused element as trusted input (IME-style commit, any characters). */
+  type(text: string): Promise<void>;
+  /** Reloads the page and waits for its load event (persistence checks). */
+  reload(): Promise<void>;
+  /** How later alert/confirm/prompt dialogs are answered (default: accept). */
+  setDialogResponse(accept: boolean): void;
   wait(ms: number): Promise<void>;
   /** Saves a screenshot under .agent-workspace/logs and returns its path. */
   screenshot(name: string): Promise<string>;
@@ -117,6 +123,7 @@ export class BrowserSmokeService {
     let browserLogs = '';
     let sessionId = '';
     let loaded = false;
+    let acceptDialogs = true;
     const errors = new Set<string>();
     const pending = new Map<number, {
       resolve: (value: ProtocolData) => void;
@@ -156,6 +163,10 @@ export class BrowserSmokeService {
         if (message.sessionId !== sessionId) { continue; }
         const params = message.params ?? {};
         if (message.method === 'Page.loadEventFired') { loaded = true; }
+        // An unanswered confirm() freezes the page; answer as the script chose.
+        if (message.method === 'Page.javascriptDialogOpening') {
+          call('Page.handleJavaScriptDialog', { accept: acceptDialogs }, sessionId).catch(() => { /* the page may have closed */ });
+        }
         if (message.method === 'Runtime.exceptionThrown') {
           const details = params.exceptionDetails ?? {};
           errors.add(`JavaScript exception: ${details.exception?.description ?? details.text ?? 'unknown exception'}${exceptionLocation(details)}`);
@@ -246,6 +257,16 @@ export class BrowserSmokeService {
               await call('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 }, sessionId);
             }
           },
+          type: async text => { await call('Input.insertText', { text }, sessionId); },
+          reload: async () => {
+            loaded = false;
+            await call('Page.reload', { ignoreCache: false }, sessionId);
+            const reloadDeadline = Date.now() + 15_000;
+            while (!loaded && Date.now() < reloadDeadline && !processError) { await sleep(100); }
+            if (!loaded) { throw new Error('Page did not finish reloading within 15 seconds.'); }
+            await sleep(500);
+          },
+          setDialogResponse: accept => { acceptDialogs = accept; },
           wait: sleep,
           screenshot: name => capture(`acceptance-${name.replace(/[^\w-]/g, '_')}`),
         };

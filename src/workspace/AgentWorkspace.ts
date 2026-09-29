@@ -220,6 +220,7 @@ export class AgentWorkspace {
   get criticPath(): string          { return this.agentNotePath('02_critic.md'); }
   get secondBrainstormPath(): string{ return this.agentNotePath('03_second_brainstorm.md'); }
   get projectBriefPath(): string    { return this.agentNotePath('00_project_brief.json'); }
+  get acceptanceContractPath(): string { return this.agentNotePath('00_acceptance_contract.json'); }
   get toolchainReportPath(): string { return this.agentNotePath('00_toolchain_report.json'); }
   get gitSnapshotPath(): string     { return this.agentNotePath('00_git_snapshot.json'); }
   get githubContextPath(): string   { return this.agentNotePath('00_github_context.json'); }

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { builtinModules } from 'module';
+import { createHash } from 'crypto';
 import type {
   AgentRole,
   AgentActivity,
@@ -46,6 +47,7 @@ import { TelegramNotifierService } from '../services/telegramNotifierService';
 import { SearchService } from '../services/searchService';
 import { PatchService } from '../services/patchService';
 import { AppVerificationService } from '../services/appVerificationService';
+import { parseAcceptanceContract, describeAcceptanceContract, acceptanceContractInteraction, type AcceptanceContract } from '../services/acceptanceContract';
 import { GitHubIntegrationService } from '../services/githubIntegrationService';
 import { PlanController } from '../services/planController';
 import { SkillManager } from '../services/skillManager';
@@ -993,6 +995,8 @@ export class AgentOrchestrator {
       if (!this._phaseAlreadyDone(phase, 'briefing', completedPhases)) {
         await this._phaseBriefing(state);
       }
+      // Focused maintenance keeps its existing checks; new products get a locked walk-through.
+      if (!route.skipDebate) { await this._phaseAcceptanceContract(state); }
       if (!this._phaseAlreadyDone(phase, 'toolchain_discovery', completedPhases)) {
         await this._phaseToolchainDiscovery(state);
       }
@@ -1167,6 +1171,108 @@ export class AgentOrchestrator {
 
     this._updateTimeline('briefing', 'completed');
     this._emit('log', 'Autonomous project brief complete.', 'info');
+  }
+
+  /**
+   * Lock a browser acceptance walk-through before any code exists (ECC
+   * generator/evaluator split): planners write it from the brief, coders build
+   * to it, and the final checks replay it. Coders cannot edit it, so a product
+   * cannot pass by weakening its own test. Failure to write a valid contract
+   * is not fatal; the run then relies on the other gates.
+   */
+  private async _phaseAcceptanceContract(state: ProjectState): Promise<void> {
+    this._checkAborted();
+    if (this.workspace.fileExists(this.workspace.acceptanceContractPath)) { return; }
+    if (process.env.DEBATE_ACCEPTANCE_SCRIPT) {
+      this._journal('info', 'Acceptance contract skipped', 'A human-written acceptance script (DEBATE_ACCEPTANCE_SCRIPT) is configured and takes precedence.');
+      return;
+    }
+    const brief = this.workspace.readFile(this.workspace.projectBriefPath) ?? '';
+    const specialist = this._specialistForPlanningRole('briefBuilder', state);
+    const { model, fallbackModel } = specialist
+      ? { model: specialist.model, fallbackModel: specialist.fallbackModel }
+      : this._agentConfig('briefBuilder');
+    const instructions = [
+      'You are the independent QA lead. Before any code exists, write the acceptance walk-through that a real browser will replay against the finished product.',
+      'The builders will read it and must make it pass; they cannot change it. Cover the main user journey and the brief\'s acceptance criteria with observable checks.',
+      'If the product has no browser page (CLI, API, library, native app), return {"applicable": false, "reason": "..."}.',
+      'Otherwise return {"applicable": true, "steps": [...]} using ONLY these step objects:',
+      '  {"do":"press","key":"ArrowLeft","holdMs":300}   keys: letters, digits, " ", Enter, Escape, Arrow*',
+      '  {"do":"click","selector":"#add-note"}  or  {"do":"click","x":640,"y":450}',
+      '  {"do":"type","selector":"#title","text":"Groceries"}   (clicks the field, then types)',
+      '  {"do":"wait","ms":500}',
+      '  {"do":"reload"}   (persistence checks)',
+      '  {"do":"dialog","accept":false}   (how later confirm() dialogs are answered; default accept)',
+      '  {"do":"remember","name":"before","expression":"document.querySelectorAll(\'.note\').length"}',
+      '  {"do":"expect","label":"the new note is listed","expression":"document.body.innerText.includes(\'Groceries\')","timeoutMs":3000}',
+      '  {"do":"screenshot","name":"after-add"}',
+      'Expressions are JavaScript evaluated in the page; they may read remembered values as memo.<name>. An expect passes when its expression becomes truthy before the timeout.',
+      'Rules: at least 3 expect steps, and at least one expect after a press/click/type; at most 60 steps and 180 seconds in total.',
+      'Name every selector, key, global, or window.* test hook you rely on precisely: the builders will implement exactly those. Prefer ids/data-testid and visible text over layout details.',
+      'A canvas game should expose a read-only window.__gameState snapshot that expectations can read. Use test hooks only to skip parts a script cannot play quickly (e.g. finishing many levels), never to fake the behaviour under test.',
+      'Respond with ONLY the JSON object.',
+    ].join('\n');
+    let feedback = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const messages: OllamaMessage[] = [
+        { role: 'system', content: instructions },
+        { role: 'user', content: `# Project Brief\n${brief}${feedback ? `\n\n# Your previous contract was rejected\n${feedback}\nReturn a corrected contract.` : ''}` },
+      ];
+      let raw: unknown;
+      try {
+        raw = await this._callWithFallbackJson<unknown>('briefBuilder', model, fallbackModel, messages,
+          this.workspace.acceptanceContractPath + '.draft', [this.workspace.projectBriefPath]);
+      } catch (err) {
+        if (err instanceof UserAbortError) { throw err; }
+        feedback = `The response was not valid JSON: ${formatError(err)}`;
+        continue;
+      }
+      const { contract, errors } = parseAcceptanceContract(raw);
+      if (!contract) {
+        feedback = errors.map(error => `- ${error}`).join('\n');
+        continue;
+      }
+      this._lockAcceptanceContract(state, contract);
+      return;
+    }
+    this._journal('warn', 'No acceptance contract', `The planner could not produce a valid browser walk-through; the run relies on the other gates.\n${feedback}`);
+  }
+
+  private _lockAcceptanceContract(state: ProjectState, contract: AcceptanceContract): void {
+    const text = prettyJson(contract);
+    this.workspace.writeFile(this.workspace.acceptanceContractPath, text);
+    state.acceptanceContractSha256 = createHash('sha256').update(text).digest('hex');
+    this.workspace.writeProjectState(state);
+    const lines = describeAcceptanceContract(contract);
+    if (contract.applicable) {
+      try {
+        const brief = JSON.parse(this.workspace.readFile(this.workspace.projectBriefPath) ?? '') as ProjectBrief;
+        brief.acceptanceWalkthrough = lines;
+        brief.acceptanceCriteria = [...(brief.acceptanceCriteria ?? []),
+          'The locked acceptanceWalkthrough passes when replayed in a real browser with real key presses and clicks.'];
+        this.workspace.writeFile(this.workspace.projectBriefPath, prettyJson(brief));
+      } catch {
+        // A non-JSON brief still gets the contract enforced at the final checks.
+      }
+    }
+    this._journal('brief', contract.applicable ? 'Acceptance walk-through locked' : 'No browser walk-through applies', lines.join('\n'));
+  }
+
+  /** The locked contract, or undefined when absent, not applicable, or changed since locking. */
+  private _loadAcceptanceContract(): AcceptanceContract | undefined {
+    const text = this.workspace.readFile(this.workspace.acceptanceContractPath);
+    if (!text) { return undefined; }
+    const expected = this.workspace.readProjectState().acceptanceContractSha256;
+    if (!expected || createHash('sha256').update(text).digest('hex') !== expected) {
+      this._journal('warn', 'Acceptance contract ignored', 'The contract file changed after it was locked, so it is not trusted.');
+      return undefined;
+    }
+    try {
+      const { contract } = parseAcceptanceContract(JSON.parse(text));
+      return contract?.applicable ? contract : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async _phaseBrainstorm(state: ProjectState): Promise<void> {
@@ -4380,7 +4486,10 @@ export class AgentOrchestrator {
    */
   private _acceptanceInteraction(): BrowserInteraction | undefined {
     const script = process.env.DEBATE_ACCEPTANCE_SCRIPT;
-    if (!script) { return undefined; }
+    if (!script) {
+      const contract = this._loadAcceptanceContract();
+      return contract ? acceptanceContractInteraction(contract) : undefined;
+    }
     const resolved = path.resolve(script);
     const root = path.resolve(this.workspace.rootDir);
     if (resolved === root || resolved.startsWith(root + path.sep)) {

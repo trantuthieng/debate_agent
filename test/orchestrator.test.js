@@ -3157,3 +3157,60 @@ test('per-task verification does not block on "No tests found" before any test f
   fs.writeFileSync(path.join(root, 'tests/a.test.js'), 'test("x", () => {});\n');
   assert.equal((await orchestrator._taskRuntimeIssues(task, ['tests/a.test.js'])).length, 1, 'once tests exist, the runner must find them');
 });
+
+test('acceptance contract: a rejected draft is retried with its errors, then locked into the brief and final checks', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'briefing' });
+  orchestrator.workspace.writeProjectState(state);
+  orchestrator.workspace.writeFile(orchestrator.workspace.projectBriefPath, JSON.stringify({
+    projectName: 'notes', goal: 'notes app', acceptanceCriteria: ['notes can be added'],
+  }));
+  const valid = { applicable: true, steps: [
+    { do: 'type', selector: '#title', text: 'a' },
+    { do: 'click', selector: '#add' },
+    { do: 'expect', label: 'note listed', expression: "document.querySelectorAll('.note').length === 1" },
+    { do: 'reload' },
+    { do: 'expect', label: 'note persists', expression: "document.querySelectorAll('.note').length === 1" },
+    { do: 'expect', label: 'empty state hidden', expression: "document.querySelector('#empty').hidden" },
+  ] };
+  const prompts = [];
+  orchestrator.ollama = {
+    callWithFallbackJson: async (_model, _fallback, messages) => {
+      prompts.push(messages[1].content);
+      return prompts.length === 1 ? { applicable: true, steps: [{ do: 'expect', label: 'loads', expression: 'true' }] } : valid;
+    },
+  };
+
+  await orchestrator._phaseAcceptanceContract(state);
+
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /previous contract was rejected[\s\S]*At least 3 "expect" steps/);
+  const brief = JSON.parse(orchestrator.workspace.readFile(orchestrator.workspace.projectBriefPath));
+  assert.equal(brief.acceptanceWalkthrough.length, 6);
+  assert.match(brief.acceptanceWalkthrough[2], /EXPECT note listed/);
+  assert.ok(brief.acceptanceCriteria.some(line => /locked acceptanceWalkthrough/.test(line)));
+  assert.equal(typeof orchestrator._acceptanceInteraction(), 'function');
+
+  // Locked means locked: a second call keeps the file, and an edited file is not trusted.
+  await orchestrator._phaseAcceptanceContract(state);
+  assert.equal(prompts.length, 2);
+  const file = orchestrator.workspace.acceptanceContractPath;
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('=== 1', '>= 0'));
+  assert.equal(orchestrator._acceptanceInteraction(), undefined);
+});
+
+test('acceptance contract: a non-browser product records why and adds no browser check', async () => {
+  const root = makeTempWorkspace();
+  const orchestrator = await makeOrchestrator(root);
+  const state = makeState({ currentPhase: 'briefing' });
+  orchestrator.workspace.writeProjectState(state);
+  orchestrator.workspace.writeFile(orchestrator.workspace.projectBriefPath, JSON.stringify({ goal: 'cli', acceptanceCriteria: [] }));
+  orchestrator.ollama = { callWithFallbackJson: async () => ({ applicable: false, reason: 'A command-line tool has no page.' }) };
+
+  await orchestrator._phaseAcceptanceContract(state);
+
+  const brief = JSON.parse(orchestrator.workspace.readFile(orchestrator.workspace.projectBriefPath));
+  assert.equal(brief.acceptanceWalkthrough, undefined);
+  assert.equal(orchestrator._acceptanceInteraction(), undefined);
+});
