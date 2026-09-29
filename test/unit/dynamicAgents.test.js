@@ -127,18 +127,48 @@ test('dynamic team aggregation ranks proposals by mean score and reports agreeme
   const proposals = [
     { agentId: 'a', agentName: 'A', proposal: 'Plan A' },
     { agentId: 'b', agentName: 'B', proposal: 'Plan B' },
+    { agentId: 'c', agentName: 'C', proposal: 'Plan C' },
   ];
   const scores = [
-    { judgeId: 'a', proposalId: 'a', score: 6, reason: '' },
     { judgeId: 'b', proposalId: 'a', score: 6, reason: '' },
+    { judgeId: 'c', proposalId: 'a', score: 6, reason: '' },
     { judgeId: 'a', proposalId: 'b', score: 9, reason: '' },
-    { judgeId: 'b', proposalId: 'b', score: 9, reason: '' },
+    { judgeId: 'c', proposalId: 'b', score: 9, reason: '' },
+    { judgeId: 'a', proposalId: 'c', score: 5, reason: '' },
+    { judgeId: 'b', proposalId: 'c', score: 5, reason: '' },
   ];
   const decision = team._aggregate('goal', proposals, scores);
   assert.equal(decision.winningAgentId, 'b');
   assert.equal(decision.weightedScore, 9);
-  assert.equal(decision.agreement, 'high'); // both judges gave 9 → tight spread
+  assert.equal(decision.agreement, 'high'); // both other judges gave 9 → tight spread
   assert.equal(decision.ranked[0].agentId, 'b');
+});
+
+test('dynamic team aggregation ignores a judge scoring its own proposal', () => {
+  const team = new DynamicTeam({ callWithFallback: async () => '', callWithFallbackJson: async () => ({}) });
+  const proposals = [
+    { agentId: 'a', agentName: 'A', proposal: 'Plan A' },
+    { agentId: 'b', agentName: 'B', proposal: 'Plan B' },
+    { agentId: 'c', agentName: 'C', proposal: 'Plan C' },
+  ];
+  // Authors a and c give themselves 10 and b sandbags itself. Counting
+  // self-votes, a wins (7.33 vs b 5.00); peers alone prefer b (7 vs a 6).
+  const scores = [
+    { judgeId: 'a', proposalId: 'a', score: 10, reason: '' },
+    { judgeId: 'b', proposalId: 'a', score: 6, reason: '' },
+    { judgeId: 'c', proposalId: 'a', score: 6, reason: '' },
+    { judgeId: 'a', proposalId: 'b', score: 7, reason: '' },
+    { judgeId: 'b', proposalId: 'b', score: 1, reason: '' },
+    { judgeId: 'c', proposalId: 'b', score: 7, reason: '' },
+    { judgeId: 'a', proposalId: 'c', score: 3, reason: '' },
+    { judgeId: 'b', proposalId: 'c', score: 3, reason: '' },
+    { judgeId: 'c', proposalId: 'c', score: 10, reason: '' },
+  ];
+  const decision = team._aggregate('goal', proposals, scores);
+  assert.equal(decision.winningAgentId, 'b');
+  assert.equal(decision.weightedScore, 7);
+  assert.equal(decision.ranked.find(r => r.agentId === 'a').score, 6);
+  assert.match(decision.rationale, /6 judge votes \(self-scores excluded\)/);
 });
 
 test('dynamic team aggregation handles an empty proposal set', () => {

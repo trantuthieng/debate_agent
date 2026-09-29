@@ -406,9 +406,12 @@ export class DynamicTeam {
   /**
    * Pure aggregation: mean score per proposal across all judges, ranked; the
    * highest mean wins; agreement is derived from how tightly the judges scored
-   * the winner. Exposed for unit testing (no model calls).
+   * the winner. A judge's score for its own proposal is ignored: authors grade
+   * their own work generously, which would reward the loudest self-promoter.
+   * Exposed for unit testing (no model calls).
    */
-  _aggregate(goal: string, proposals: Proposal[], scores: DynamicAgentScore[]): DynamicTeamDecision {
+  _aggregate(goal: string, proposals: Proposal[], allScores: DynamicAgentScore[]): DynamicTeamDecision {
+    const scores = allScores.filter(s => s.judgeId !== s.proposalId);
     const byProposal = new Map<string, number[]>();
     for (const p of proposals) { byProposal.set(p.agentId, []); }
     for (const s of scores) { byProposal.get(s.proposalId)?.push(s.score); }
@@ -440,7 +443,7 @@ export class DynamicTeam {
       weightedScore: Math.round(winner.score * 100) / 100,
       agreement,
       ranked: ranked.map(r => ({ agentId: r.agentId, proposal: r.proposal, score: Math.round(r.score * 100) / 100 })),
-      rationale: `Selected the proposal with the highest mean score (${winner.score.toFixed(2)}/10) across ${scores.length} judge votes.`,
+      rationale: `Selected the proposal with the highest mean score (${winner.score.toFixed(2)}/10) across ${scores.length} judge votes (self-scores excluded).`,
       generatedAt: new Date().toISOString(),
     };
   }
