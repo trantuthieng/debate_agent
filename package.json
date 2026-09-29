@@ -113,7 +113,8 @@
     "docker:build": "docker compose build",
     "docker:up": "docker compose up -d",
     "docker:logs": "docker compose logs -f",
-    "test:vsix:runtime": "node test/vscode/checkVsixRuntime.js"
+    "test:vsix:runtime": "node test/vscode/checkVsixRuntime.js",
+    "replay:run": "npm run compile && node scripts/replay-run.js"
   },
   "dependencies": {
     "typescript": "^5.3.3",

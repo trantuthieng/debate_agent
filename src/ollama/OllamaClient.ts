@@ -15,6 +15,7 @@ import type {
 import { OllamaConnectionError, ModelNotFoundError, UserAbortError } from '../utils/errors';
 import { logInfo, logWarn, logError } from '../utils/logging';
 import { ModelLoadLock, type ModelLoadLockLike } from './ModelLoadLock';
+import { ModelExchangeRecorder, createReplayTransport, type ReplayStats } from './modelReplay';
 
 // Default request timeout in milliseconds
 const DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
@@ -94,17 +95,31 @@ export class OllamaClient {
   private readonly modelInventory = new Map<string, LocalModelInventoryEntry>();
   private readonly modelDetails = new Map<string, LocalModelDetails>();
   private readonly modelLoadLock: ModelLoadLockLike;
+  private readonly transport: OllamaTransport;
+  private recorder: ModelExchangeRecorder | null = null;
+  /** Set when DEBATE_MODEL_REPLAY serves a recorded run instead of Ollama. */
+  readonly replayStats?: ReplayStats;
 
   constructor(
     baseUrl: string,
     logFilePath?: string,
     requestTimeoutMs: number = DEFAULT_TIMEOUT_MS,
     textKeepAliveSeconds: number = DEFAULT_TEXT_KEEP_ALIVE_SECONDS,
-    private readonly transport: OllamaTransport = nodeHttpTransport,
+    transport: OllamaTransport = nodeHttpTransport,
     modelLoadLock?: ModelLoadLockLike
   ) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
+    const replayFile = process.env.DEBATE_MODEL_REPLAY;
+    if (replayFile) {
+      const replay = createReplayTransport(replayFile);
+      this.transport = replay;
+      this.replayStats = replay.stats;
+      logInfo(`Replaying recorded model exchanges from ${replayFile}; Ollama is not contacted.`);
+    } else {
+      this.transport = transport;
+    }
     this.logFilePath = logFilePath ?? null;
+    if (logFilePath) { this._startRecording(logFilePath); }
     this.requestTimeoutMs = Math.max(30_000, requestTimeoutMs);
     this.textKeepAliveSeconds = Math.max(0, textKeepAliveSeconds);
     // Cross-PROCESS lock: only one process on the machine ever holds a model
@@ -118,6 +133,12 @@ export class OllamaClient {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
+    this._startRecording(filePath);
+  }
+
+  /** Every exchange is recorded beside the call log so a run can be replayed (not while replaying). */
+  private _startRecording(callLogPath: string): void {
+    this.recorder = this.replayStats ? null : new ModelExchangeRecorder(path.join(path.dirname(callLogPath), 'model_exchanges.jsonl'));
   }
 
   // ------------------------------------------------------------------
@@ -496,11 +517,21 @@ export class OllamaClient {
     }, timeoutMs);
     this.activeControllers.add(controller);
     try {
-      const res = await this.transport(url, { ...init, signal: controller.signal });
-      // fetch resolves when headers arrive. Keep cancellation and the deadline
-      // active until the non-streaming JSON body finishes as well, otherwise a
-      // stalled runner can hang forever after sending HTTP 200 headers.
-      const body = await res.arrayBuffer();
+      let res: Response;
+      let body: ArrayBuffer;
+      try {
+        res = await this.transport(url, { ...init, signal: controller.signal });
+        // fetch resolves when headers arrive. Keep cancellation and the deadline
+        // active until the non-streaming JSON body finishes as well, otherwise a
+        // stalled runner can hang forever after sending HTTP 200 headers.
+        body = await res.arrayBuffer();
+      } catch (err) {
+        if (!controller.signal.aborted) { this.recorder?.record(url, init, { error: err instanceof Error ? err.message : String(err) }); }
+        throw err;
+      }
+      this.recorder?.record(url, init, {
+        status: res.status, contentType: res.headers.get('content-type') ?? undefined, body: Buffer.from(body).toString('utf8'),
+      });
       return new Response([204, 205, 304].includes(res.status) ? null : body, {
         status: res.status, statusText: res.statusText, headers: res.headers,
       });
